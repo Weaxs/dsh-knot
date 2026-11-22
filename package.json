@@ -1,6 +1,6 @@
 {
   "name": "@weaxs/dsh-knot",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Connect DeepSeek Harness with Hermes, OpenClaw, and remote dsh instances through ACP v1 or native gateways over private networks or loopback.",
   "type": "module",
   "main": "./dist/index.js",
