@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { runDoctor } from '../src/doctor.js';
 import { AgentManager } from '../src/manager.js';
 import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
 
@@ -27,9 +28,119 @@ class FakeAdapter implements AgentAdapter {
   async close() {}
 }
 
-const config: AgentConfig = { id: 'remote', kind: 'hermes', ssh: 'box' };
+const config: AgentConfig = { id: 'remote', kind: 'hermes', transport: 'local' };
 
 describe('AgentManager', () => {
+  it('does not apply a doctor result from an agent replaced during the check', async () => {
+    let completeProbe!: (result: { ok: boolean }) => void;
+    const probe = new Promise<{ ok: boolean }>((resolve) => {
+      completeProbe = resolve;
+    });
+    class SlowHealthAdapter extends FakeAdapter {
+      override health() {
+        return probe;
+      }
+    }
+    const manager = new AgentManager([config], 10_000, (current) =>
+      current === config ? new SlowHealthAdapter(current.id) : new FakeAdapter(current.id),
+    );
+    const checking = runDoctor(manager, config.id);
+    await manager.upsert({ ...config, port: 443 });
+    completeProbe({ ok: true });
+    await checking;
+    expect(manager.list()[0]?.connection.status).toBe('unverified');
+    await manager.close();
+  });
+
+  it('keeps the last doctor result when the caller aborts a new check', async () => {
+    const adapter = new FakeAdapter(config.id);
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    await runDoctor(manager, config.id);
+    const previous = manager.list()[0]?.connection;
+    expect(previous?.status).toBe('connected');
+
+    const controller = new AbortController();
+    const reason = new Error('Doctor request aborted');
+    vi.spyOn(adapter, 'health').mockImplementationOnce(async () => {
+      controller.abort(reason);
+      throw reason;
+    });
+    await expect(runDoctor(manager, config.id, controller.signal)).rejects.toBe(reason);
+    expect(manager.list()[0]?.connection).toBe(previous);
+    await manager.close();
+  });
+
+  it('bounds job admission while all slots are active and evicts finished jobs', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class BusyAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        await blocked;
+        yield { type: 'final', text: 'done' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new BusyAdapter(config.id));
+    const jobs = Array.from({ length: 200 }, () => manager.start(config.id, 'work', undefined));
+    expect(() => manager.start(config.id, 'overflow', undefined)).toThrow(/job slots are in use/);
+    release();
+    await Promise.all(jobs.map((job) => manager.wait(job.id)));
+    await manager.wait(manager.start(config.id, 'next job', undefined).id);
+    expect(manager.listJobs()).toHaveLength(200);
+    expect(() => manager.get(jobs[0]!.id)).toThrow(/Unknown job/);
+    await manager.close();
+  });
+
+  it.each(['manual', 'timeout'])('keeps an exclusive session locked during %s remote cancellation', async (mode) => {
+    let acknowledge!: () => void;
+    let cancellations = 0;
+    let closed = false;
+    const pending = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    class PendingCancelAdapter extends FakeAdapter {
+      override async *prompt(
+        _sessionId: string | undefined,
+        _text: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        if (signal?.aborted) return;
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+      }
+
+      override cancel(): Promise<void> {
+        cancellations++;
+        return pending;
+      }
+
+      override async close() {
+        closed = true;
+      }
+    }
+    const manager = new AgentManager(
+      [config],
+      mode === 'manual' ? 10_000 : 20,
+      () => new PendingCancelAdapter(config.id),
+    );
+    const job = manager.start(config.id, 'panel turn', 'shared', undefined, true);
+    const cancelling = mode === 'manual' ? manager.cancel(job.id) : undefined;
+    await manager.wait(job.id);
+    const retry = manager.cancel(job.id);
+    expect(() => manager.start(config.id, 'tool turn', 'shared')).toThrow(/active or cancelling job/);
+    expect(cancellations).toBe(1);
+    const replacing = manager.upsert({ ...config, port: 443 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(closed).toBe(false);
+    } finally {
+      acknowledge();
+      await Promise.all([cancelling, retry, replacing]);
+    }
+    expect(closed).toBe(true);
+    await manager.close();
+  });
+
   it('tracks jobs, approvals and completion notifications', async () => {
     const adapter = new FakeAdapter('remote');
     const manager = new AgentManager([config], 10_000, () => adapter);

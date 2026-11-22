@@ -12,12 +12,11 @@ import {
   type RequestPermissionResponse,
   type SessionUpdate,
 } from '@agentclientprotocol/sdk';
-import { createWebSocketStream, type WebSocketConstructor } from '@agentclientprotocol/sdk/experimental/ws-client';
+import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
-import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
 import { transportFor } from '../transports/http.js';
-import { shellQuote, sshBaseArguments } from '../transports/stdio-socket.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
 
@@ -350,9 +349,9 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async connect(signal?: AbortSignal): Promise<void> {
-    if (this.connection && !this.connection.signal.aborted) return;
     if (signal?.aborted) throw signal.reason ?? new Error('request aborted');
     if (!this.connecting) {
+      if (this.connection && !this.connection.signal.aborted) return;
       this.connecting = this.open()
         .catch(async (error) => {
           this.connection?.close();
@@ -404,8 +403,10 @@ export class AcpAdapter implements AgentAdapter {
     const connection = app.connect(stream);
     this.connection = connection;
     connection.closed.then(() => {
-      if (this.connection === connection) this.clearSessions();
-      for (const queue of this.queues.values()) queue.fail(new Error('ACP connection closed'));
+      if (this.connection !== connection) return;
+      this.clearSessions();
+      const closeErr = new Error('ACP connection closed');
+      for (const queue of this.queues.values()) queue.fail(closeErr);
       for (const [requestId, pending] of this.permissions) {
         pending.resolve({ outcome: { outcome: 'cancelled' } });
         this.permissions.delete(requestId);
@@ -420,31 +421,41 @@ export class AcpAdapter implements AgentAdapter {
       this.config.connectTimeoutMs ?? 30_000,
       'ACP initialize',
     );
+    if (initialized.protocolVersion !== PROTOCOL_VERSION) {
+      throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}`);
+    }
     this.capabilities = initialized.agentCapabilities;
   }
 
   private openWebSocket() {
-    const host = this.transport.kind === 'ssh' ? '127.0.0.1' : (this.config.host ?? '127.0.0.1');
-    const protocol = this.transport.kind !== 'ssh' && this.config.tls ? 'wss' : 'ws';
+    const host = urlHost(this.config.host ?? '127.0.0.1');
+    const protocol = this.config.tls ? 'wss' : 'ws';
+    const path = this.config.basePath ?? '/acp';
     const token = secret(this.config);
-    return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}/acp`, {
-      WebSocket: acpWebSocketConstructor(this.transport),
+    return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${path}`, {
+      WebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
     });
   }
 
   private openStdio() {
-    const spec = acpStdioSpawnSpec(this.config);
-    const child = spawn(spec.command, spec.args, { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true });
+    if (this.config.transport !== 'local' || !this.config.acpCommand?.trim()) {
+      throw new Error('ACP stdio requires local transport and acpCommand');
+    }
+    const child = spawn(this.config.acpCommand, this.config.acpArgs ?? [], {
+      // ACP agents can write credentials and session content to stderr.
+      stdio: ['pipe', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
     this.child = child;
-    child.on('error', (error) => {
-      for (const queue of this.queues.values()) queue.fail(error);
-      child.stdin!.destroy();
-      child.stdout!.destroy();
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      const failure = new Error(`ACP process error${error.code ? ` (${error.code})` : ''}`);
+      child.stdin.destroy(failure);
+      child.stdout.destroy(failure);
     });
     return ndJsonStream(
-      Writable.toWeb(child.stdin!) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
+      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
     );
   }
 
@@ -498,26 +509,6 @@ function acpEvent(update: SessionUpdate): AgentEvent | undefined {
     return { type: 'error', text: update.description ?? update.title };
   }
   return undefined;
-}
-
-function acpWebSocketConstructor(transport: Transport): WebSocketConstructor {
-  if (transport.kind !== 'ssh') return WebSocket;
-  return class AcpWebSocket extends WebSocket {
-    constructor(url: string, protocols?: string | string[], options?: { headers?: Record<string, string> }) {
-      super(url, protocols, { ...options, createConnection: () => transport.socket!() });
-    }
-  };
-}
-
-export function acpStdioSpawnSpec(config: AgentConfig): { command: string; args: string[] } {
-  const command = config.acpCommand!;
-  const args = config.acpArgs ?? [];
-  if ((config.transport ?? 'ssh') !== 'ssh') return { command, args };
-  const remoteCommand = [command, ...args].map(shellQuote).join(' ');
-  return {
-    command: 'ssh',
-    args: [...sshBaseArguments(config), config.ssh!, '--', remoteCommand],
-  };
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, label: string, signal?: AbortSignal): Promise<T> {

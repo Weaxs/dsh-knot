@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
-import type { AgentAdapter, AgentConfig, AgentJob, PluginConfig } from './types.js';
+import type { AgentAdapter, AgentConfig, AgentConnectionState, AgentJob, DoctorStep, PluginConfig } from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
@@ -13,13 +13,18 @@ export class AgentManager {
   readonly configs: AgentConfig[];
   private readonly factory: AdapterFactory;
   private readonly jobs = new Map<string, AgentJob>();
-  private readonly jobAdapters = new Map<string, AgentAdapter>();
+  private readonly jobOwners = new Map<
+    string,
+    { adapter: AgentAdapter; exclusive: boolean; cancelling?: Promise<void> }
+  >();
+  private readonly configRevisions = new WeakMap<AgentConfig, string>();
   private readonly completions = new Map<string, Promise<AgentJob>>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly remoteCancelled = new Set<string>();
   private readonly latestSessionJob = new Map<string, string>();
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
+  private readonly connectionStates = new Map<string, AgentConnectionState>();
 
   constructor(
     configs: AgentConfig[],
@@ -31,46 +36,82 @@ export class AgentManager {
     for (const config of this.configs) this.adapters.set(config.id, this.factory(config));
   }
 
+  recordDoctorResult(config: AgentConfig, steps: DoctorStep[]): void {
+    const failed = steps.find((step) => !step.ok);
+    const state: AgentConnectionState = failed
+      ? {
+          status: 'error',
+          checkedAt: Date.now(),
+          failedStep: failed.name,
+          error: failed.detail,
+          hint: failed.hint,
+          steps,
+        }
+      : {
+          status: 'connected',
+          checkedAt: Date.now(),
+          steps,
+        };
+    if (this.getConfig(config.id) === config && !this.reconfiguring.has(config.id)) {
+      this.connectionStates.set(config.id, state);
+    }
+  }
+
   list(): Array<
     Pick<
       AgentConfig,
-      'id' | 'kind' | 'transport' | 'host' | 'ssh' | 'port' | 'tls' | 'acpTransport' | 'acpCommand' | 'model'
+      'id' | 'kind' | 'transport' | 'host' | 'port' | 'tls' | 'basePath' | 'acpTransport' | 'acpCommand' | 'model'
     > & {
+      revision: string;
       hasToken: boolean;
       supportsRespond: boolean;
+      connection: AgentConnectionState;
     }
   > {
-    return this.configs.map(
-      ({ id, kind, transport, host, ssh, port, tls, acpTransport, acpCommand, model, ...rest }) => ({
-        id,
-        kind,
-        transport,
-        host,
-        ssh,
-        port,
-        tls,
-        acpTransport,
-        acpCommand,
-        model,
-        hasToken: Boolean(
-          secret({ id, kind, transport, host, ssh, port, tls, acpTransport, acpCommand, model, ...rest }),
-        ),
-        supportsRespond: typeof this.adapters.get(id)?.respond === 'function',
-      }),
-    );
+    return this.configs.map((config) => ({
+      id: config.id,
+      kind: config.kind,
+      transport: config.transport,
+      host: config.host,
+      port: config.port,
+      tls: config.tls,
+      basePath: config.basePath,
+      acpTransport: config.acpTransport,
+      acpCommand: config.acpCommand,
+      model: config.model,
+      revision: this.configRevision(config),
+      hasToken: Boolean(secret(config)),
+      supportsRespond: typeof this.adapters.get(config.id)?.respond === 'function',
+      connection: this.connectionStates.get(config.id) ?? { status: 'unverified' },
+    }));
   }
 
   getConfig(id: string): AgentConfig | undefined {
     return this.configs.find((item) => item.id === id);
   }
 
-  async upsert(config: AgentConfig): Promise<void> {
+  matchesRevision(id: string, revision: string): boolean {
+    const config = this.getConfig(id);
+    return Boolean(config && !this.reconfiguring.has(id) && this.configRevision(config) === revision);
+  }
+
+  async upsert(config: AgentConfig, persist?: () => void): Promise<void> {
     return this.withAgentLock(config.id, async () => {
+      const replacement = this.factory(config);
+      try {
+        persist?.();
+      } catch (error) {
+        await replacement.close().catch(() => {
+          /* best-effort cleanup of an unused adapter */
+        });
+        throw error;
+      }
       this.reconfiguring.add(config.id);
       const existing = this.adapters.get(config.id);
       this.adapters.delete(config.id);
+      this.connectionStates.delete(config.id);
       try {
-        await this.abortJobsForAgent(config.id, existing);
+        await this.abortJobsForAgent(config.id);
         if (existing) {
           await existing.close().catch(() => {
             /* best-effort cleanup of replaced adapter */
@@ -79,27 +120,29 @@ export class AgentManager {
         const index = this.configs.findIndex((item) => item.id === config.id);
         if (index >= 0) this.configs[index] = config;
         else this.configs.push(config);
-        this.adapters.set(config.id, this.factory(config));
+        this.configRevisions.delete(config);
+        this.adapters.set(config.id, replacement);
       } finally {
         this.reconfiguring.delete(config.id);
       }
     });
   }
 
-  async remove(id: string): Promise<boolean> {
+  async remove(id: string, persist?: () => void): Promise<boolean> {
     return this.withAgentLock(id, async () => {
+      persist?.();
       this.reconfiguring.add(id);
       const existing = this.adapters.get(id);
       this.adapters.delete(id);
+      this.connectionStates.delete(id);
       const index = this.configs.findIndex((item) => item.id === id);
       if (index >= 0) this.configs.splice(index, 1);
       try {
-        await this.abortJobsForAgent(id, existing);
-        if (!existing) return false;
-        await existing.close().catch(() => {
+        await this.abortJobsForAgent(id);
+        await existing?.close().catch(() => {
           /* best-effort cleanup of removed adapter */
         });
-        return true;
+        return index >= 0;
       } finally {
         this.reconfiguring.delete(id);
       }
@@ -108,12 +151,17 @@ export class AgentManager {
 
   adapter(id: string): AgentAdapter {
     const adapter = this.adapters.get(id);
-    if (!adapter)
-      throw new Error(`Unknown agent "${id}". Available: ${[...this.adapters.keys()].join(', ') || '(none)'}`);
-    return adapter;
+    if (adapter) return adapter;
+    throw new Error(`Unknown agent "${id}". Available: ${[...this.adapters.keys()].join(', ') || '(none)'}`);
   }
 
-  start(agentId: string, text: string, sessionId: string | undefined, onDone?: (job: AgentJob) => void): AgentJob {
+  start(
+    agentId: string,
+    text: string,
+    sessionId: string | undefined,
+    onDone?: (job: AgentJob) => void,
+    exclusiveSession = false,
+  ): AgentJob {
     if (this.reconfiguring.has(agentId)) {
       throw new Error(`Agent "${agentId}" is currently being reconfigured or removed`);
     }
@@ -121,36 +169,44 @@ export class AgentManager {
     const config = this.configs.find((item) => item.id === agentId)!;
     const remoteSession =
       sessionId ?? (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config));
-    if (adapter.kind === 'acp' && remoteSession) {
-      const existingId = this.latestSessionJob.get(sessionKey(agentId, remoteSession));
-      const existingJob = existingId ? this.jobs.get(existingId) : undefined;
-      if (
-        adapter.isSessionBusy?.(remoteSession) ||
-        (existingJob &&
-          (existingJob.status === 'queued' ||
-            existingJob.status === 'running' ||
-            this.completions.has(existingJob.id) ||
-            (existingJob.status === 'cancelled' && !this.remoteCancelled.has(existingJob.id))))
-      ) {
+    if (remoteSession) {
+      const exclusive = exclusiveSession || adapter.kind === 'acp';
+      const existingJob = [...this.jobs.values()].find((job) => {
+        const owner = this.jobOwners.get(job.id);
+        return (
+          job.agentId === agentId &&
+          job.sessionId === remoteSession &&
+          owner?.adapter === adapter &&
+          (exclusive || owner.exclusive) &&
+          (job.status === 'queued' ||
+            job.status === 'running' ||
+            this.completions.has(job.id) ||
+            owner.cancelling !== undefined ||
+            (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))
+        );
+      });
+      if (existingJob || (exclusive && adapter.isSessionBusy?.(remoteSession))) {
         throw new Error(
-          `ACP session "${remoteSession}" still has an active or cancelling job (${existingJob?.id ?? remoteSession})`,
+          `Session "${remoteSession}" still has an active or cancelling job (${existingJob?.id ?? remoteSession})`,
         );
       }
     }
+    this.evictFinishedJobs();
+    if (this.jobs.size >= MAX_JOBS) throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
     const id = randomUUID();
     const job: AgentJob = {
       id,
       agentId,
       ...(remoteSession ? { sessionId: remoteSession } : {}),
+      prompt: text.slice(0, 4_000),
       status: 'queued',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       text: '',
     };
     this.jobs.set(id, job);
-    this.jobAdapters.set(id, adapter);
+    this.jobOwners.set(id, { adapter, exclusive: exclusiveSession });
     if (remoteSession) this.latestSessionJob.set(sessionKey(agentId, remoteSession), id);
-    this.evictFinishedJobs();
     const completion = this.run(job, adapter, text, remoteSession, onDone);
     this.completions.set(id, completion);
     completion
@@ -168,8 +224,11 @@ export class AgentManager {
     return job;
   }
 
-  listJobs(): AgentJob[] {
-    return [...this.jobs.values()].sort((a, b) => b.updatedAt - a.updatedAt).map((job) => ({ ...job }));
+  listJobs({ currentOnly = false } = {}): AgentJob[] {
+    return [...this.jobs.values()]
+      .filter((job) => !currentOnly || this.jobOwners.get(job.id)?.adapter === this.adapters.get(job.agentId))
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map((job) => ({ ...job }));
   }
 
   async wait(id: string, signal?: AbortSignal): Promise<AgentJob> {
@@ -202,18 +261,17 @@ export class AgentManager {
       );
     }
     const currentAdapter = this.adapters.get(job.agentId);
-    const originalAdapter = this.jobAdapters.get(id);
-    if (originalAdapter && currentAdapter !== originalAdapter) {
+    const owner = this.jobOwners.get(id);
+    if (owner && currentAdapter !== owner.adapter) {
       throw new Error(`Cannot cancel job ${id}: agent "${job.agentId}" has been reconfigured or removed`);
     }
     job.status = 'cancelled';
     delete job.pendingApproval;
     job.updatedAt = Date.now();
-    this.controllers.get(id)?.abort(new Error('job cancelled'));
-    if (currentAdapter && job.sessionId) {
-      await currentAdapter.cancel(job.sessionId, signal);
-    }
-    this.remoteCancelled.add(id);
+    this.controllers
+      .get(id)
+      ?.abort(job.sessionId ? new LocalOnlyAbortError('job cancelled') : new Error('job cancelled'));
+    await this.cancelRemote(job, signal);
     return job;
   }
 
@@ -247,6 +305,32 @@ export class AgentManager {
     await Promise.allSettled([...this.adapters.values()].map((adapter) => adapter.close()));
   }
 
+  private async cancelRemote(job: AgentJob, signal?: AbortSignal): Promise<void> {
+    const owner = this.jobOwners.get(job.id);
+    if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
+    if (owner && job.sessionId) {
+      const deadline = AbortSignal.timeout(5_000);
+      const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+      stopSignal.throwIfAborted();
+      owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
+      try {
+        await owner.cancelling;
+      } finally {
+        delete owner.cancelling;
+      }
+    }
+    if (this.jobs.has(job.id)) this.remoteCancelled.add(job.id);
+  }
+
+  private configRevision(config: AgentConfig): string {
+    let revision = this.configRevisions.get(config);
+    if (!revision) {
+      revision = randomUUID();
+      this.configRevisions.set(config, revision);
+    }
+    return revision;
+  }
+
   private async withAgentLock<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.agentLocks.get(agentId) ?? Promise.resolve();
     let release!: () => void;
@@ -268,26 +352,23 @@ export class AgentManager {
     return !job.sessionId || this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) === job.id;
   }
 
-  private async abortJobsForAgent(agentId: string, adapter?: AgentAdapter): Promise<void> {
+  private async abortJobsForAgent(agentId: string): Promise<void> {
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
-      if (job.agentId !== agentId || ['completed', 'failed', 'cancelled'].includes(job.status)) continue;
+      if (job.agentId !== agentId || job.status === 'completed' || job.status === 'failed') continue;
+      const cancelling = this.jobOwners.get(id)?.cancelling;
+      if (job.status === 'cancelled' && !cancelling) continue;
       const owned = this.isLatestSessionJob(job);
       job.status = 'cancelled';
       delete job.pendingApproval;
       job.updatedAt = Date.now();
       this.controllers.get(id)?.abort(new LocalOnlyAbortError(`agent "${agentId}" reconfigured`));
-      if (owned && adapter && job.sessionId) {
+      if (cancelling || (owned && job.sessionId)) {
         remoteCancels.push(
-          adapter
-            .cancel(job.sessionId, deadlineSignal)
-            .then(() => {
-              this.remoteCancelled.add(id);
-            })
-            .catch(() => {
-              /* best-effort remote cancel during reconfigure; bounded by 5s deadline */
-            }),
+          this.cancelRemote(job, deadlineSignal).catch(() => {
+            /* best-effort remote cancel during reconfigure; bounded by 5s deadline */
+          }),
         );
       }
     }
@@ -303,12 +384,16 @@ export class AgentManager {
   }
 
   private evictFinishedJobs(): void {
-    if (this.jobs.size <= MAX_JOBS) return;
+    if (this.jobs.size < MAX_JOBS) return;
     for (const [id, job] of this.jobs) {
-      if (this.jobs.size <= MAX_JOBS) break;
-      if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+      if (this.jobs.size < MAX_JOBS) break;
+      if (
+        !this.completions.has(id) &&
+        !this.jobOwners.get(id)?.cancelling &&
+        ['completed', 'failed', 'cancelled'].includes(job.status)
+      ) {
         this.jobs.delete(id);
-        this.jobAdapters.delete(id);
+        this.jobOwners.delete(id);
         this.remoteCancelled.delete(id);
         if (job.sessionId && this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) === id) {
           this.latestSessionJob.delete(sessionKey(job.agentId, job.sessionId));
@@ -329,14 +414,11 @@ export class AgentManager {
     const timer = setTimeout(() => {
       const owned = this.isLatestSessionJob(job);
       const message = `job timed out after ${this.timeoutMs}ms`;
-      controller.abort(owned ? new Error(message) : new LocalOnlyAbortError(message));
+      controller.abort(!owned || job.sessionId ? new LocalOnlyAbortError(message) : new Error(message));
       if (owned && job.sessionId) {
-        adapter
-          .cancel(job.sessionId)
-          .then(() => this.remoteCancelled.add(job.id))
-          .catch(() => {
-            /* best-effort timeout cancel; retry stays enabled because remoteCancelled is unset */
-          });
+        this.cancelRemote(job).catch(() => {
+          /* best-effort timeout cancel; retry stays enabled because remoteCancelled is unset */
+        });
       }
     }, this.timeoutMs);
     job.status = 'running';
@@ -346,7 +428,9 @@ export class AgentManager {
         if (event.sessionId) {
           job.sessionId = event.sessionId;
           const key = sessionKey(job.agentId, event.sessionId);
-          if (!this.latestSessionJob.has(key)) this.latestSessionJob.set(key, job.id);
+          if (!controller.signal.aborted && !this.latestSessionJob.has(key)) {
+            this.latestSessionJob.set(key, job.id);
+          }
         }
         if (event.type === 'text' && event.text) job.text = (job.text + event.text).slice(-2_000_000);
         else if (event.type === 'approval') {

@@ -193,8 +193,9 @@ describe('DSH adapter', () => {
     expect(historicalWait.payload.args.request.afterSeq).toBe(5);
     expect(transport.calls.filter((call) => (call.body as any)?.method === 'session/create')).toHaveLength(1);
     expect(transport.calls.some((call) => (call.body as any)?.method === 'session/selectModel')).toBe(true);
-    expect(transport.calls.find((call) => (call.body as any)?.method === 'session/wait')?.body).toMatchObject({
-      payload: { args: { request: { afterSeq: 0, timeoutMs: 30_000 } } },
+    expect(transport.calls.find((call) => call.path === '/api/session/wait')).toMatchObject({
+      responseWaitMs: 30_000,
+      body: { payload: { args: { request: { afterSeq: 0, timeoutMs: 30_000 } } } },
     });
     await adapter.cancel('dsh-session-1');
     await adapter.close();

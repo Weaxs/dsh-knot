@@ -1,18 +1,16 @@
 import type { IncomingMessage } from 'node:http';
-import type { Duplex } from 'node:stream';
 
-export type TransportKind = 'ssh' | 'direct' | 'local';
+export type TransportKind = 'direct' | 'local';
 export type AgentKind = 'hermes' | 'openclaw' | 'dsh' | 'acp';
 
 export interface AgentConfig {
   id: string;
   kind: AgentKind;
   transport?: TransportKind;
-  ssh?: string;
-  sshConfig?: string;
   host?: string;
   port?: number;
   tls?: boolean;
+  basePath?: string;
   token?: string;
   tokenEnv?: string;
   origin?: string;
@@ -25,6 +23,22 @@ export interface AgentConfig {
   acpCommand?: string;
   acpArgs?: string[];
   connectTimeoutMs?: number;
+}
+
+export interface DoctorStep {
+  name: string;
+  ok: boolean;
+  detail: string;
+  hint?: string;
+}
+
+export interface AgentConnectionState {
+  status: 'unverified' | 'connected' | 'error';
+  checkedAt?: number;
+  failedStep?: string;
+  error?: string;
+  hint?: string;
+  steps?: DoctorStep[];
 }
 
 export interface McpConfig {
@@ -78,6 +92,8 @@ export interface HttpRequest {
   path: string;
   headers?: Record<string, string>;
   body?: unknown;
+  /** Additional time the server may hold the request before sending headers. */
+  responseWaitMs?: number;
   signal?: AbortSignal;
 }
 
@@ -91,7 +107,6 @@ export interface Transport {
   readonly kind: TransportKind;
   request(request: HttpRequest): Promise<HttpResponse>;
   stream(request: HttpRequest): Promise<IncomingMessage>;
-  socket?(): Duplex;
   close(): Promise<void>;
 }
 
@@ -101,6 +116,7 @@ export interface AgentJob {
   id: string;
   agentId: string;
   sessionId?: string;
+  prompt?: string;
   status: JobStatus;
   createdAt: number;
   updatedAt: number;

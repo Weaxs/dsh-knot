@@ -17,12 +17,11 @@ export const Config = Schema.object({
     Schema.object({
       id: Schema.string().required().description('Unique agent identifier (letters, digits, ., _, -).'),
       kind: Schema.union(['hermes', 'openclaw', 'dsh', 'acp']).required().description('Target protocol adapter.'),
-      transport: Schema.union(['ssh', 'direct', 'local']).default('ssh').description('Connectivity transport.'),
-      ssh: Schema.string().description('OpenSSH host alias from ~/.ssh/config (required for ssh transport).'),
-      sshConfig: Schema.string().description('Optional custom OpenSSH config file path.'),
-      host: Schema.string().description('Target host for direct or local transport.'),
-      port: Schema.number().description('Target TCP port (defaults per protocol).'),
+      transport: Schema.union(['direct', 'local']).description('Connectivity transport, defaults to direct.'),
+      host: Schema.string().description('Target hostname or full HTTP(S)/WS(S) gateway endpoint URL.'),
+      port: Schema.number().description('Target TCP port (defaults per protocol, or 443 for HTTPS).'),
       tls: Schema.boolean().description('Use HTTPS/WSS for direct transport.'),
+      basePath: Schema.string().description('HTTP path prefix or exact Gateway WebSocket path.'),
       token: Schema.string().role('secret').description('Gateway bearer or launch token for this agent.'),
       tokenEnv: Schema.string().description('Optional environment variable fallback holding the token.'),
       model: Schema.string().description('Optional remote model override.'),
@@ -95,10 +94,9 @@ export { HermesAdapter } from './adapters/hermes.js';
 export { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 export { OpenClawAdapter } from './adapters/openclaw.js';
 export { normalizeConfig } from './config.js';
-export { runDoctor, sshHint } from './doctor.js';
+export { runDoctor } from './doctor.js';
 export { AgentManager } from './manager.js';
 export { McpServer } from './mcp/server.js';
 export { redact, redactText } from './policy/redact.js';
 export { NodeHttpTransport, transportFor } from './transports/http.js';
-export { StdioSocket, sshArguments } from './transports/stdio-socket.js';
 export type * from './types.js';

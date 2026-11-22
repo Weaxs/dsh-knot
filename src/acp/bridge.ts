@@ -159,12 +159,15 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
   app.onRequest(methods.agent.session.list, async ({ signal }) => {
     const sessions = await adapter.listSessions(signal);
     return {
-      sessions: sessions.map((session) => ({
-        sessionId: session.id,
-        cwd: sessionCwds.get(session.id) ?? config.dshCwd ?? '/',
-        title: session.title,
-        updatedAt: session.updatedAt === undefined ? undefined : new Date(session.updatedAt).toISOString(),
-      })),
+      sessions: sessions.map((session) => {
+        const updatedAt = new Date(session.updatedAt ?? Number.NaN);
+        return {
+          sessionId: session.id,
+          cwd: sessionCwds.get(session.id) ?? config.dshCwd ?? '/',
+          title: session.title,
+          updatedAt: Number.isFinite(updatedAt.getTime()) ? updatedAt.toISOString() : undefined,
+        };
+      }),
     };
   });
   app.onRequest(methods.agent.session.prompt, async ({ params, client, signal }) => {

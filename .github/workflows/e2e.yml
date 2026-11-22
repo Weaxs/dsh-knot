@@ -8,7 +8,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, local, ssh, tailscale, headscale]
+        options: [all, local, tailscale, headscale]
       target:
         description: Agent to test
         required: true
@@ -78,7 +78,7 @@ jobs:
           fi
           if [[ "$model" == true && "$tailscale" != true ]]; then
             message="TAILSCALE_AUTHKEY must be a reusable pre-auth key (tskey-auth-...), not an API or OAuth key; Tailscale jobs will be skipped."
-            if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" != local && "${{ inputs.transport }}" != ssh && "${{ inputs.transport }}" != headscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
+            if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" != local && "${{ inputs.transport }}" != headscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
           fi
 
           transport_filter="${{ inputs.transport || 'all' }}"
@@ -86,7 +86,7 @@ jobs:
           protocol_filter="${{ inputs.protocol || 'all' }}"
           has_work=false
           matrix='{"include":['
-          for transport in local ssh tailscale headscale; do
+          for transport in local tailscale headscale; do
             if [[ "$transport_filter" != all && "$transport_filter" != "$transport" ]]; then continue; fi
             if [[ "$transport" == tailscale && "$tailscale" != true ]]; then continue; fi
             for target in hermes openclaw dsh; do

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
 import { OpenClawAdapter } from '../src/adapters/openclaw.js';
+import { normalizeConfig } from '../src/config.js';
 
 let server: WebSocketServer | undefined;
 afterEach(async () => {
@@ -19,8 +20,9 @@ afterEach(async () => {
 describe('OpenClaw WebSocket wire protocol', () => {
   it('performs the challenge handshake and JSON-RPC calls', async () => {
     const received: any[] = [];
-    server = new WebSocketServer({ host: '127.0.0.1', port: 0, handleProtocols: () => 'json' });
-    server.on('connection', (socket) => {
+    server = new WebSocketServer({ host: '127.0.0.1', port: 0, path: '/gateway/', handleProtocols: () => 'json' });
+    server.on('connection', (socket, request) => {
+      expect(request.headers.origin).toBeUndefined();
       socket.send(
         JSON.stringify({
           type: 'event',
@@ -75,14 +77,10 @@ describe('OpenClaw WebSocket wire protocol', () => {
     if (!address || typeof address === 'string') throw new Error('expected TCP address');
     process.env.OPENCLAW_GATEWAY_TOKEN = 'token';
     process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-wire-'));
-    const adapter = new OpenClawAdapter('wire', {
-      id: 'wire',
-      kind: 'openclaw',
-      transport: 'direct',
-      host: '127.0.0.1',
-      port: address.port,
-      origin: `http://127.0.0.1:${address.port}`,
-    });
+    const [config] = normalizeConfig({
+      agents: [{ id: 'wire', kind: 'openclaw', host: `ws://127.0.0.1:${address.port}/gateway/` }],
+    }).agents;
+    const adapter = new OpenClawAdapter('wire', config!);
     expect(await adapter.health()).toEqual({ ok: true });
     const events = [];
     for await (const event of adapter.prompt('agent:main:wire', 'hello')) events.push(event);

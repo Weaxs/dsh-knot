@@ -26,7 +26,10 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
   }
   const raw = JSON.parse(text) as unknown;
   if (Array.isArray(raw)) {
-    return { agents: normalizeConfig({ agents: raw as AgentConfig[] }).agents, deletedIds: [] };
+    return {
+      agents: normalizeConfig({ agents: raw as AgentConfig[] }).agents,
+      deletedIds: [],
+    };
   }
   if (!raw || typeof raw !== 'object') {
     throw new Error(`Invalid state format in ${file}`);

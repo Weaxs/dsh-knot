@@ -18,26 +18,35 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async health(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const capabilities = await this.json('/v1/capabilities', { signal });
+    const features = capabilities?.features;
+    if (
+      capabilities?.object !== 'hermes.api_server.capabilities' ||
+      features?.run_submission !== true ||
+      features.run_status !== true ||
+      features.run_events_sse !== true ||
+      features.run_stop !== true
+    ) {
+      throw new Error('Hermes API Server does not advertise the required Runs API capabilities');
+    }
     return this.json('/health', { signal });
   }
 
   async listSessions(signal?: AbortSignal): Promise<AgentSession[]> {
-    const value = await this.json('/api/sessions', { signal });
-    const rows = Array.isArray(value)
-      ? value
-      : Array.isArray(value.items)
-        ? value.items
-        : Array.isArray(value.sessions)
-          ? value.sessions
-          : [];
+    // The Runs API cannot resume sessions owned by another Hermes surface.
+    const value = await this.json('/api/sessions?source=api_server', { signal });
+    const rows = Array.isArray(value) ? value : (value?.data ?? value?.items ?? value?.sessions);
+    if (!Array.isArray(rows)) throw new Error('Hermes returned an invalid session list');
     return rows
-      .map((row: Record<string, unknown>) => ({
-        id: String(row.session_id ?? row.id ?? ''),
-        ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
-        ...(row.last_active === undefined && row.updated_at === undefined
-          ? {}
-          : { updatedAt: String(row.last_active ?? row.updated_at) }),
-      }))
+      .map((row: Record<string, unknown>) => {
+        const updatedAt =
+          typeof row.last_active === 'number' ? row.last_active * 1_000 : (row.last_active ?? row.updated_at);
+        return {
+          id: String(row.session_id ?? row.id ?? ''),
+          ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
+          ...(typeof updatedAt === 'number' || typeof updatedAt === 'string' ? { updatedAt } : {}),
+        };
+      })
       .filter((row: AgentSession) => row.id);
   }
 
@@ -122,10 +131,12 @@ export class HermesAdapter implements AgentAdapter {
       if (state === 'completed') yield { type: 'final', text: finalText || output, stopReason: state };
       else if (state === 'cancelled' || state === 'canceled')
         yield { type: 'final', text: finalText || output, stopReason: 'cancelled' };
-      else if (state)
+      else
         yield {
           type: 'error',
-          text: String(status.error ?? `Hermes stream ended while run was ${state}`),
+          text: String(
+            status.error ?? (state ? `Hermes stream ended while run was ${state}` : 'Hermes returned no run status'),
+          ),
           stopReason: state,
         };
     }

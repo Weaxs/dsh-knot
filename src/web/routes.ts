@@ -23,6 +23,7 @@ interface ConnectionHostFace {
 export const WEB_ROUTES = {
   state: '/api/dsh-knot/state',
   doctor: '/api/dsh-knot/doctor',
+  ask: '/api/dsh-knot/ask',
   respond: '/api/dsh-knot/respond',
   cancel: '/api/dsh-knot/cancel',
   sessions: '/api/dsh-knot/sessions',
@@ -128,7 +129,7 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: redact(manager.listJobs().slice(0, 50)),
+            jobs: redact(manager.listJobs({ currentOnly: true }).slice(0, 50)),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -148,6 +149,26 @@ export function registerWebRoutes(
         const agent = typeof body.agent === 'string' && body.agent.trim() ? body.agent.trim() : undefined;
         const result = await runDoctor(manager, agent, request.signal);
         return jsonReply({ ok: true, value: redact(result) });
+      } catch (error) {
+        return errorReply(error instanceof Error ? error.message : String(error), 400);
+      }
+    });
+
+    const staleGateway = () => errorReply('The gateway configuration changed. Select the conversation again.', 409);
+
+    register(WEB_ROUTES.ask, async (request) => {
+      try {
+        const body = await parseBody(request);
+        const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
+        const message = typeof body.message === 'string' ? body.message.trim() : '';
+        const sessionId =
+          typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId.trim() : undefined;
+        if (!agentId) return errorReply('agentId is required', 400);
+        if (!message) return errorReply('message is required', 400);
+        if (typeof body.revision !== 'string') return errorReply('revision is required', 400);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
+        const job = manager.start(agentId, message, sessionId, undefined, true);
+        return jsonReply({ ok: true, value: redact(job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -184,7 +205,12 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const agentId = typeof body.agentId === 'string' ? body.agentId : '';
         if (!agentId) return errorReply('agentId is required', 400);
-        const items = await manager.adapter(agentId).listSessions(request.signal);
+        if (typeof body.revision !== 'string') return errorReply('revision is required', 400);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
+        const timeoutMs = manager.getConfig(agentId)?.connectTimeoutMs ?? 15_000;
+        const boundedSignal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
+        const items = await manager.adapter(agentId).listSessions(boundedSignal);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
         return jsonReply({ ok: true, value: { agentId, sessions: redact(items.slice(0, 100)) } });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
@@ -217,42 +243,57 @@ export function registerWebRoutes(
           const incomingToken = typeof body.token === 'string' ? body.token.trim() : '';
           const clearToken = body.clearToken === true;
           const kind = (body.kind ?? existing?.kind) as AgentConfig['kind'];
-          const transport = ((body.transport ?? existing?.transport) as AgentConfig['transport']) ?? 'ssh';
-          const resolvedToken = clearToken ? undefined : incomingToken || existing?.token;
-          const resolvedTls = typeof body.tls === 'boolean' ? body.tls : existing?.tls;
+          const transport = (body.transport ?? existing?.transport ?? 'direct') as AgentConfig['transport'];
+          const sameTransport = existing?.transport === transport;
+          const endpointInput = typeof body.endpoint === 'string' ? body.endpoint.trim() : undefined;
+          const hostInput =
+            endpointInput ??
+            (typeof body.host === 'string' ? body.host.trim() : sameTransport ? existing?.host : undefined);
+          const resolvedPort =
+            body.port !== undefined
+              ? body.port === ''
+                ? undefined
+                : Number(body.port)
+              : endpointInput === undefined && sameTransport
+                ? existing?.port
+                : undefined;
+          const resolvedTls =
+            typeof body.tls === 'boolean'
+              ? body.tls
+              : endpointInput === undefined && sameTransport
+                ? existing?.tls
+                : undefined;
+          const resolvedBasePath =
+            typeof body.basePath === 'string'
+              ? body.basePath.trim() || undefined
+              : endpointInput === undefined && sameTransport
+                ? existing?.basePath
+                : undefined;
           const acpTransport =
             kind === 'acp'
               ? body.acpTransport === 'stdio' || body.acpTransport === 'websocket'
                 ? body.acpTransport
-                : existing?.acpTransport
+                : sameTransport
+                  ? existing?.acpTransport
+                  : undefined
               : undefined;
           const acpCommand =
             kind === 'acp' && acpTransport === 'stdio'
               ? typeof body.acpCommand === 'string'
                 ? body.acpCommand.trim() || undefined
-                : existing?.acpCommand
+                : sameTransport
+                  ? existing?.acpCommand
+                  : undefined
               : undefined;
           const candidate: AgentConfig = {
-            ...(existing ?? {}),
+            ...existing,
             id,
             kind,
             transport,
-            ssh:
-              transport === 'ssh'
-                ? typeof body.ssh === 'string'
-                  ? body.ssh.trim() || undefined
-                  : existing?.ssh
-                : undefined,
-            host:
-              transport !== 'ssh'
-                ? typeof body.host === 'string'
-                  ? body.host.trim() || undefined
-                  : existing?.host
-                : undefined,
-            port: body.port !== undefined && body.port !== '' ? Number(body.port) : undefined,
-            tls: transport === 'direct' && resolvedTls ? true : undefined,
-            token: resolvedToken,
-            tokenEnv: clearToken ? undefined : existing?.tokenEnv,
+            host: hostInput || undefined,
+            port: resolvedPort,
+            tls: resolvedTls,
+            basePath: resolvedBasePath,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
             acpTransport,
             acpCommand,
@@ -261,13 +302,28 @@ export function registerWebRoutes(
           for (const key of Object.keys(candidate) as Array<keyof AgentConfig>) {
             if (candidate[key] === undefined) delete candidate[key];
           }
-          const [normalized] = normalizeConfig({ agents: [candidate] }).agents;
-          await manager.upsert(normalized!);
-          updateStoredState((state) => ({
-            ...state,
-            agents: [...state.agents.filter((item) => item.id !== normalized!.id), normalized!],
-            deletedIds: state.deletedIds.filter((item) => item !== normalized!.id),
-          }));
+          const normalized = normalizeConfig({ agents: [candidate] }).agents[0]!;
+          const sameGateway =
+            existing &&
+            sameTransport &&
+            existing.kind === normalized.kind &&
+            existing.host === normalized.host &&
+            existing.port === normalized.port &&
+            Boolean(existing.tls) === Boolean(normalized.tls) &&
+            existing.basePath === normalized.basePath &&
+            (existing.acpTransport ?? 'websocket') === (normalized.acpTransport ?? 'websocket');
+          if (clearToken || incomingToken || !sameGateway) {
+            // An empty token prevents falling back to the previous or ambient gateway credential.
+            normalized.token = clearToken ? '' : incomingToken;
+            delete normalized.tokenEnv;
+          }
+          await manager.upsert(normalized, () => {
+            updateStoredState((state) => ({
+              ...state,
+              agents: [...state.agents.filter((item) => item.id !== id), normalized],
+              deletedIds: state.deletedIds.filter((item) => item !== id),
+            }));
+          });
         });
         return jsonReply({ ok: true, value: { agents: manager.list() } });
       } catch (error) {
@@ -281,12 +337,13 @@ export function registerWebRoutes(
         const id = typeof body.id === 'string' ? body.id.trim() : '';
         if (!id) return errorReply('id is required', 400);
         await withAgentRouteLock(id, async () => {
-          await manager.remove(id);
-          updateStoredState((state) => ({
-            ...state,
-            agents: state.agents.filter((item) => item.id !== id),
-            deletedIds: [...new Set([...state.deletedIds, id])],
-          }));
+          await manager.remove(id, () => {
+            updateStoredState((state) => ({
+              ...state,
+              agents: state.agents.filter((item) => item.id !== id),
+              deletedIds: [...new Set([...state.deletedIds, id])],
+            }));
+          });
         });
         return jsonReply({ ok: true, value: { agents: manager.list() } });
       } catch (error) {

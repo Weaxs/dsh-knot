@@ -7,8 +7,7 @@ Read this file and the relevant design doc before changing code.
 Read the authoritative doc before modifying its subsystem; keep docs minimal with pointers instead of duplicating rules:
 
 - Architecture, protocol contracts, and security boundaries: [docs/DESIGN.md](docs/DESIGN.md)
-- SSH provider setups and failure modes: [docs/SSH.md](docs/SSH.md)
-- Real model-backed 24-job E2E matrix and required secrets: [docs/E2E.md](docs/E2E.md)
+- Real model-backed 18-job E2E matrix and required secrets: [docs/E2E.md](docs/E2E.md)
 - Installation, configuration, tools, MCP, and release usage: [README.md](README.md)
 
 ## Architecture & ownership
@@ -18,7 +17,7 @@ Read the authoritative doc before modifying its subsystem; keep docs minimal wit
 Keep module boundaries strict — never mix protocol logic into transports or transport branches into adapters:
 
 - `src/adapters/` — gateway protocols and event normalization (`acp.ts` is the single ACP v1 provider; `hermes.ts`, `openclaw.ts`, `openclaw-identity.ts`, `dsh.ts`, `sse.ts`, `gateway-ws.ts` are native drivers).
-- `src/transports/` — connectivity and process/socket lifecycles (`http.ts`, `stdio-socket.ts`).
+- `src/transports/` — HTTP connectivity and request lifecycles (`http.ts`).
 - `src/manager.ts` — local jobs, bounded output, timeouts, cancellation, and completion notifications.
 - `src/tools.ts` — model-facing dsh tool contract.
 - `src/acp/` — reusable ACP v1 bridge and CLI (`bridge.ts`, `cli.ts`); native adapters stay behind this boundary.
@@ -41,10 +40,9 @@ Prefer the shared ACP provider for compatible platforms; a new native-only platf
 3. **Read-only MCP**: MCP remains read-only until a separate write-token, per-session write permission, origin marker, and loop-prevention design is implemented.
 4. **Fail closed & loopback/tailnet only**: MCP fails closed without a bearer token and refuses `0.0.0.0` / `::`. Non-loopback ACP bridges require `DSH_KNOT_ACP_TOKEN`. Compare bearer tokens in constant time (`verifyBearerToken`).
 5. **No secret leakage**: Tokens, cookies, private keys, full remote configs, and session contents are never logged. Redact recursively (with circular-reference protection) before returning MCP payloads.
-6. **System OpenSSH only**: Invoke `ssh` via `execFile`/`spawn` without a shell, always with `BatchMode=yes`, `ConnectTimeout`, `ServerAliveInterval`/`ServerAliveCountMax`, and `ExitOnForwardFailure=yes`. Never auto-accept unknown host keys, weaken global algorithms, or edit `~/.ssh/config`.
-7. **Honest errors & approvals**: Surface gateway failures as structured errors; never fabricate success or hide partial output. Surface remote approvals to the user; never auto-approve.
-8. **Normalized events**: Adapter-specific payloads stop at `src/adapters/`. Tools and jobs consume normalized `AgentEvent` only.
-9. **Package parity**: `@weaxs/dsh-knot` and `dsh-knot` carry identical behavior; `cordis.patch.yml` must name the package being published.
+6. **Honest errors & approvals**: Surface gateway failures as structured errors; never fabricate success or hide partial output. Surface remote approvals to the user; never auto-approve.
+7. **Normalized events**: Adapter-specific payloads stop at `src/adapters/`. Tools and jobs consume normalized `AgentEvent` only.
+8. **Package parity**: `@weaxs/dsh-knot` and `dsh-knot` carry identical behavior; `cordis.patch.yml` must name the package being published.
 
 ## dsh integration rules
 
@@ -72,9 +70,8 @@ Prefer the shared ACP provider for compatible platforms; a new native-only platf
 Check every change against these recurring failure modes:
 
 - **`Promise.race` + `AsyncQueue` waiter leaks**: Never call `queue.next()` inside a `Promise.race` loop without an `AbortSignal` cleanup or reusing the pending promise — abandoned waiters silently steal subsequent events from the queue.
-- **SSH stdio shell quoting**: `spawn('ssh', args)` runs without a local shell. Never shell-quote local `ssh` flags (like `-F <path with spaces>`); shell-quote only the remote command and its arguments using single-quote escaping (`shellQuote`).
 - **Multi-byte UTF-8 chunk splitting**: Never call `chunk.toString('utf8')` per TCP chunk on streaming text (SSE, HTTP bodies, stderr). Use `StringDecoder('utf8')` or `Buffer.concat`.
-- **Stream backpressure & error events**: Respect `this.push(chunk)` return values in `StdioSocket` (`pause`/`resume`), and always attach `response.on('error', reject)` on HTTP error-status streams.
+- **HTTP stream errors**: Always attach `response.on('error', reject)` on HTTP error-status streams.
 - **Cancel vs. completion races**: `manager.cancel()` must abort the job's local `AbortController` as well as calling `adapter.cancel()`, and `run()` must not overwrite `'cancelled'` back to `'completed'` or `'failed'`.
 - **Yielding in `finally`**: Avoid `yield` inside `finally` blocks of async generators; run stream-end fallbacks after the `for await` loop inside `try` so real stream errors are not masked.
 - **Cross-session permission isolation**: Scope pending approval/permission maps by `sessionId` so cancelling one session never cancels another session's approval.
@@ -105,8 +102,8 @@ npm run check
 
 Behavioral test requirements:
 
-- Cover behavior, not just types: Hermes runs/SSE/fallback/cancel/approvals; OpenClaw handshake/RPC/session continuation over real WS; DSH native RPC/cookie refresh; ACP WS & stdio prompt/continuation/tools/permissions/cancel; SSH arg safety & doctor; MCP auth/allow-list/redaction/read/watch/limits; plugin entry, tools, and job lifecycle.
-- Real model-backed E2E lives in `.github/e2e/` and `.github/workflows/e2e.yml` (24-job matrix). Never replace real services with mocks, silently skip missing credentials, or treat `/health` as E2E.
+- Cover behavior, not just types. Exercise Hermes runs, SSE, fallback, cancellation, and approvals. Check OpenClaw handshake, RPC, and continuation over real WebSocket, DSH native RPC and cookie refresh, and ACP WebSocket and stdio prompt, continuation, tool, permission, and cancel flows. Cover diagnostics, MCP authentication, allow-listing, redaction, read, watch, and limits, plugin entry, tools, and job lifecycle.
+- Real model-backed E2E lives in `.github/e2e/` and `.github/workflows/e2e.yml` (18-job matrix). Never replace real services with mocks, silently skip missing credentials, or treat `/health` as E2E.
 
 ## Commit & release hygiene
 

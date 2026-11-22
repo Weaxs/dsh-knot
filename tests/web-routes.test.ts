@@ -1,9 +1,9 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as plugin from '../src/index.js';
 
 import { apply, Config } from '../src/index.js';
@@ -50,10 +50,16 @@ const sessionsController: SessionControllerLike = {
 };
 
 let mcp: McpServer | undefined;
+let stateDir: string;
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), 'dsh-knot-web-'));
+  vi.stubEnv('DSH_KNOT_STATE_DIR', stateDir);
+});
 afterEach(async () => {
   await mcp?.close();
   mcp = undefined;
-  delete process.env.DSH_KNOT_STATE_DIR;
+  vi.unstubAllEnvs();
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 describe('web UI host routes & schemastery Config', () => {
@@ -103,6 +109,7 @@ describe('web UI host routes & schemastery Config', () => {
     const initial = await post(WEB_ROUTES.state);
     expect(initial.ok).toBe(true);
     expect(initial.value.agents).toHaveLength(1);
+    expect(initial.value.agents[0].connection.status).toBe('unverified');
     expect(initial.value.mcp.enabled).toBe(true);
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
@@ -111,13 +118,38 @@ describe('web UI host routes & schemastery Config', () => {
     expect(toggled.ok).toBe(true);
     expect(toggled.value.allowSessions).toEqual(['local-1']);
 
-    const remoteSessions = await post(WEB_ROUTES.sessions, { agentId: 'hermes-local' });
+    const revision = initial.value.agents[0].revision;
+    const remoteSessions = await post(WEB_ROUTES.sessions, { agentId: 'hermes-local', revision });
     expect(remoteSessions.ok).toBe(true);
     expect(remoteSessions.value.sessions[0].id).toBe('remote-1');
 
     const doc = await post(WEB_ROUTES.doctor, { agent: 'hermes-local' });
     expect(doc.ok).toBe(true);
     expect(doc.value.agents[0].steps.every((s: any) => s.ok)).toBe(true);
+
+    const afterDoc = await post(WEB_ROUTES.state);
+    expect(afterDoc.value.agents[0].connection.status).toBe('connected');
+
+    const asked = await post(WEB_ROUTES.ask, {
+      agentId: 'hermes-local',
+      revision,
+      message: 'hello from panel',
+      sessionId: 'remote-1',
+    });
+    expect(asked.ok).toBe(true);
+    expect(asked.value.prompt).toBe('hello from panel');
+    expect(asked.value.sessionId).toBe('remote-1');
+    const duplicate = await post(WEB_ROUTES.ask, {
+      agentId: 'hermes-local',
+      revision,
+      message: 'overlapping turn',
+      sessionId: 'remote-1',
+    });
+    expect(duplicate).toMatchObject({ ok: false, error: expect.stringMatching(/active or cancelling job/) });
+    expect(() => manager.start('hermes-local', 'overlapping tool turn', 'remote-1')).toThrow(
+      /active or cancelling job/,
+    );
+    await post(WEB_ROUTES.cancel, { jobId: asked.value.id });
 
     const job = manager.start('hermes-local', 'test', undefined);
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -133,7 +165,6 @@ describe('web UI host routes & schemastery Config', () => {
     expect(cancelled.ok).toBe(true);
     expect(cancelled.value.status).toBe('cancelled');
 
-    process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-store-'));
     const toggledPersisted = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggledPersisted.ok).toBe(true);
     expect(loadStoredState().allowSessions).toEqual(['local-1']);
@@ -156,7 +187,6 @@ describe('web UI host routes & schemastery Config', () => {
       id: 'hermes-second',
       kind: 'hermes',
       transport: 'direct',
-      host: '100.64.0.9',
       model: 'deepseek-chat',
     });
     expect(edited.ok).toBe(true);
@@ -164,19 +194,16 @@ describe('web UI host routes & schemastery Config', () => {
     expect(manager.getConfig('hermes-second')?.tls).toBe(true);
     expect(manager.getConfig('hermes-second')?.acpArgs).toEqual(['--flag']);
 
-    // Clearing token via clearToken: true removes the stored token, and switching transport strips stale fields
+    vi.stubEnv('HERMES_API_KEY', 'ambient-secret');
+    // Switching gateways clears the saved token and suppresses the ambient fallback.
     const cleared = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
       kind: 'hermes',
-      transport: 'ssh',
-      ssh: 'gpu-2',
-      host: '100.64.0.9',
-      tls: true,
-      clearToken: true,
+      transport: 'local',
     });
     expect(cleared.ok).toBe(true);
-    expect(manager.getConfig('hermes-second')?.token).toBeUndefined();
-    expect(manager.getConfig('hermes-second')?.host).toBeUndefined();
+    expect(cleared.value.agents.find((agent: { id: string }) => agent.id === 'hermes-second')?.hasToken).toBe(false);
+    expect(manager.getConfig('hermes-second')?.host).toBe('127.0.0.1');
     expect(manager.getConfig('hermes-second')?.tls).toBeUndefined();
 
     // Deleting an agent records a tombstone in deletedIds and aborts in-flight jobs
@@ -198,6 +225,48 @@ describe('web UI host routes & schemastery Config', () => {
     expect(savedIds).toContain('concurrent-a');
     expect(savedIds).toContain('concurrent-b');
 
+    // An endpoint URL owns the port, including when switching from an older HTTP endpoint.
+    const oldEndpoint = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      kind: 'hermes',
+      endpoint: 'http://aws-box.tail1234.ts.net:8642/legacy',
+    });
+    expect(oldEndpoint.ok).toBe(true);
+    const tsSaved = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      kind: 'hermes',
+      transport: 'direct',
+      endpoint: 'https://aws-box.tail1234.ts.net/hermes',
+      port: 8642,
+      token: 'ts-secret',
+    });
+    expect(tsSaved.ok).toBe(true);
+    expect(manager.getConfig('aws-tailscale')).toMatchObject({
+      host: 'aws-box.tail1234.ts.net',
+      port: 443,
+      tls: true,
+      basePath: '/hermes',
+    });
+
+    const openclaw = await post(WEB_ROUTES.agentSave, {
+      id: 'openclaw',
+      kind: 'openclaw',
+      endpoint: 'https://claw.tailnet.ts.net',
+      token: 'claw-test-secret',
+    });
+    expect(openclaw.ok).toBe(true);
+    const oldRevision = openclaw.value.agents.find((agent: { id: string }) => agent.id === 'openclaw').revision;
+    const slash = await post(WEB_ROUTES.agentSave, { id: 'openclaw', endpoint: 'https://claw.tailnet.ts.net/' });
+    expect(slash.ok).toBe(true);
+    expect(manager.getConfig('openclaw')?.token).toBe('claw-test-secret');
+    const staleSession = { agentId: 'openclaw', revision: oldRevision, sessionId: 'agent:main:main' };
+    const [staleAsk, staleHistory] = await Promise.all([
+      post(WEB_ROUTES.ask, { ...staleSession, message: 'stale turn' }),
+      post(WEB_ROUTES.sessions, staleSession),
+    ]);
+    expect(staleAsk).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
+    expect(staleHistory).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
+
     // Deleted static agent stays deleted when plugin reloads
     const registeredTools: string[] = [];
     const effects: Array<() => Promise<void>> = [];
@@ -210,15 +279,94 @@ describe('web UI host routes & schemastery Config', () => {
     );
     for (const cleanup of effects) await cleanup();
 
+    const diskBlocked = join(stateDir, 'agents.json');
+    vi.stubEnv('DSH_KNOT_STATE_DIR', diskBlocked);
+    const failedSave = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      endpoint: 'https://replacement.tailnet.ts.net',
+    });
+    const failedDelete = await post(WEB_ROUTES.agentDelete, { id: 'aws-tailscale' });
+    expect(failedSave.ok).toBe(false);
+    expect(failedDelete.ok).toBe(false);
+    expect(manager.getConfig('aws-tailscale')?.host).toBe('aws-box.tail1234.ts.net');
+    vi.stubEnv('DSH_KNOT_STATE_DIR', stateDir);
+
     // Corrupted agents.json throws instead of silently wiping state
-    writeFileSync(join(process.env.DSH_KNOT_STATE_DIR, 'agents.json'), '{broken-json', 'utf8');
+    writeFileSync(join(stateDir, 'agents.json'), '{broken-json', 'utf8');
     expect(() => loadStoredState()).toThrow();
 
     await manager.close();
   });
 
-  it('activates cleanly in real Cordis 4.1.0 without sessionController, mounts all 8 routes on connection, and gates agent_respond with ask', async () => {
-    process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-cordis-'));
+  it('bounds hanging sessions requests and records failedStep on doctor errors', async () => {
+    const hangingAdapter: AgentAdapter = {
+      id: 'slow-hermes',
+      kind: 'hermes',
+      async health() {
+        throw new Error('socket hang up');
+      },
+      async listSessions(signal) {
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('sessions timed out')), { once: true });
+        });
+      },
+      async *prompt() {},
+      async cancel() {},
+      async close() {},
+    };
+    const manager = new AgentManager(
+      [{ id: 'slow-hermes', kind: 'hermes', transport: 'local', port: 8642, connectTimeoutMs: 120 }],
+      10_000,
+      () => hangingAdapter,
+    );
+    const routes = new Map<string, (req: Request) => Promise<Response>>();
+    registerWebRoutes(
+      {
+        connection: {
+          fetch: {
+            register(route: { path: string; fetch: (req: Request) => Promise<Response> }) {
+              routes.set(route.path, route.fetch);
+              return () => routes.delete(route.path);
+            },
+          },
+        },
+        effect() {},
+      } as any,
+      manager,
+      undefined,
+      undefined,
+    );
+    const post = async (path: string, body: Record<string, unknown> = {}) => {
+      const res = await routes.get(path)!(
+        new Request(`http://localhost${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }),
+      );
+      return (await res.json()) as any;
+    };
+
+    const sessionsRes = await post(WEB_ROUTES.sessions, {
+      agentId: 'slow-hermes',
+      revision: manager.list()[0]?.revision,
+    });
+    expect(sessionsRes.ok).toBe(false);
+    expect(sessionsRes.error).toMatch(/timed out/i);
+
+    const docRes = await post(WEB_ROUTES.doctor, { agent: 'slow-hermes' });
+    expect(docRes.ok).toBe(true);
+    const stateRes = await post(WEB_ROUTES.state);
+    expect(stateRes.value.agents[0].connection).toMatchObject({
+      status: 'error',
+      failedStep: 'gateway-health',
+    });
+    expect(stateRes.value.agents[0].connection.error).toContain('socket hang up');
+
+    await manager.close();
+  });
+
+  it('activates cleanly in real Cordis 4.1.0 without sessionController, mounts routes on connection, and gates agent_respond with ask', async () => {
     const root = new Context();
     const registeredTools: string[] = [];
     const registeredRoutes: string[] = [];
@@ -230,7 +378,7 @@ describe('web UI host routes & schemastery Config', () => {
     await fiber;
     expect(registeredTools).toHaveLength(7);
 
-    // Providing connection later mounts all 8 Dashboard routes on the injected child context
+    // Providing connection later mounts the Dashboard routes on the injected child context.
     (root as any).provide('connection');
     (root as any).set('connection', {
       fetch: {

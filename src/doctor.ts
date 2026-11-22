@@ -1,108 +1,69 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { secret, urlHost } from './config.js';
 import type { AgentManager } from './manager.js';
+import { redactText } from './policy/redact.js';
+import type { AgentConfig, DoctorStep } from './types.js';
 
-const execute = promisify(execFile);
-
-export interface DoctorStep {
-  name: string;
-  ok: boolean;
-  detail: string;
-  hint?: string;
-}
+export type { DoctorStep } from './types.js';
 
 export async function runDoctor(
   manager: AgentManager,
   only?: string,
   signal?: AbortSignal,
 ): Promise<{ agents: Array<{ id: string; steps: DoctorStep[] }> }> {
+  signal?.throwIfAborted();
   const configs = manager.configs.filter((config) => !only || config.id === only);
   if (only && configs.length === 0) throw new Error(`Unknown agent "${only}"`);
   return {
     agents: await Promise.all(
       configs.map(async (config) => {
         const steps: DoctorStep[] = [];
-        if ((config.transport ?? 'ssh') === 'ssh') {
-          const sshOptions = config.sshConfig ? ['-F', config.sshConfig] : [];
-          try {
-            const { stdout } = await execute('ssh', [...sshOptions, '-G', config.ssh!], {
-              timeout: 10_000,
-              maxBuffer: 2_000_000,
-              signal,
-            });
-            const picked = stdout
-              .split('\n')
-              .filter((line) => /^(hostname|user|port|identityfile|proxycommand|proxyjump) /.test(line));
-            steps.push({ name: 'ssh-config', ok: true, detail: picked.join('\n') });
-          } catch (error) {
-            steps.push(failure('ssh-config', error));
-            return { id: config.id, steps };
-          }
-          try {
-            await execute(
-              'ssh',
-              [...sshOptions, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', config.ssh!, 'echo', 'ok'],
-              {
-                timeout: 15_000,
-                signal,
-              },
-            );
-            steps.push({ name: 'ssh-login', ok: true, detail: 'Non-interactive SSH login succeeded.' });
-          } catch (error) {
-            steps.push(failure('ssh-login', error));
-          }
-        } else if (config.transport === 'direct') {
-          steps.push({
-            name: 'direct-transport',
-            ok: true,
-            detail: `Connecting to ${config.host}:${config.port}. Keep the gateway on a trusted interface.`,
-          });
-        } else {
-          steps.push({ name: 'local-transport', ok: true, detail: 'Using the local loopback transport.' });
-        }
+        const isWebSocket = config.kind === 'openclaw' || config.kind === 'acp';
+        const scheme = `${isWebSocket ? 'ws' : 'http'}${config.tls ? 's' : ''}`;
+        const host = urlHost(config.host ?? '127.0.0.1');
+        const detail =
+          config.acpTransport === 'stdio'
+            ? 'Starting a local ACP process.'
+            : `Connecting to ${scheme}://${host}:${config.port}${config.basePath ?? ''}.`;
+        steps.push({ name: `${config.transport ?? 'direct'}-transport`, ok: true, detail });
+        const timeout = AbortSignal.timeout(config.connectTimeoutMs ?? 15_000);
+        const healthSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
         try {
-          const health = await manager.adapter(config.id).health(signal);
-          steps.push({ name: 'gateway-health', ok: true, detail: JSON.stringify(health) });
+          const health = await manager.adapter(config.id).health(healthSignal);
+          if (health.ok === false) throw new Error('The gateway reported unhealthy status.');
+          steps.push({ name: 'gateway-health', ok: true, detail: 'Gateway connection verified.' });
         } catch (error) {
-          steps.push(failure('gateway-health', error));
+          const message = error instanceof Error ? error.message : String(error);
+          const token = secret(config);
+          const detail = redactText(token ? message.replaceAll(token, '[REDACTED]') : message).slice(0, 2_048);
+          steps.push({ name: 'gateway-health', ok: false, detail, hint: gatewayHint(config, detail) });
         }
+        signal?.throwIfAborted();
+        manager.recordDoctorResult(config, steps);
         return { id: config.id, steps };
       }),
     ),
   };
 }
 
-export function sshHint(text: string): string {
-  const value = text.toLowerCase();
-  if (value.includes('too many authentication failures'))
-    return 'Set IdentitiesOnly yes and one IdentityFile for this host.';
-  if (value.includes('permission denied'))
-    return 'Check User, IdentityFile, and the authorized_keys entry on the server.';
-  if (value.includes('unprotected private key')) return 'Run chmod 600 on the private key.';
-  if (value.includes('invalid format') || value.includes('ppk'))
-    return 'Convert a PuTTY .ppk key to OpenSSH format with puttygen.';
-  if (value.includes('no matching host key type'))
-    return 'For this host only, add the server-offered HostKeyAlgorithms and PubkeyAcceptedAlgorithms.';
-  if (value.includes('no matching key exchange'))
-    return 'For this host only, add the server-offered KexAlgorithms; plan a server upgrade.';
-  if (value.includes('remote host identification has changed'))
-    return 'Verify the server was reinstalled before replacing its known_hosts entry.';
-  if (value.includes('host key verification failed')) return 'Connect once manually and verify the host fingerprint.';
-  if (value.includes('could not resolve hostname')) return 'Check HostName and DNS in ~/.ssh/config.';
-  if (value.includes('connection timed out')) return 'Check the address, security group, firewall, and TCP port 22.';
-  if (value.includes('connection refused')) return 'Check sshd and the configured Port.';
-  if (value.includes('passphrase'))
-    return 'Add the private key to ssh-agent or the macOS keychain; background SSH cannot prompt.';
-  if (value.includes('openclaw_session_token') || value.includes('openclaw_gateway_token'))
-    return 'Configure the agent token in the DSH Knot Web UI (or set OPENCLAW_GATEWAY_TOKEN / tokenEnv).';
-  if (value.includes('hermes_api_key'))
-    return 'Configure the agent token in the DSH Knot Web UI (or set HERMES_API_KEY / tokenEnv).';
-  if (value.includes('launch token') || value.includes('dsh_gateway_token'))
-    return 'Paste the remote dsh web launch token into the agent token field in the DSH Knot Web UI (or DSH_GATEWAY_TOKEN).';
-  return 'See docs/SSH.md. The plugin never changes ~/.ssh/config automatically.';
-}
-
-function failure(name: string, error: unknown): DoctorStep {
-  const detail = error instanceof Error ? error.message : String(error);
-  return { name, ok: false, detail, hint: sshHint(detail) };
+function gatewayHint(config: AgentConfig, detail: string): string {
+  const value = detail.toLowerCase();
+  if (config.kind === 'openclaw' && /pairing.required|device.approval/.test(value)) {
+    return 'Approve this device in OpenClaw, then run the check again.';
+  }
+  if (/http 40[13]|unauthorized|token|api.key/.test(value)) {
+    if (config.kind === 'hermes') return 'Enter the Hermes API server key (API_SERVER_KEY) as the gateway token.';
+    if (config.kind === 'dsh') return 'Enter the launch token printed by the remote dsh web command.';
+    return 'Verify the gateway token in the agent settings.';
+  }
+  if (/certificate|self.signed|altname|wrong version number/.test(value)) {
+    return 'Check the endpoint scheme and hostname, and verify the TLS certificate is trusted.';
+  }
+  if (/enotfound|eai_again|could not resolve/.test(value)) {
+    return 'Verify the hostname and that this device can resolve it on the private network.';
+  }
+  if (/timed out|timeout|econnrefused|connection refused|socket hang up/.test(value)) {
+    return 'Verify the gateway is running and this device can reach the endpoint through the private network or proxy.';
+  }
+  if (config.acpTransport === 'stdio') return 'Check that the local command is installed and executable.';
+  return 'Verify that the endpoint serves this agent protocol.';
 }

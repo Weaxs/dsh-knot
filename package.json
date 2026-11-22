@@ -1,7 +1,7 @@
 {
   "name": "@weaxs/dsh-knot",
   "version": "0.1.1",
-  "description": "Connect DeepSeek Harness with Hermes, OpenClaw, and remote dsh instances through ACP v1 or native gateways over SSH, Tailscale, or local transports.",
+  "description": "Connect DeepSeek Harness with Hermes, OpenClaw, and remote dsh instances through ACP v1 or native gateways over private networks or loopback.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -47,8 +47,7 @@
     "hermes",
     "openclaw",
     "multi-agent",
-    "tailscale",
-    "ssh"
+    "tailscale"
   ],
   "homepage": "https://github.com/Weaxs/dsh-knot#readme",
   "repository": {

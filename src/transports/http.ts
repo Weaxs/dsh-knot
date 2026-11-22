@@ -1,16 +1,13 @@
 import http, { type IncomingMessage, type RequestOptions } from 'node:http';
 import https from 'node:https';
-import type { Socket } from 'node:net';
-import type { Duplex } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import type { AgentConfig, HttpRequest, HttpResponse, Transport } from '../types.js';
-import { openSshSocket } from './stdio-socket.js';
+import type { AgentConfig, HttpRequest, HttpResponse, Transport, TransportKind } from '../types.js';
 
 const MAX_BODY = 16 * 1024 * 1024;
 
 export class NodeHttpTransport implements Transport {
   constructor(
-    readonly kind: 'ssh' | 'direct' | 'local',
+    readonly kind: TransportKind,
     private readonly config: AgentConfig,
   ) {}
 
@@ -37,18 +34,17 @@ export class NodeHttpTransport implements Transport {
 
   async stream(input: HttpRequest): Promise<IncomingMessage> {
     const payload = input.body === undefined ? undefined : Buffer.from(JSON.stringify(input.body));
-    const host = this.kind === 'ssh' ? '127.0.0.1' : (this.config.host ?? '127.0.0.1');
-    const secure = this.kind !== 'ssh' && this.config.tls === true;
-    const factory = this.kind === 'ssh' ? () => openSshSocket(this.config) : undefined;
-    const customAgent = factory ? new http.Agent() : undefined;
-    if (customAgent && factory) customAgent.createConnection = factory as unknown as () => Socket;
+    const host = this.config.host ?? '127.0.0.1';
+    const secure = this.config.tls === true;
+    const basePath = this.config.basePath?.replace(/\/+$/, '') ?? '';
+    const path = basePath ? `${basePath}${input.path.startsWith('/') ? input.path : `/${input.path}`}` : input.path;
     const options: RequestOptions = {
       protocol: secure ? 'https:' : 'http:',
       host,
       port: this.config.port,
       method: input.method ?? 'GET',
-      path: input.path,
-      agent: customAgent ?? false,
+      path,
+      agent: false,
       headers: {
         Accept: 'application/json, text/event-stream',
         ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': String(payload.length) } : {}),
@@ -56,9 +52,16 @@ export class NodeHttpTransport implements Transport {
       },
     };
     const driver = secure ? https : http;
+    const timeoutMs = Math.min(2_147_483_647, (this.config.connectTimeoutMs ?? 15_000) + (input.responseWaitMs ?? 0));
     return new Promise<IncomingMessage>((resolve, reject) => {
+      let headerTimer: NodeJS.Timeout | undefined;
+      const clearHeaderTimer = () => {
+        if (headerTimer) {
+          clearTimeout(headerTimer);
+          headerTimer = undefined;
+        }
+      };
       const request = driver.request(options, (response) => {
-        request.setTimeout(0);
         if ((response.statusCode ?? 500) >= 400) {
           const decoder = new StringDecoder('utf8');
           let detail = '';
@@ -66,6 +69,7 @@ export class NodeHttpTransport implements Transport {
           const finish = (err: Error) => {
             if (settled) return;
             settled = true;
+            clearHeaderTimer();
             reject(err);
           };
           response.on('data', (chunk: Buffer) => {
@@ -82,29 +86,33 @@ export class NodeHttpTransport implements Transport {
           });
           return;
         }
+        clearHeaderTimer();
         resolve(response);
       });
-      if (this.kind !== 'ssh' && this.config.connectTimeoutMs) {
-        request.setTimeout(this.config.connectTimeoutMs, () => {
-          request.destroy(new Error(`request timed out after ${this.config.connectTimeoutMs}ms`));
-        });
-      }
-      request.on('error', reject);
+      headerTimer = setTimeout(() => {
+        const error = new Error(`request timed out after ${timeoutMs}ms`);
+        reject(error);
+        request.destroy(error);
+      }, timeoutMs);
+      request.on('error', (error: Error) => {
+        clearHeaderTimer();
+        reject(error);
+      });
       const signal = input.signal;
-      const abort = () => request.destroy(new Error('request aborted'));
-      if (signal?.aborted) request.destroy(new Error('request aborted'));
-      else signal?.addEventListener('abort', abort, { once: true });
+      const abort = () => {
+        clearHeaderTimer();
+        request.destroy(signal?.reason instanceof Error ? signal.reason : new Error('request aborted'));
+      };
+      if (signal?.aborted) abort();
+      else {
+        signal?.addEventListener('abort', abort, { once: true });
+      }
       responseCleanup(request, () => {
+        clearHeaderTimer();
         signal?.removeEventListener('abort', abort);
-        customAgent?.destroy();
       });
       request.end(payload);
     });
-  }
-
-  socket(): Duplex {
-    if (this.kind !== 'ssh') throw new Error('custom sockets are only used by the ssh transport');
-    return openSshSocket(this.config);
   }
 
   async close(): Promise<void> {}
@@ -128,5 +136,5 @@ function responseCleanup(request: http.ClientRequest, cleanup: () => void): void
 }
 
 export function transportFor(config: AgentConfig): NodeHttpTransport {
-  return new NodeHttpTransport(config.transport ?? 'ssh', config);
+  return new NodeHttpTransport(config.transport ?? 'direct', config);
 }

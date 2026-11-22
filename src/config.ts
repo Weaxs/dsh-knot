@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import type { AgentConfig, PluginConfig } from './types.js';
 
 export class ConfigError extends Error {
@@ -30,34 +31,95 @@ export function normalizeConfig(
 
 function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   if (typeof agent !== 'object' || agent === null) throw new ConfigError('each agent must be an object');
-  if (!ID.test(agent.id)) throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
+  if (typeof agent.id !== 'string' || !ID.test(agent.id))
+    throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
   if (ids.has(agent.id)) throw new ConfigError(`duplicate agent id: ${agent.id}`);
   ids.add(agent.id);
   if (!['hermes', 'openclaw', 'dsh', 'acp'].includes(agent.kind))
     throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
-  const transport = agent.transport ?? 'ssh';
-  if (!['ssh', 'direct', 'local'].includes(transport)) throw new ConfigError(`${agent.id}: invalid transport`);
-  if (agent.ssh !== undefined && (agent.ssh.startsWith('-') || !/^\S+$/.test(agent.ssh))) {
-    throw new ConfigError(`${agent.id}: ssh must be one host alias without spaces`);
+  const transport = agent.transport ?? 'direct';
+  if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
+  if (agent.acpTransport === 'stdio') {
+    if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
+    if (transport !== 'local') throw new ConfigError(`${agent.id}: ACP stdio requires local transport`);
+    if (typeof agent.acpCommand !== 'string' || !agent.acpCommand.trim()) {
+      throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand`);
+    }
   }
-  if (transport === 'ssh' && !agent.ssh) throw new ConfigError(`${agent.id}: ssh transport requires an ssh host alias`);
+
+  if (agent.host !== undefined && typeof agent.host !== 'string') throw new ConfigError(`${agent.id}: invalid host`);
+  let parsedHost = agent.host?.trim() || (transport === 'local' ? '127.0.0.1' : '');
+  let parsedPort = agent.port;
+  let parsedTls = agent.tls;
+  let parsedBasePath = agent.basePath;
+  const isWebSocket = agent.kind === 'acp' || agent.kind === 'openclaw';
+
+  if (/^(https?|wss?):\/\//i.test(parsedHost)) {
+    let url: URL;
+    try {
+      url = new URL(parsedHost);
+    } catch {
+      throw new ConfigError(`${agent.id}: invalid endpoint URL`);
+    }
+    if (!url.hostname || url.username || url.password || url.href.includes('?') || url.href.includes('#')) {
+      throw new ConfigError(`${agent.id}: endpoint URL must not contain credentials, a query, or a fragment`);
+    }
+    // URL.pathname is "/" even when the endpoint omits a path.
+    const hasPath = parsedHost.includes('/', parsedHost.indexOf('://') + 3) || url.pathname !== '/';
+    parsedHost = url.hostname;
+    parsedTls = url.protocol === 'https:' || url.protocol === 'wss:';
+    parsedPort = url.port ? Number(url.port) : parsedTls ? 443 : 80;
+    parsedBasePath = isWebSocket && !hasPath ? undefined : url.pathname;
+  }
+  if (!parsedHost) throw new ConfigError(`${agent.id}: direct transport requires a gateway endpoint`);
+  if (parsedHost.startsWith('[') && parsedHost.endsWith(']')) parsedHost = parsedHost.slice(1, -1);
+  if (!isIP(parsedHost) && !/^[\p{L}\p{N}_][\p{L}\p{N}_.-]*$/u.test(parsedHost)) {
+    throw new ConfigError(`${agent.id}: invalid host or endpoint URL`);
+  }
+
+  if (parsedBasePath !== undefined) {
+    if (typeof parsedBasePath !== 'string') throw new ConfigError(`${agent.id}: invalid basePath`);
+    const trimmed = parsedBasePath.trim();
+    if (trimmed && (!trimmed.startsWith('/') || /[\s?#\\]/.test(trimmed))) {
+      throw new ConfigError(`${agent.id}: basePath must be a URL path starting with "/"`);
+    }
+    parsedBasePath =
+      (isWebSocket && !(agent.kind === 'openclaw' && trimmed === '/') ? trimmed : trimmed.replace(/\/+$/, '')) ||
+      undefined;
+  }
+  if (agent.kind === 'acp' && agent.acpTransport !== 'stdio') parsedBasePath ??= '/acp';
+
   const defaultPort =
-    agent.kind === 'openclaw' ? 18_789 : agent.kind === 'dsh' ? 18_790 : agent.kind === 'acp' ? 18_792 : 8_642;
-  const result: AgentConfig = { ...agent, transport, port: agent.port ?? defaultPort };
+    parsedTls === true
+      ? 443
+      : agent.kind === 'openclaw'
+        ? 18_789
+        : agent.kind === 'dsh'
+          ? 18_790
+          : agent.kind === 'acp'
+            ? 18_792
+            : 8_642;
+  const result: AgentConfig = {
+    ...agent,
+    transport,
+    host: parsedHost,
+    ...(parsedTls !== undefined ? { tls: parsedTls } : {}),
+    basePath: parsedBasePath,
+    port: parsedPort ?? defaultPort,
+  };
+  if (result.basePath === undefined) delete result.basePath;
   port(result.port!, `${agent.id}.port`);
-  if (transport !== 'ssh' && !result.host) result.host = '127.0.0.1';
-  if (result.host?.startsWith('-')) throw new ConfigError(`${agent.id}: invalid host`);
-  if (result.acpTransport === 'stdio') {
-    if (result.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
-    if (transport === 'direct') throw new ConfigError(`${agent.id}: ACP stdio requires local or ssh transport`);
-    if (!result.acpCommand?.trim()) throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand`);
-  }
-  if (result.acpArgs?.some((argument) => typeof argument !== 'string')) {
+  if (
+    result.acpArgs !== undefined &&
+    (!Array.isArray(result.acpArgs) || result.acpArgs.some((arg) => typeof arg !== 'string'))
+  ) {
     throw new ConfigError(`${agent.id}: acpArgs must be strings`);
   }
   if (
     result.connectTimeoutMs !== undefined &&
-    (!Number.isSafeInteger(result.connectTimeoutMs) || result.connectTimeoutMs < 100)
+    (!Number.isInteger(result.connectTimeoutMs) ||
+      result.connectTimeoutMs < 100 ||
+      result.connectTimeoutMs > 2_147_483_647)
   ) {
     throw new ConfigError(`${agent.id}: invalid connectTimeoutMs`);
   }
@@ -66,6 +128,10 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
 
 function port(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 1 || value > 65_535) throw new ConfigError(`${name} must be a TCP port`);
+}
+
+export function urlHost(host: string): string {
+  return isIP(host) === 6 ? `[${host}]` : host;
 }
 
 export function secret(agent: AgentConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {

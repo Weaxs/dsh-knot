@@ -1,8 +1,9 @@
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { AcpBridge } from '../src/acp/bridge.js';
-import { AcpAdapter, acpStdioSpawnSpec } from '../src/adapters/acp.js';
-import type { AgentAdapter, AgentEvent } from '../src/types.js';
+import { AcpAdapter } from '../src/adapters/acp.js';
+import { normalizeConfig } from '../src/config.js';
+import type { AgentAdapter, AgentEvent, AgentSession } from '../src/types.js';
 
 class FakeNativeAdapter implements AgentAdapter {
   readonly kind = 'hermes' as const;
@@ -16,10 +17,8 @@ class FakeNativeAdapter implements AgentAdapter {
     return { ok: true };
   }
 
-  async listSessions() {
-    return [
-      { id: this.prompts[0]?.sessionId ?? 'session-1', title: 'ACP session', updatedAt: '2026-01-01T00:00:00.000Z' },
-    ];
+  async listSessions(): Promise<AgentSession[]> {
+    return [{ id: this.prompts[0]?.sessionId ?? 'session-1', title: 'ACP session', updatedAt: 1767225600000 }];
   }
 
   async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
@@ -50,8 +49,46 @@ afterEach(async () => {
 });
 
 describe('ACP provider and bridge', () => {
+  it('uses the exact endpoint and waits for one initialization before allowing concurrent requests', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const initializing = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const native = new FakeNativeAdapter();
+    native.health = async () => {
+      entered();
+      await ready;
+      return { ok: true };
+    };
+    const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
+    const address = await bridge.start({ port: 0, token: 'acp-test-token' });
+    const [config] = normalizeConfig({
+      agents: [{ id: 'exact', kind: 'acp', host: `ws://${address.host}:${address.port}/acp`, token: 'acp-test-token' }],
+    }).agents;
+    const adapter = new AcpAdapter('exact', config!);
+    cleanups.push(async () => {
+      release();
+      await adapter.close();
+      await bridge.close();
+    });
+
+    const health = adapter.health();
+    await Promise.race([health, initializing]);
+    const sessions = adapter.listSessions();
+    release();
+    const [verified, listed] = await Promise.all([health, sessions]);
+    expect(verified).toMatchObject({ ok: true, protocolVersion: 1 });
+    expect(listed).toMatchObject([{ id: 'session-1' }]);
+  });
+
   it('runs prompts, continuations, tools and permissions over the official ACP WebSocket transport', async () => {
     const native = new FakeNativeAdapter();
+    const listSessions = native.listSessions.bind(native);
+    native.listSessions = async () => [...(await listSessions()), { id: 'undated', updatedAt: 'unavailable' }];
     const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const adapter = new AcpAdapter('unified', {
@@ -100,6 +137,7 @@ describe('ACP provider and bridge', () => {
         cwd: '/',
         updatedAt: '2026-01-01T00:00:00.000Z',
       },
+      { id: 'undated', cwd: '/' },
     ]);
 
     // A fresh adapter (empty cache) resumes the historical session via session/load without changing sessionId
@@ -194,24 +232,34 @@ describe('ACP provider and bridge', () => {
     expect(failed.at(-1)?.text).toMatch(/session\/load/);
   });
 
-  it('keeps local SSH flags unquoted while shell-quoting remote ACP stdio command and args', () => {
-    const spec = acpStdioSpawnSpec({
-      id: 'remote-stdio',
+  it.each([
+    {
+      name: 'rejects an unsupported ACP protocol version',
+      script: `const { id } = JSON.parse(line);
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result: { protocolVersion: 2 } }) + '\\n');`,
+      error: /Unsupported ACP protocol version 2/,
+    },
+    {
+      name: 'reports a closed process without including subprocess stderr',
+      script: "console.error('private-subprocess-output'); process.exit(42);",
+      error: /^ACP connection closed$/,
+    },
+  ])('$name', async ({ script, error }) => {
+    const adapter = new AcpAdapter('stdio-failure', {
+      id: 'stdio-failure',
       kind: 'acp',
-      transport: 'ssh',
-      ssh: 'gpu-box',
-      sshConfig: '/tmp/my ssh config/config',
+      transport: 'local',
       acpTransport: 'stdio',
-      acpCommand: '/usr/local/bin/acp agent',
-      acpArgs: ['--flag', '$HOME;rm -rf /', "it's"],
+      acpCommand: process.execPath,
+      acpArgs: [
+        '-e',
+        `require('node:readline').createInterface({ input: process.stdin }).once('line', line => {
+        ${script}
+      });`,
+      ],
     });
-    expect(spec.command).toBe('ssh');
-    expect(spec.args.slice(0, 2)).toEqual(['-F', '/tmp/my ssh config/config']);
-    expect(spec.args.slice(-3)).toEqual([
-      'gpu-box',
-      '--',
-      `'/usr/local/bin/acp agent' '--flag' '$HOME;rm -rf /' 'it'\\''s'`,
-    ]);
+    cleanups.push(() => adapter.close());
+    await expect(adapter.health()).rejects.toThrow(error);
   });
 
   it('paginates session/list via nextCursor to recover cwd for sessions on later pages', async () => {
