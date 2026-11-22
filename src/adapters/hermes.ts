@@ -38,13 +38,15 @@ export class HermesAdapter implements AgentAdapter {
     const rows = Array.isArray(value) ? value : (value?.data ?? value?.items ?? value?.sessions);
     if (!Array.isArray(rows)) throw new Error('Hermes returned an invalid session list');
     return rows
-      .map((row: Record<string, unknown>) => ({
-        id: String(row.session_id ?? row.id ?? ''),
-        ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
-        ...(row.last_active === undefined && row.updated_at === undefined
-          ? {}
-          : { updatedAt: String(row.last_active ?? row.updated_at) }),
-      }))
+      .map((row: Record<string, unknown>) => {
+        const updatedAt =
+          typeof row.last_active === 'number' ? row.last_active * 1_000 : (row.last_active ?? row.updated_at);
+        return {
+          id: String(row.session_id ?? row.id ?? ''),
+          ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
+          ...(typeof updatedAt === 'number' || typeof updatedAt === 'string' ? { updatedAt } : {}),
+        };
+      })
       .filter((row: AgentSession) => row.id);
   }
 

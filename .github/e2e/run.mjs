@@ -89,11 +89,7 @@ async function verify(kind) {
     assertCompleted(secondResult, marker, 'same-session continuation');
 
     const sessions = await manager.adapter(config.id).listSessions();
-    if (
-      kind === 'hermes' &&
-      protocol === 'native' &&
-      !sessions.some((session) => session.id === firstResult.sessionId)
-    ) {
+    if (kind === 'hermes' && !sessions.some((session) => session.id === firstResult.sessionId)) {
       throw new Error('Hermes did not list the API session created by the test');
     }
     console.log(`[e2e] ${label}/${kind}: ${sessions.length} visible session(s) after the task`);

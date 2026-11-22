@@ -48,7 +48,9 @@ describe('Hermes API Server adapter', () => {
       } else if (request.url === '/v1/capabilities') {
         response.end(capabilities);
       } else if (request.url === '/api/sessions?source=api_server') {
-        response.end('{"object":"list","data":[{"id":"api-chat","source":"api_server","title":"Remote chat"}]}');
+        response.end(
+          '{"object":"list","data":[{"id":"api-chat","source":"api_server","title":"Remote chat","last_active":1767225600.125}]}',
+        );
       } else {
         response.writeHead(404).end('{}');
       }
@@ -61,7 +63,9 @@ describe('Hermes API Server adapter', () => {
       await expect(unauthorized.health()).rejects.toThrow(/HTTP 401/);
       const authorized = new HermesAdapter('hermes', { ...config, token: 'hermes-test-key' });
       await expect(authorized.health()).resolves.toEqual({ status: 'ok', platform: 'hermes-agent' });
-      await expect(authorized.listSessions()).resolves.toEqual([{ id: 'api-chat', title: 'Remote chat' }]);
+      await expect(authorized.listSessions()).resolves.toEqual([
+        { id: 'api-chat', title: 'Remote chat', updatedAt: 1767225600125 },
+      ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { AcpBridge } from '../src/acp/bridge.js';
 import { AcpAdapter } from '../src/adapters/acp.js';
 import { normalizeConfig } from '../src/config.js';
-import type { AgentAdapter, AgentEvent } from '../src/types.js';
+import type { AgentAdapter, AgentEvent, AgentSession } from '../src/types.js';
 
 class FakeNativeAdapter implements AgentAdapter {
   readonly kind = 'hermes' as const;
@@ -17,10 +17,8 @@ class FakeNativeAdapter implements AgentAdapter {
     return { ok: true };
   }
 
-  async listSessions() {
-    return [
-      { id: this.prompts[0]?.sessionId ?? 'session-1', title: 'ACP session', updatedAt: '2026-01-01T00:00:00.000Z' },
-    ];
+  async listSessions(): Promise<AgentSession[]> {
+    return [{ id: this.prompts[0]?.sessionId ?? 'session-1', title: 'ACP session', updatedAt: 1767225600000 }];
   }
 
   async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
@@ -89,6 +87,8 @@ describe('ACP provider and bridge', () => {
 
   it('runs prompts, continuations, tools and permissions over the official ACP WebSocket transport', async () => {
     const native = new FakeNativeAdapter();
+    const listSessions = native.listSessions.bind(native);
+    native.listSessions = async () => [...(await listSessions()), { id: 'undated', updatedAt: 'unavailable' }];
     const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const adapter = new AcpAdapter('unified', {
@@ -137,6 +137,7 @@ describe('ACP provider and bridge', () => {
         cwd: '/',
         updatedAt: '2026-01-01T00:00:00.000Z',
       },
+      { id: 'undated', cwd: '/' },
     ]);
 
     // A fresh adapter (empty cache) resumes the historical session via session/load without changing sessionId

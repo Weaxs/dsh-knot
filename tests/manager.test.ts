@@ -92,7 +92,7 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
-  it('keeps an exclusive session locked while remote cancellation is pending', async () => {
+  it.each(['manual', 'timeout'])('keeps an exclusive session locked during %s remote cancellation', async (mode) => {
     let acknowledge!: () => void;
     let cancellations = 0;
     const pending = new Promise<void>((resolve) => {
@@ -113,9 +113,13 @@ describe('AgentManager', () => {
         return pending;
       }
     }
-    const manager = new AgentManager([config], 10_000, () => new PendingCancelAdapter(config.id));
+    const manager = new AgentManager(
+      [config],
+      mode === 'manual' ? 10_000 : 20,
+      () => new PendingCancelAdapter(config.id),
+    );
     const job = manager.start(config.id, 'panel turn', 'shared', undefined, true);
-    const cancelling = manager.cancel(job.id);
+    const cancelling = mode === 'manual' ? manager.cancel(job.id) : undefined;
     await manager.wait(job.id);
     const retry = manager.cancel(job.id);
     expect(() => manager.start(config.id, 'tool turn', 'shared')).toThrow(/active or cancelling job/);

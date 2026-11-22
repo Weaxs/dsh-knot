@@ -111,7 +111,7 @@ export class AgentManager {
       this.adapters.delete(config.id);
       this.connectionStates.delete(config.id);
       try {
-        await this.abortJobsForAgent(config.id, existing);
+        await this.abortJobsForAgent(config.id);
         if (existing) {
           await existing.close().catch(() => {
             /* best-effort cleanup of replaced adapter */
@@ -138,7 +138,7 @@ export class AgentManager {
       const index = this.configs.findIndex((item) => item.id === id);
       if (index >= 0) this.configs.splice(index, 1);
       try {
-        await this.abortJobsForAgent(id, existing);
+        await this.abortJobsForAgent(id);
         await existing?.close().catch(() => {
           /* best-effort cleanup of removed adapter */
         });
@@ -268,20 +268,10 @@ export class AgentManager {
     job.status = 'cancelled';
     delete job.pendingApproval;
     job.updatedAt = Date.now();
-    this.controllers.get(id)?.abort(new Error('job cancelled'));
-    if (owner?.cancelling) {
-      await raceAbort(owner.cancelling, signal);
-      return job;
-    }
-    if (owner && currentAdapter && job.sessionId) {
-      owner.cancelling = currentAdapter.cancel(job.sessionId, signal);
-      try {
-        await owner.cancelling;
-      } finally {
-        delete owner.cancelling;
-      }
-    }
-    if (this.jobs.has(id)) this.remoteCancelled.add(id);
+    this.controllers
+      .get(id)
+      ?.abort(job.sessionId ? new LocalOnlyAbortError('job cancelled') : new Error('job cancelled'));
+    await this.cancelRemote(job, signal);
     return job;
   }
 
@@ -315,6 +305,23 @@ export class AgentManager {
     await Promise.allSettled([...this.adapters.values()].map((adapter) => adapter.close()));
   }
 
+  private async cancelRemote(job: AgentJob, signal?: AbortSignal): Promise<void> {
+    const owner = this.jobOwners.get(job.id);
+    if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
+    if (owner && job.sessionId) {
+      const deadline = AbortSignal.timeout(5_000);
+      const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+      stopSignal.throwIfAborted();
+      owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
+      try {
+        await owner.cancelling;
+      } finally {
+        delete owner.cancelling;
+      }
+    }
+    if (this.jobs.has(job.id)) this.remoteCancelled.add(job.id);
+  }
+
   private configRevision(config: AgentConfig): string {
     let revision = this.configRevisions.get(config);
     if (!revision) {
@@ -345,7 +352,7 @@ export class AgentManager {
     return !job.sessionId || this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) === job.id;
   }
 
-  private async abortJobsForAgent(agentId: string, adapter?: AgentAdapter): Promise<void> {
+  private async abortJobsForAgent(agentId: string): Promise<void> {
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
@@ -355,16 +362,11 @@ export class AgentManager {
       delete job.pendingApproval;
       job.updatedAt = Date.now();
       this.controllers.get(id)?.abort(new LocalOnlyAbortError(`agent "${agentId}" reconfigured`));
-      if (owned && adapter && job.sessionId) {
+      if (owned && job.sessionId) {
         remoteCancels.push(
-          adapter
-            .cancel(job.sessionId, deadlineSignal)
-            .then(() => {
-              if (this.jobs.has(id)) this.remoteCancelled.add(id);
-            })
-            .catch(() => {
-              /* best-effort remote cancel during reconfigure; bounded by 5s deadline */
-            }),
+          this.cancelRemote(job, deadlineSignal).catch(() => {
+            /* best-effort remote cancel during reconfigure; bounded by 5s deadline */
+          }),
         );
       }
     }
@@ -410,16 +412,11 @@ export class AgentManager {
     const timer = setTimeout(() => {
       const owned = this.isLatestSessionJob(job);
       const message = `job timed out after ${this.timeoutMs}ms`;
-      controller.abort(owned ? new Error(message) : new LocalOnlyAbortError(message));
+      controller.abort(!owned || job.sessionId ? new LocalOnlyAbortError(message) : new Error(message));
       if (owned && job.sessionId) {
-        adapter
-          .cancel(job.sessionId)
-          .then(() => {
-            if (this.jobs.has(job.id)) this.remoteCancelled.add(job.id);
-          })
-          .catch(() => {
-            /* best-effort timeout cancel; retry stays enabled because remoteCancelled is unset */
-          });
+        this.cancelRemote(job).catch(() => {
+          /* best-effort timeout cancel; retry stays enabled because remoteCancelled is unset */
+        });
       }
     }, this.timeoutMs);
     job.status = 'running';
