@@ -35,13 +35,8 @@ export class HermesAdapter implements AgentAdapter {
   async listSessions(signal?: AbortSignal): Promise<AgentSession[]> {
     // The Runs API cannot resume sessions owned by another Hermes surface.
     const value = await this.json('/api/sessions?source=api_server', { signal });
-    const rows = Array.isArray(value)
-      ? value
-      : Array.isArray(value.items)
-        ? value.items
-        : Array.isArray(value.sessions)
-          ? value.sessions
-          : [];
+    const rows = Array.isArray(value) ? value : (value?.data ?? value?.items ?? value?.sessions);
+    if (!Array.isArray(rows)) throw new Error('Hermes returned an invalid session list');
     return rows
       .map((row: Record<string, unknown>) => ({
         id: String(row.session_id ?? row.id ?? ''),

@@ -154,6 +154,8 @@ export function registerWebRoutes(
       }
     });
 
+    const staleGateway = () => errorReply('The gateway configuration changed. Select the conversation again.', 409);
+
     register(WEB_ROUTES.ask, async (request) => {
       try {
         const body = await parseBody(request);
@@ -163,6 +165,8 @@ export function registerWebRoutes(
           typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId.trim() : undefined;
         if (!agentId) return errorReply('agentId is required', 400);
         if (!message) return errorReply('message is required', 400);
+        if (typeof body.revision !== 'string') return errorReply('revision is required', 400);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
         const job = manager.start(agentId, message, sessionId, undefined, true);
         return jsonReply({ ok: true, value: redact(job) });
       } catch (error) {
@@ -201,9 +205,12 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const agentId = typeof body.agentId === 'string' ? body.agentId : '';
         if (!agentId) return errorReply('agentId is required', 400);
+        if (typeof body.revision !== 'string') return errorReply('revision is required', 400);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
         const timeoutMs = manager.getConfig(agentId)?.connectTimeoutMs ?? 15_000;
         const boundedSignal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
         const items = await manager.adapter(agentId).listSessions(boundedSignal);
+        if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
         return jsonReply({ ok: true, value: { agentId, sessions: redact(items.slice(0, 100)) } });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);

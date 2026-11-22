@@ -44,6 +44,7 @@ interface AgentConnectionState {
 
 interface AgentSummary {
   id: string;
+  revision: string;
   kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
   transport?: 'direct' | 'local';
   host?: string;
@@ -57,6 +58,9 @@ interface AgentSummary {
   supportsRespond?: boolean;
   connection?: AgentConnectionState;
 }
+
+type AgentSelection = Pick<AgentSummary, 'id' | 'revision'>;
+const NO_AGENT: AgentSelection = { id: '', revision: '' };
 
 interface AgentFormState {
   editing: boolean;
@@ -429,16 +433,18 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [error, setError] = React.useState<string | null>(null);
     const [expandedDoctor, setExpandedDoctor] = React.useState<Record<string, boolean>>({});
     const [checkingDoctor, setCheckingDoctor] = React.useState(false);
-    const [historyAgent, setHistoryAgent] = React.useState('');
+    const [history, setHistory] = React.useState(NO_AGENT);
+    const historyAgent = history.id;
     const [historyItems, setHistoryItems] = React.useState<RemoteSessionItem[]>([]);
     const [historyLoading, setHistoryLoading] = React.useState(false);
     const [historyError, setHistoryError] = React.useState<string | null>(null);
     const [historySearch, setHistorySearch] = React.useState('');
     const [historyLimit, setHistoryLimit] = React.useState(6);
-    const [chatAgent, setChatAgent] = React.useState('');
+    const [chat, setChat] = React.useState(NO_AGENT);
+    const chatAgent = chat.id;
     const [chatSessionId, setChatSessionId] = React.useState('');
     const [chatSessionTitle, setChatSessionTitle] = React.useState('');
-    const chatSelection = React.useRef({ agentId: '' });
+    const chatSelection = React.useRef(NO_AGENT);
     const [chatInput, setChatInput] = React.useState('');
     const [chatSending, setChatSending] = React.useState(false);
     const [chatError, setChatError] = React.useState<string | null>(null);
@@ -448,7 +454,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [saving, setSaving] = React.useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-    const historySelection = React.useRef({ agentId: '' });
+    const historySelection = React.useRef(NO_AGENT);
     const stateRequest = React.useRef(0);
     const hasRunningRef = React.useRef(false);
 
@@ -503,22 +509,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       };
     }, [refreshState]);
 
-    React.useEffect(() => {
-      if (!chatAgent && state) {
-        const first = state.agents[0];
-        if (first) {
-          chatSelection.current = { agentId: first.id };
-          setChatAgent(first.id);
-        }
-      }
-      if (chatActiveJobId && state?.jobs.length) {
-        const active = state.jobs.find((j) => j.id === chatActiveJobId);
-        if (active?.sessionId && active.agentId === chatAgent && !chatSessionId) {
-          setChatSessionId(active.sessionId);
-        }
-      }
-    }, [state, chatAgent, chatActiveJobId, chatSessionId]);
-
     const runDoctorAll = async (onlyAgent?: string) => {
       setCheckingDoctor(true);
       try {
@@ -541,13 +531,13 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       }
     };
 
-    const loadHistory = async (agentId: string) => {
-      const selection = { agentId };
+    const loadHistory = async ({ id, revision }: AgentSelection = NO_AGENT) => {
+      const selection = { id, revision };
       historySelection.current = selection;
-      setHistoryAgent(agentId);
+      setHistory(selection);
       setHistoryLimit(6);
       setHistoryError(null);
-      if (!agentId) {
+      if (!id) {
         setHistoryItems([]);
         setHistoryLoading(false);
         return;
@@ -557,7 +547,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
         const result = await apiPost<{ sessions: RemoteSessionItem[] }>(
           ctx,
           '/api/dsh-knot/sessions',
-          { agentId },
+          { agentId: id, revision },
           20_000,
         );
         if (historySelection.current !== selection) return;
@@ -574,8 +564,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
 
     const sendChatMessage = async () => {
       const message = chatInput.trim();
-      if (!chatAgent || !message || chatBusy) return;
-      const selection = chatSelection.current;
+      if (!chatAgent || !message || chatBusy || chatSelection.current !== chat) return;
       setChatSending(true);
       setChatError(null);
       try {
@@ -584,28 +573,30 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           '/api/dsh-knot/ask',
           {
             agentId: chatAgent,
+            revision: chat.revision,
             message,
             ...(chatSessionId ? { sessionId: chatSessionId } : {}),
           },
           15_000,
         );
         hasRunningRef.current = true;
-        if (selection === chatSelection.current) {
+        if (chat === chatSelection.current) {
           setChatInput('');
           setChatActiveJobId(job.id);
           if (job.sessionId) setChatSessionId(job.sessionId);
         }
         await refreshState();
       } catch (err) {
-        if (selection === chatSelection.current) setChatError(err instanceof Error ? err.message : String(err));
+        if (chat === chatSelection.current) setChatError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (selection === chatSelection.current) setChatSending(false);
+        if (chat === chatSelection.current) setChatSending(false);
       }
     };
 
-    const startChatWith = (agentId: string, sessionId = '', title = '') => {
-      chatSelection.current = { agentId };
-      setChatAgent(agentId);
+    const startChatWith = ({ id, revision }: AgentSelection = NO_AGENT, sessionId = '', title = '') => {
+      const selection = { id, revision };
+      chatSelection.current = selection;
+      setChat(selection);
       setChatSessionId(sessionId);
       setChatSessionTitle(title);
       setChatInput('');
@@ -613,6 +604,22 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       setChatActiveJobId(null);
       setChatError(null);
     };
+
+    React.useEffect(() => {
+      if (!state) return;
+      if (history.id && !state.agents.some((a) => a.id === history.id && a.revision === history.revision)) {
+        if (historySelection.current === history) void loadHistory();
+      }
+      const current = state.agents.find((a) => a.id === chatAgent);
+      if (!current || current.revision !== chat.revision) {
+        const replacement = current ?? state.agents[0];
+        if (chatSelection.current === chat && (replacement || chatAgent)) startChatWith(replacement);
+        return;
+      }
+      if (chatSelection.current !== chat || chatSessionId || !chatActiveJobId) return;
+      const active = state.jobs.find((job) => job.id === chatActiveJobId && job.agentId === chatAgent);
+      if (active?.sessionId) setChatSessionId(active.sessionId);
+    }, [state, history, chat, chatAgent, chatActiveJobId, chatSessionId]);
 
     const respondApproval = async (jobId: string, requestId: string, choice: string) => {
       try {
@@ -703,9 +710,11 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           acpCommand: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpCommand : undefined,
           ...(acpArgs ? { acpArgs } : {}),
         });
-        if (historySelection.current.agentId === savedId) void loadHistory('');
-        if (chatSelection.current.agentId === savedId) startChatWith(savedId);
-        setState((prev) => (prev ? { ...prev, agents } : prev));
+        if (historySelection.current.id === savedId) void loadHistory();
+        if (chatSelection.current.id === savedId) startChatWith(agents.find((agent) => agent.id === savedId));
+        setState((prev) =>
+          prev ? { ...prev, agents, jobs: prev.jobs.filter((job) => job.agentId !== savedId) } : prev,
+        );
         setForm(null);
         showToast(t('savedAgentToast'));
         await refreshState();
@@ -725,9 +734,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       setConfirmDeleteId(null);
       try {
         const { agents } = await apiPost<{ agents: AgentSummary[] }>(ctx, '/api/dsh-knot/agent-delete', { id });
-        if (historySelection.current.agentId === id) void loadHistory('');
-        if (chatSelection.current.agentId === id) startChatWith(agents[0]?.id ?? '');
-        setState((prev) => (prev ? { ...prev, agents } : prev));
+        if (historySelection.current.id === id) void loadHistory();
+        if (chatSelection.current.id === id) startChatWith(agents[0]);
+        setState((prev) => (prev ? { ...prev, agents, jobs: prev.jobs.filter((job) => job.agentId !== id) } : prev));
         setExpandedDoctor((prev) => {
           const next = { ...prev };
           delete next[id];
@@ -1021,12 +1030,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
                         h(
                           'button',
-                          { className: 'dk-btn-link', onClick: () => startChatWith(agent.id) },
+                          { className: 'dk-btn-link', onClick: () => startChatWith(agent) },
                           t('chatWithAgent'),
                         ),
                         h(
                           'button',
-                          { className: 'dk-btn-link', onClick: () => void loadHistory(agent.id) },
+                          { className: 'dk-btn-link', onClick: () => void loadHistory(agent) },
                           t('viewHistory'),
                         ),
                         h('button', { className: 'dk-btn', onClick: () => openEditForm(agent) }, t('editAgent')),
@@ -1133,7 +1142,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                 {
                   className: 'dk-input',
                   value: chatAgent,
-                  onChange: (e: { target: { value: string } }) => startChatWith(e.target.value),
+                  onChange: (e: { target: { value: string } }) =>
+                    startChatWith(agents.find((agent) => agent.id === e.target.value)),
                 },
                 h('option', { value: '' }, t('chatSelectAgent')),
                 agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
@@ -1151,7 +1161,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   'button',
                   {
                     className: 'dk-btn',
-                    onClick: () => startChatWith(chatAgent),
+                    onClick: () => startChatWith(chat),
                   },
                   t('chatNewSession'),
                 )
@@ -1276,7 +1286,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   {
                     className: 'dk-input',
                     value: historyAgent,
-                    onChange: (e: { target: { value: string } }) => void loadHistory(e.target.value),
+                    onChange: (e: { target: { value: string } }) =>
+                      void loadHistory(agents.find((agent) => agent.id === e.target.value)),
                   },
                   h('option', { value: '' }, t('selectAgentPrompt')),
                   agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
@@ -1317,7 +1328,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         null,
                         h(
                           'button',
-                          { className: 'dk-btn dk-btn-primary', onClick: () => void loadHistory(historyAgent) },
+                          { className: 'dk-btn dk-btn-primary', onClick: () => void loadHistory(history) },
                           t('retry'),
                         ),
                       ),
@@ -1348,7 +1359,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                                 'button',
                                 {
                                   className: 'dk-btn dk-btn-primary',
-                                  onClick: () => startChatWith(historyAgent, item.id, item.title ?? ''),
+                                  onClick: () => startChatWith(history, item.id, item.title ?? ''),
                                 },
                                 t('resumeInPanel'),
                               ),

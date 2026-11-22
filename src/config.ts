@@ -83,7 +83,9 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
     if (trimmed && (!trimmed.startsWith('/') || /[\s?#\\]/.test(trimmed))) {
       throw new ConfigError(`${agent.id}: basePath must be a URL path starting with "/"`);
     }
-    parsedBasePath = (isWebSocket ? trimmed : trimmed.replace(/\/+$/, '')) || undefined;
+    parsedBasePath =
+      (isWebSocket && !(agent.kind === 'openclaw' && trimmed === '/') ? trimmed : trimmed.replace(/\/+$/, '')) ||
+      undefined;
   }
   if (agent.kind === 'acp' && agent.acpTransport !== 'stdio') parsedBasePath ??= '/acp';
 

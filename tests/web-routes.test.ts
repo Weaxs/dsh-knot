@@ -118,7 +118,8 @@ describe('web UI host routes & schemastery Config', () => {
     expect(toggled.ok).toBe(true);
     expect(toggled.value.allowSessions).toEqual(['local-1']);
 
-    const remoteSessions = await post(WEB_ROUTES.sessions, { agentId: 'hermes-local' });
+    const revision = initial.value.agents[0].revision;
+    const remoteSessions = await post(WEB_ROUTES.sessions, { agentId: 'hermes-local', revision });
     expect(remoteSessions.ok).toBe(true);
     expect(remoteSessions.value.sessions[0].id).toBe('remote-1');
 
@@ -131,6 +132,7 @@ describe('web UI host routes & schemastery Config', () => {
 
     const asked = await post(WEB_ROUTES.ask, {
       agentId: 'hermes-local',
+      revision,
       message: 'hello from panel',
       sessionId: 'remote-1',
     });
@@ -139,10 +141,14 @@ describe('web UI host routes & schemastery Config', () => {
     expect(asked.value.sessionId).toBe('remote-1');
     const duplicate = await post(WEB_ROUTES.ask, {
       agentId: 'hermes-local',
+      revision,
       message: 'overlapping turn',
       sessionId: 'remote-1',
     });
     expect(duplicate).toMatchObject({ ok: false, error: expect.stringMatching(/active or cancelling job/) });
+    expect(() => manager.start('hermes-local', 'overlapping tool turn', 'remote-1')).toThrow(
+      /active or cancelling job/,
+    );
     await post(WEB_ROUTES.cancel, { jobId: asked.value.id });
 
     const job = manager.start('hermes-local', 'test', undefined);
@@ -242,6 +248,25 @@ describe('web UI host routes & schemastery Config', () => {
       basePath: '/hermes',
     });
 
+    const openclaw = await post(WEB_ROUTES.agentSave, {
+      id: 'openclaw',
+      kind: 'openclaw',
+      endpoint: 'https://claw.tailnet.ts.net',
+      token: 'claw-test-secret',
+    });
+    expect(openclaw.ok).toBe(true);
+    const oldRevision = openclaw.value.agents.find((agent: { id: string }) => agent.id === 'openclaw').revision;
+    const slash = await post(WEB_ROUTES.agentSave, { id: 'openclaw', endpoint: 'https://claw.tailnet.ts.net/' });
+    expect(slash.ok).toBe(true);
+    expect(manager.getConfig('openclaw')?.token).toBe('claw-test-secret');
+    const staleSession = { agentId: 'openclaw', revision: oldRevision, sessionId: 'agent:main:main' };
+    const [staleAsk, staleHistory] = await Promise.all([
+      post(WEB_ROUTES.ask, { ...staleSession, message: 'stale turn' }),
+      post(WEB_ROUTES.sessions, staleSession),
+    ]);
+    expect(staleAsk).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
+    expect(staleHistory).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
+
     // Deleted static agent stays deleted when plugin reloads
     const registeredTools: string[] = [];
     const effects: Array<() => Promise<void>> = [];
@@ -322,7 +347,10 @@ describe('web UI host routes & schemastery Config', () => {
       return (await res.json()) as any;
     };
 
-    const sessionsRes = await post(WEB_ROUTES.sessions, { agentId: 'slow-hermes' });
+    const sessionsRes = await post(WEB_ROUTES.sessions, {
+      agentId: 'slow-hermes',
+      revision: manager.list()[0]?.revision,
+    });
     expect(sessionsRes.ok).toBe(false);
     expect(sessionsRes.error).toMatch(/timed out/i);
 

@@ -48,7 +48,7 @@ describe('Hermes API Server adapter', () => {
       } else if (request.url === '/v1/capabilities') {
         response.end(capabilities);
       } else if (request.url === '/api/sessions?source=api_server') {
-        response.end('{"sessions":[{"id":"api-chat","source":"api_server","title":"Remote chat"}]}');
+        response.end('{"object":"list","data":[{"id":"api-chat","source":"api_server","title":"Remote chat"}]}');
       } else {
         response.writeHead(404).end('{}');
       }

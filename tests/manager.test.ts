@@ -92,6 +92,39 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
+  it('keeps an exclusive session locked while remote cancellation is pending', async () => {
+    let acknowledge!: () => void;
+    let cancellations = 0;
+    const pending = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    class PendingCancelAdapter extends FakeAdapter {
+      override async *prompt(
+        _sessionId: string | undefined,
+        _text: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        if (signal?.aborted) return;
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+      }
+
+      override cancel(): Promise<void> {
+        cancellations++;
+        return pending;
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new PendingCancelAdapter(config.id));
+    const job = manager.start(config.id, 'panel turn', 'shared', undefined, true);
+    const cancelling = manager.cancel(job.id);
+    await manager.wait(job.id);
+    const retry = manager.cancel(job.id);
+    expect(() => manager.start(config.id, 'tool turn', 'shared')).toThrow(/active or cancelling job/);
+    expect(cancellations).toBe(1);
+    acknowledge();
+    await Promise.all([cancelling, retry]);
+    await manager.close();
+  });
+
   it('tracks jobs, approvals and completion notifications', async () => {
     const adapter = new FakeAdapter('remote');
     const manager = new AgentManager([config], 10_000, () => adapter);

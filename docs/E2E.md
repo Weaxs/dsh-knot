@@ -18,7 +18,7 @@ Every job tests exactly one target:
 2. Start a task that asks the model to remember and return a random token.
 3. Require a completed result containing that token.
 4. Continue the same remote session and ask the model to repeat it.
-5. Require the second result to contain the same token.
+5. Require the second result to contain the same token. Native Hermes also verifies that the session appears in history.
 
 The second response verifies a real model invocation and remote session continuity. A manual `workflow_dispatch` without required credentials fails explicitly. Push and scheduled runs emit a visible warning and skip only the missing E2E jobs; they never substitute mocks or report skipped jobs as passing.
 
