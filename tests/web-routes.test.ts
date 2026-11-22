@@ -1,9 +1,9 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as plugin from '../src/index.js';
 
 import { apply, Config } from '../src/index.js';
@@ -50,10 +50,16 @@ const sessionsController: SessionControllerLike = {
 };
 
 let mcp: McpServer | undefined;
+let stateDir: string;
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), 'dsh-knot-web-'));
+  vi.stubEnv('DSH_KNOT_STATE_DIR', stateDir);
+});
 afterEach(async () => {
   await mcp?.close();
   mcp = undefined;
-  delete process.env.DSH_KNOT_STATE_DIR;
+  vi.unstubAllEnvs();
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 describe('web UI host routes & schemastery Config', () => {
@@ -67,8 +73,12 @@ describe('web UI host routes & schemastery Config', () => {
 
   it('serves state, doctor, sessions, respond, cancel, and live mcp-share toggles', async () => {
     const config: AgentConfig = { id: 'hermes-local', kind: 'hermes', transport: 'local', port: 8642 };
+    writeFileSync(
+      join(stateDir, 'agents.json'),
+      JSON.stringify([{ id: 'legacy', kind: 'hermes', ssh: 'gpu-box', token: 'legacy-secret-token' }]),
+    );
     const adapter = new StubAdapter('hermes-local');
-    const manager = new AgentManager([config], 10_000, () => adapter);
+    const manager = new AgentManager([config, ...loadStoredState().agents], 10_000, () => adapter);
     mcp = new McpServer({ port: 0, token: 'secret-tok', allowSessions: [] }, sessionsController);
     await mcp.start();
 
@@ -102,8 +112,12 @@ describe('web UI host routes & schemastery Config', () => {
 
     const initial = await post(WEB_ROUTES.state);
     expect(initial.ok).toBe(true);
-    expect(initial.value.agents).toHaveLength(1);
+    expect(initial.value.agents).toHaveLength(2);
     expect(initial.value.agents[0].connection.status).toBe('unverified');
+    expect(initial.value.agents[1]).toMatchObject({ id: 'legacy', connection: { status: 'error' } });
+    expect(JSON.stringify(initial)).not.toMatch(/gpu-box|legacy-secret-token/);
+    const legacyAsk = await post(WEB_ROUTES.ask, { agentId: 'legacy', message: 'hello' });
+    expect(legacyAsk).toMatchObject({ ok: false, error: expect.stringMatching(/enter its gateway endpoint/) });
     expect(initial.value.mcp.enabled).toBe(true);
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
@@ -133,9 +147,7 @@ describe('web UI host routes & schemastery Config', () => {
     expect(asked.value.sessionId).toBe('remote-1');
     await post(WEB_ROUTES.cancel, { jobId: asked.value.id });
 
-    const keys = await post(WEB_ROUTES.sshKeys);
-    expect(keys.ok).toBe(true);
-    expect(Array.isArray(keys.value.keys)).toBe(true);
+    expect(routes.has('/api/dsh-knot/ssh-keys')).toBe(false);
 
     const job = manager.start('hermes-local', 'test', undefined);
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -151,7 +163,6 @@ describe('web UI host routes & schemastery Config', () => {
     expect(cancelled.ok).toBe(true);
     expect(cancelled.value.status).toBe('cancelled');
 
-    process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-store-'));
     const toggledPersisted = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggledPersisted.ok).toBe(true);
     expect(loadStoredState().allowSessions).toEqual(['local-1']);
@@ -186,15 +197,12 @@ describe('web UI host routes & schemastery Config', () => {
     const cleared = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
       kind: 'hermes',
-      transport: 'ssh',
-      ssh: 'gpu-2',
-      host: '100.64.0.9',
-      tls: true,
+      transport: 'local',
       clearToken: true,
     });
     expect(cleared.ok).toBe(true);
     expect(manager.getConfig('hermes-second')?.token).toBeUndefined();
-    expect(manager.getConfig('hermes-second')?.host).toBeUndefined();
+    expect(manager.getConfig('hermes-second')?.host).toBe('127.0.0.1');
     expect(manager.getConfig('hermes-second')?.tls).toBeUndefined();
 
     // Deleting an agent records a tombstone in deletedIds and aborts in-flight jobs
@@ -216,12 +224,19 @@ describe('web UI host routes & schemastery Config', () => {
     expect(savedIds).toContain('concurrent-a');
     expect(savedIds).toContain('concurrent-b');
 
-    // Saving Tailscale Serve HTTPS endpoint and direct SSH + ACP runtime user fields
+    // An endpoint URL owns the port, including when switching from an older HTTP endpoint.
+    const oldEndpoint = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      kind: 'hermes',
+      endpoint: 'http://aws-box.tail1234.ts.net:8642/legacy',
+    });
+    expect(oldEndpoint.ok).toBe(true);
     const tsSaved = await post(WEB_ROUTES.agentSave, {
       id: 'aws-tailscale',
       kind: 'hermes',
       transport: 'direct',
       endpoint: 'https://aws-box.tail1234.ts.net/hermes',
+      port: 8642,
       token: 'ts-secret',
     });
     expect(tsSaved.ok).toBe(true);
@@ -232,28 +247,28 @@ describe('web UI host routes & schemastery Config', () => {
       basePath: '/hermes',
     });
 
-    const sshSaved = await post(WEB_ROUTES.agentSave, {
-      id: 'aws-ssh-acp',
-      kind: 'acp',
+    const rejectedSsh = await post(WEB_ROUTES.agentSave, {
+      id: 'ssh-agent',
+      kind: 'hermes',
       transport: 'ssh',
-      sshHost: 'ec2-1-2-3-4.compute.amazonaws.com',
-      sshPort: 22,
-      sshUser: 'ubuntu',
-      sshIdentityFile: '~/.ssh/aws.pem',
-      acpTransport: 'stdio',
-      acpCommand: '/root/.local/bin/hermes',
-      acpArgs: ['acp'],
-      acpRuntimeUser: 'root',
-      acpLauncher: 'sudo -n /usr/local/bin/hermes-acp',
     });
-    expect(sshSaved.ok).toBe(true);
-    expect(manager.getConfig('aws-ssh-acp')).toMatchObject({
-      sshHost: 'ec2-1-2-3-4.compute.amazonaws.com',
-      sshPort: 22,
-      sshUser: 'ubuntu',
-      sshIdentityFile: '~/.ssh/aws.pem',
-      acpRuntimeUser: 'root',
-      acpLauncher: 'sudo -n /usr/local/bin/hermes-acp',
+    expect(rejectedSsh).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/SSH connections are no longer supported/),
+    });
+
+    const migrated = await post(WEB_ROUTES.agentSave, {
+      id: 'legacy',
+      transport: 'direct',
+      endpoint: 'https://legacy.tailnet.ts.net',
+    });
+    expect(migrated.ok).toBe(true);
+    expect(loadStoredState().agents.find((agent) => agent.id === 'legacy')).toMatchObject({
+      transport: 'direct',
+      host: 'legacy.tailnet.ts.net',
+      port: 443,
+      tls: true,
+      token: 'legacy-secret-token',
     });
 
     // Deleted static agent stays deleted when plugin reloads
@@ -269,7 +284,7 @@ describe('web UI host routes & schemastery Config', () => {
     for (const cleanup of effects) await cleanup();
 
     // Corrupted agents.json throws instead of silently wiping state
-    writeFileSync(join(process.env.DSH_KNOT_STATE_DIR, 'agents.json'), '{broken-json', 'utf8');
+    writeFileSync(join(stateDir, 'agents.json'), '{broken-json', 'utf8');
     expect(() => loadStoredState()).toThrow();
 
     await manager.close();
@@ -340,8 +355,7 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it('activates cleanly in real Cordis 4.1.0 without sessionController, mounts all 8 routes on connection, and gates agent_respond with ask', async () => {
-    process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-cordis-'));
+  it('activates cleanly in real Cordis 4.1.0 without sessionController, mounts routes on connection, and gates agent_respond with ask', async () => {
     const root = new Context();
     const registeredTools: string[] = [];
     const registeredRoutes: string[] = [];
@@ -353,7 +367,7 @@ describe('web UI host routes & schemastery Config', () => {
     await fiber;
     expect(registeredTools).toHaveLength(7);
 
-    // Providing connection later mounts all 8 Dashboard routes on the injected child context
+    // Providing connection later mounts the Dashboard routes on the injected child context.
     (root as any).provide('connection');
     (root as any).set('connection', {
       fetch: {

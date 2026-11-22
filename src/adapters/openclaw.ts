@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
@@ -20,7 +20,7 @@ export class OpenClawAdapter implements AgentAdapter {
     gateway?: GatewayWebSocket,
   ) {
     this.transport = transport ?? transportFor(config);
-    this.gateway = gateway ?? new GatewayWebSocket(this.transport, config.connectTimeoutMs ?? 30_000);
+    this.gateway = gateway ?? new GatewayWebSocket(config.connectTimeoutMs ?? 30_000);
   }
 
   async health(signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -220,14 +220,15 @@ export class OpenClawAdapter implements AgentAdapter {
       throw new Error(
         `${this.id}: configure the agent token in DSH Knot UI (or tokenEnv / OPENCLAW_GATEWAY_TOKEN) for the OpenClaw gateway`,
       );
-    const host = this.transport.kind === 'ssh' ? '127.0.0.1' : (this.config.host ?? '127.0.0.1');
+    const host = urlHost(this.config.host ?? '127.0.0.1');
     const port = this.config.port ?? 18_789;
-    const origin = this.config.origin ?? `http://${host}:${port}`;
+    const tls = this.config.tls === true;
     await this.gateway.openWebSocket({
       host,
       port,
-      tls: this.transport.kind !== 'ssh' && this.config.tls === true,
-      origin,
+      tls,
+      path: this.config.basePath,
+      origin: this.config.origin,
     });
     const identity = loadOrCreateIdentity(this.id);
     const challenge = await withTimeout(

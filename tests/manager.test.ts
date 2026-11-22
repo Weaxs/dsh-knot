@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { runDoctor } from '../src/doctor.js';
 import { AgentManager } from '../src/manager.js';
 import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
 
@@ -27,9 +28,30 @@ class FakeAdapter implements AgentAdapter {
   async close() {}
 }
 
-const config: AgentConfig = { id: 'remote', kind: 'hermes', ssh: 'box' };
+const config: AgentConfig = { id: 'remote', kind: 'hermes', transport: 'local' };
 
 describe('AgentManager', () => {
+  it('does not apply a doctor result from an agent replaced during the check', async () => {
+    let completeProbe!: (result: { ok: boolean }) => void;
+    const probe = new Promise<{ ok: boolean }>((resolve) => {
+      completeProbe = resolve;
+    });
+    class SlowHealthAdapter extends FakeAdapter {
+      override health() {
+        return probe;
+      }
+    }
+    const manager = new AgentManager([config], 10_000, (current) =>
+      current === config ? new SlowHealthAdapter(current.id) : new FakeAdapter(current.id),
+    );
+    const checking = runDoctor(manager, config.id);
+    await manager.upsert({ ...config, port: 443 });
+    completeProbe({ ok: true });
+    await checking;
+    expect(manager.list()[0]?.connection.status).toBe('unverified');
+    await manager.close();
+  });
+
   it('tracks jobs, approvals and completion notifications', async () => {
     const adapter = new FakeAdapter('remote');
     const manager = new AgentManager([config], 10_000, () => adapter);

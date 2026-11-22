@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import WebSocket, { type RawData } from 'ws';
 import { AsyncQueue } from '../async-queue.js';
-import type { Transport } from '../types.js';
 
 interface Pending {
   resolve: (value: Record<string, any>) => void;
@@ -17,25 +16,25 @@ export class GatewayWebSocket {
   private readonly subscribers = new Set<AsyncQueue<Record<string, any>>>();
   private connected = false;
 
-  constructor(
-    private readonly transport: Transport,
-    private readonly timeoutMs = 30_000,
-  ) {}
+  constructor(private readonly timeoutMs = 30_000) {}
 
   get isOpen(): boolean {
     return this.connected;
   }
 
-  async openWebSocket(options: { host: string; port: number; tls?: boolean; origin: string }): Promise<void> {
+  async openWebSocket(options: {
+    host: string;
+    port: number;
+    tls?: boolean;
+    path?: string;
+    origin?: string;
+  }): Promise<void> {
     if (this.connected) return;
     this.events = new AsyncQueue<Record<string, any>>(64);
     const protocol = options.tls ? 'wss' : 'ws';
-    const ws = new WebSocket(`${protocol}://${options.host}:${options.port}/`, 'json', {
-      origin: options.origin,
+    const ws = new WebSocket(`${protocol}://${options.host}:${options.port}${options.path ?? '/'}`, 'json', {
+      ...(options.origin ? { origin: options.origin } : {}),
       handshakeTimeout: this.timeoutMs,
-      ...(this.transport.kind === 'ssh' && this.transport.socket
-        ? { createConnection: () => this.transport.socket!() }
-        : {}),
     });
     this.ws = ws;
     ws.on('message', (data) => this.message(data));

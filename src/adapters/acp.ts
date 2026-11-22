@@ -13,12 +13,11 @@ import {
   type RequestPermissionResponse,
   type SessionUpdate,
 } from '@agentclientprotocol/sdk';
-import { createWebSocketStream, type WebSocketConstructor } from '@agentclientprotocol/sdk/experimental/ws-client';
+import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
-import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
 import { transportFor } from '../transports/http.js';
-import { shellQuote, sshBaseArguments, sshTarget } from '../transports/stdio-socket.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
 
@@ -435,22 +434,26 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private openWebSocket() {
-    const host = this.transport.kind === 'ssh' ? '127.0.0.1' : (this.config.host ?? '127.0.0.1');
-    const protocol = this.transport.kind !== 'ssh' && this.config.tls ? 'wss' : 'ws';
-    const basePath =
-      this.transport.kind !== 'ssh' && this.config.basePath ? this.config.basePath.replace(/\/+$/, '') : '';
+    const host = urlHost(this.config.host ?? '127.0.0.1');
+    const protocol = this.config.tls ? 'wss' : 'ws';
+    const basePath = this.config.basePath?.replace(/\/+$/, '') ?? '';
     const token = secret(this.config);
     return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${basePath}/acp`, {
-      WebSocket: acpWebSocketConstructor(this.transport),
+      WebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
     });
   }
 
   private openStdio() {
-    const spec = acpStdioSpawnSpec(this.config);
+    if (this.config.transport !== 'local' || !this.config.acpCommand?.trim()) {
+      throw new Error('ACP stdio requires local transport and acpCommand');
+    }
     this.childStderr = '';
     const stderrDecoder = new StringDecoder('utf8');
-    const child = spawn(spec.command, spec.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(this.config.acpCommand, this.config.acpArgs ?? [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
     this.child = child;
     child.stderr?.on('data', (chunk: Buffer) => {
       this.childStderr = (this.childStderr + stderrDecoder.write(chunk)).slice(-8_192);
@@ -519,41 +522,6 @@ function acpEvent(update: SessionUpdate): AgentEvent | undefined {
     return { type: 'error', text: update.description ?? update.title };
   }
   return undefined;
-}
-
-function acpWebSocketConstructor(transport: Transport): WebSocketConstructor {
-  if (transport.kind !== 'ssh') return WebSocket;
-  return class AcpWebSocket extends WebSocket {
-    constructor(url: string, protocols?: string | string[], options?: { headers?: Record<string, string> }) {
-      super(url, protocols, { ...options, createConnection: () => transport.socket!() });
-    }
-  };
-}
-
-export function acpRemoteCommandTokens(config: AgentConfig): string[] {
-  const args = config.acpArgs ?? [];
-  if (config.acpLauncher?.trim()) {
-    const launcherTokens = config.acpLauncher.trim().split(/\s+/).filter(Boolean);
-    return [...launcherTokens, ...args];
-  }
-  const command = config.acpCommand!;
-  if (config.acpRuntimeUser?.trim()) {
-    return ['sudo', '-n', '-u', config.acpRuntimeUser.trim(), '--', command, ...args];
-  }
-  return [command, ...args];
-}
-
-export function acpStdioSpawnSpec(config: AgentConfig): { command: string; args: string[] } {
-  const tokens = acpRemoteCommandTokens(config);
-  if ((config.transport ?? 'ssh') !== 'ssh') {
-    const [command, ...args] = tokens;
-    return { command: command!, args };
-  }
-  const remoteCommand = tokens.map(shellQuote).join(' ');
-  return {
-    command: 'ssh',
-    args: [...sshBaseArguments(config), sshTarget(config), '--', remoteCommand],
-  };
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number, label: string, signal?: AbortSignal): Promise<T> {

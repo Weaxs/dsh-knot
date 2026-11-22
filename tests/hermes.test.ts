@@ -1,4 +1,5 @@
-import type { IncomingMessage } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { HermesAdapter } from '../src/adapters/hermes.js';
@@ -15,7 +16,8 @@ class FakeTransport implements Transport {
   async request(request: HttpRequest): Promise<HttpResponse> {
     this.requests.push(request);
     if (request.path === '/health') return { status: 200, headers: {}, text: '{"ok":true}' };
-    if (request.path === '/api/sessions')
+    if (request.path === '/v1/models') return { status: 200, headers: {}, text: '{"object":"list","data":[]}' };
+    if (request.path === '/api/sessions?source=api_server')
       return { status: 200, headers: {}, text: '[{"session_id":"s1","title":"Research"}]' };
     if (request.path === '/v1/runs') return { status: 202, headers: {}, text: '{"run_id":"run_1","status":"started"}' };
     if (request.path === '/v1/runs/run_1/stop') return { status: 200, headers: {}, text: '{}' };
@@ -31,6 +33,35 @@ class FakeTransport implements Transport {
 }
 
 describe('Hermes API Server adapter', () => {
+  it('verifies credentials and requests only resumable API sessions through the direct endpoint', async () => {
+    const server = createServer((request, response) => {
+      response.setHeader('Content-Type', 'application/json');
+      if (request.url === '/health') {
+        response.end('{"status":"ok","platform":"hermes-agent"}');
+      } else if (request.headers.authorization !== 'Bearer hermes-test-key') {
+        response.writeHead(401).end('{"error":{"message":"Invalid API key"}}');
+      } else if (request.url === '/v1/models') {
+        response.end('{"object":"list","data":[{"id":"hermes-agent"}]}');
+      } else if (request.url === '/api/sessions?source=api_server') {
+        response.end('{"sessions":[{"id":"api-chat","source":"api_server","title":"Remote chat"}]}');
+      } else {
+        response.writeHead(404).end('{}');
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const config = { id: 'hermes', kind: 'hermes', transport: 'direct', host: '127.0.0.1', port } as const;
+      const unauthorized = new HermesAdapter('hermes', { ...config, token: 'wrong-key' });
+      await expect(unauthorized.health()).rejects.toThrow(/HTTP 401/);
+      const authorized = new HermesAdapter('hermes', { ...config, token: 'hermes-test-key' });
+      await expect(authorized.health()).resolves.toEqual({ status: 'ok', platform: 'hermes-agent' });
+      await expect(authorized.listSessions()).resolves.toEqual([{ id: 'api-chat', title: 'Remote chat' }]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('starts a run and normalizes SSE events', async () => {
     const transport = new FakeTransport();
     const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);

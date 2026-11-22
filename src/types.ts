@@ -1,19 +1,12 @@
 import type { IncomingMessage } from 'node:http';
-import type { Duplex } from 'node:stream';
 
-export type TransportKind = 'ssh' | 'direct' | 'local';
+export type TransportKind = 'direct' | 'local';
 export type AgentKind = 'hermes' | 'openclaw' | 'dsh' | 'acp';
 
 export interface AgentConfig {
   id: string;
   kind: AgentKind;
-  transport?: TransportKind;
-  ssh?: string;
-  sshHost?: string;
-  sshPort?: number;
-  sshUser?: string;
-  sshIdentityFile?: string;
-  sshConfig?: string;
+  transport?: TransportKind | 'ssh'; // Legacy SSH entries remain visible for migration.
   host?: string;
   port?: number;
   tls?: boolean;
@@ -29,8 +22,6 @@ export interface AgentConfig {
   acpTransport?: 'websocket' | 'stdio';
   acpCommand?: string;
   acpArgs?: string[];
-  acpRuntimeUser?: string;
-  acpLauncher?: string;
   connectTimeoutMs?: number;
 }
 
@@ -114,7 +105,6 @@ export interface Transport {
   readonly kind: TransportKind;
   request(request: HttpRequest): Promise<HttpResponse>;
   stream(request: HttpRequest): Promise<IncomingMessage>;
-  socket?(): Duplex;
   close(): Promise<void>;
 }
 

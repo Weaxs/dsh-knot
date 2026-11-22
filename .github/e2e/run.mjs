@@ -6,6 +6,8 @@ const protocol = process.env.E2E_PROTOCOL ?? 'native';
 const label = `${process.env.E2E_MODE_LABEL ?? mode}/${protocol}`;
 const timeoutMs = Number(process.env.E2E_TASK_TIMEOUT_MS ?? 180_000);
 
+if (mode !== 'local' && mode !== 'direct') throw new Error(`Unsupported E2E transport: ${mode}`);
+
 for (const name of ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL_NAME']) {
   if (!process.env[name]) throw new Error(`${name} is required for real model-backed E2E tests`);
 }
@@ -19,9 +21,7 @@ function agentConfig(kind) {
       id: `acp-${kind}-${label}`,
       kind: 'acp',
       transport,
-      ...(transport === 'ssh'
-        ? { ssh: process.env[`${upper}_SSH_ALIAS`] ?? `${kind}-e2e`, sshConfig: process.env.E2E_SSH_CONFIG }
-        : { host }),
+      host,
       port: 18792,
       token: 'e2e-acp-token',
       dshCwd: '/tmp',
@@ -32,9 +32,7 @@ function agentConfig(kind) {
     id: `${kind}-${label}`,
     kind,
     transport,
-    ...(transport === 'ssh'
-      ? { ssh: process.env[`${upper}_SSH_ALIAS`] ?? `${kind}-e2e`, sshConfig: process.env.E2E_SSH_CONFIG }
-      : { host }),
+    host,
     port: Number(process.env[`${upper}_PORT`] ?? (kind === 'hermes' ? 8642 : kind === 'openclaw' ? 18789 : 18790)),
     token:
       process.env[

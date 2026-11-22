@@ -58,4 +58,15 @@ describe('HTTP transport', () => {
     expect(JSON.parse(ok.text)).toEqual({ url: '/hermes/health' });
     await expect(transport.request({ path: '/stall' })).rejects.toThrow(/timed out/);
   });
+
+  it('bounds a stalled HTTP error body', async () => {
+    server = http.createServer((_request, response) => {
+      response.writeHead(503);
+      response.flushHeaders();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const transport = new NodeHttpTransport('local', { id: 'x', kind: 'hermes', port, connectTimeoutMs: 120 });
+    await expect(transport.request({ path: '/health' })).rejects.toThrow(/timed out/);
+  });
 });

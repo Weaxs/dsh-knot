@@ -4,14 +4,13 @@ The `Transport Integration Tests` workflow starts official Hermes and OpenClaw i
 
 ## Jobs
 
-The matrix reports **24 independent transport/target/protocol jobs**: every transport is tested separately with `hermes`, `openclaw`, and `dsh`, once through the native adapter and once through the unified ACP provider. Native jobs exercise the existing gateway directly. ACP jobs start a bridge in the target's shared network namespace and connect to it with the official ACP v1 WebSocket transport, so the ACP bytes cross the same Local, SSH, Tailscale, or Headscale path.
+The matrix reports **18 independent transport/target/protocol jobs**. Each transport is tested separately with `hermes`, `openclaw`, and `dsh`, once through the native adapter and once through the unified ACP provider. Native jobs exercise the existing gateway directly. ACP jobs start a bridge in the target's shared network namespace and connect to it with the official ACP v1 WebSocket transport over the same network path.
 
-| Transport   | Actual network path                                                   | Additional infrastructure                                                         |
-| ----------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `local`     | Plugin → loopback-published gateway port                              | Official agent containers or the DSH test image                                   |
-| `ssh`       | Plugin → system OpenSSH `ssh -W` → SSH container → gateway            | `linuxserver/openssh-server` with its SSH tunnel mod and an ephemeral ED25519 key |
-| `tailscale` | Plugin → runner tailnet → sidecar tailnet IP → gateway                | Tailscale runner action and one sidecar per job                                   |
-| `headscale` | Plugin → self-hosted Headscale tailnet → sidecar tailnet IP → gateway | Headscale control plane and one Tailscale sidecar per job                         |
+| Transport   | Actual network path                                                   | Additional infrastructure                                 |
+| ----------- | --------------------------------------------------------------------- | --------------------------------------------------------- |
+| `local`     | Plugin → loopback-published gateway port                              | Official agent containers or the DSH test image           |
+| `tailscale` | Plugin → runner tailnet → sidecar tailnet IP → gateway                | Tailscale runner action and one sidecar per job           |
+| `headscale` | Plugin → self-hosted Headscale tailnet → sidecar tailnet IP → gateway | Headscale control plane and one Tailscale sidecar per job |
 
 Every job tests exactly one target:
 
@@ -50,7 +49,7 @@ If `OPENAI_BASE_URL` points to `127.0.0.1` or `localhost`, the generated contain
 
 ## OpenClaw device approval
 
-- Local and SSH-forwarded connections use OpenClaw's trusted loopback auto-approval behavior.
+- Local connections use OpenClaw's trusted loopback auto-approval behavior.
 - Tailscale and Headscale are remote connections. A sidecar watches `openclaw devices list --json` and calls `openclaw devices approve <requestId>` for new test devices.
 
 This is real OpenClaw pairing, not a bypass in the plugin. Each test run persists its own Ed25519 device identity for that gateway connection.
@@ -67,7 +66,7 @@ The DSH image starts `dsh web` on loopback, captures its random launch token, an
 - `session/list`
 - `session/cancel`
 
-This keeps DSH's browser trust boundary intact while exercising the same RPC path over Local, SSH, Tailscale, and Headscale. It does not expose a wildcard DSH listener or replace authentication with a static token.
+This keeps DSH's authenticated browser trust boundary intact while exercising the same RPC path over Local, Tailscale, and Headscale.
 
 ## Running the workflow
 
@@ -83,7 +82,7 @@ bash .github/e2e/scripts/run-compose.sh local dsh
 E2E_PROTOCOL=acp bash .github/e2e/scripts/run-compose.sh local dsh
 ```
 
-For Tailscale mode, also export `TAILSCALE_AUTHKEY` and connect the local machine to the same tailnet first. The Headscale script starts its own control plane and joins the local machine to it. Docker is required for all four modes; installing Hermes, OpenClaw, or DSH on the host is not.
+For Tailscale mode, also export `TAILSCALE_AUTHKEY` and connect the local machine to the same tailnet first. The Headscale script starts its own control plane and joins the local machine to it. All three modes use Docker to run the target agents.
 
 ## Logs and cleanup
 

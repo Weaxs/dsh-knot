@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mode="${1:?usage: run-compose.sh local|ssh|tailscale|headscale hermes|openclaw|dsh}"
-target="${2:?usage: run-compose.sh local|ssh|tailscale|headscale hermes|openclaw|dsh}"
-case "$mode" in local|ssh|tailscale|headscale) ;; *) echo "unknown mode $mode" >&2; exit 2 ;; esac
+mode="${1:?usage: run-compose.sh local|tailscale|headscale hermes|openclaw|dsh}"
+target="${2:?usage: run-compose.sh local|tailscale|headscale hermes|openclaw|dsh}"
+case "$mode" in local|tailscale|headscale) ;; *) echo "unknown mode $mode" >&2; exit 2 ;; esac
 case "$target" in hermes|openclaw|dsh) ;; *) echo "unknown target $target" >&2; exit 2 ;; esac
 export E2E_TARGET="$target" E2E_PROTOCOL="${E2E_PROTOCOL:-native}"
 case "$E2E_PROTOCOL" in native|acp) ;; *) echo "unknown protocol $E2E_PROTOCOL" >&2; exit 2 ;; esac
@@ -59,41 +59,6 @@ case "$mode" in
   local)
     export E2E_TRANSPORT=local E2E_MODE_LABEL=local HERMES_PORT=18642 OPENCLAW_PORT=18789 DSH_PORT=18790
     ;;
-  ssh)
-    export E2E_TRANSPORT=ssh E2E_MODE_LABEL=ssh HERMES_PORT=8642 OPENCLAW_PORT=18789 DSH_PORT=18790
-    ssh-keygen -q -t ed25519 -N '' -f .github/e2e/generated/id_ed25519
-    chmod 600 .github/e2e/generated/id_ed25519
-    export E2E_SSH_PUBLIC_KEY="$(cat .github/e2e/generated/id_ed25519.pub)"
-    cat > .github/e2e/generated/ssh_config <<'EOF'
-Host hermes-e2e
-  HostName 127.0.0.1
-  Port 22022
-  User agent
-  IdentityFile .github/e2e/generated/id_ed25519
-  IdentitiesOnly yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-
-Host openclaw-e2e
-  HostName 127.0.0.1
-  Port 22023
-  User agent
-  IdentityFile .github/e2e/generated/id_ed25519
-  IdentitiesOnly yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-
-Host dsh-e2e
-  HostName 127.0.0.1
-  Port 22024
-  User agent
-  IdentityFile .github/e2e/generated/id_ed25519
-  IdentitiesOnly yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-EOF
-    export E2E_SSH_CONFIG="$root/.github/e2e/generated/ssh_config"
-    ;;
   tailscale)
     if [[ -z "${TAILSCALE_AUTHKEY:-}" ]]; then
       echo 'TAILSCALE_AUTHKEY is required for the real Tailscale E2E job' >&2
@@ -132,18 +97,6 @@ EOF
 esac
 
 "${compose[@]}" up -d --wait
-
-if [[ "$mode" == ssh ]]; then
-  ssh_ready=false
-  for _ in {1..30}; do
-    if ssh -F "$E2E_SSH_CONFIG" -T -o BatchMode=yes -o ConnectTimeout=10 "$target-e2e" true; then
-      ssh_ready=true
-      break
-    fi
-    sleep 2
-  done
-  if [[ "$ssh_ready" != true ]]; then echo 'SSH login did not become ready' >&2; exit 1; fi
-fi
 
 if [[ "$mode" == tailscale || "$mode" == headscale ]]; then
   connected=false

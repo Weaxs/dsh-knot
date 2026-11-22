@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import type { AgentConfig, PluginConfig } from './types.js';
 
 export class ConfigError extends Error {
@@ -8,15 +9,18 @@ export class ConfigError extends Error {
 }
 
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/;
+export const LEGACY_SSH_ERROR =
+  'SSH connections are no longer supported. Edit this agent and enter its gateway endpoint.';
 
 export function normalizeConfig(
   input: PluginConfig = {},
+  { allowLegacySsh = false } = {},
 ): Required<Pick<PluginConfig, 'agents' | 'jobTimeoutMs'>> & PluginConfig {
   if (typeof input !== 'object' || input === null || Array.isArray(input))
     throw new ConfigError('config must be an object');
   if (input.agents !== undefined && !Array.isArray(input.agents)) throw new ConfigError('agents must be an array');
   const ids = new Set<string>();
-  const agents = (input.agents ?? []).map((agent) => normalizeAgent(agent, ids));
+  const agents = (input.agents ?? []).map((agent) => normalizeAgent(agent, ids, allowLegacySsh));
   const timeout = input.jobTimeoutMs ?? 1_800_000;
   if (!Number.isSafeInteger(timeout) || timeout < 1_000 || timeout > 86_400_000) {
     throw new ConfigError('jobTimeoutMs must be between 1000 and 86400000');
@@ -28,70 +32,80 @@ export function normalizeConfig(
   return { ...input, agents, jobTimeoutMs: timeout };
 }
 
-function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
+function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: boolean): AgentConfig {
   if (typeof agent !== 'object' || agent === null) throw new ConfigError('each agent must be an object');
-  if (!ID.test(agent.id)) throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
+  if (typeof agent.id !== 'string' || !ID.test(agent.id))
+    throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
   if (ids.has(agent.id)) throw new ConfigError(`duplicate agent id: ${agent.id}`);
   ids.add(agent.id);
   if (!['hermes', 'openclaw', 'dsh', 'acp'].includes(agent.kind))
     throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
-  const transport = agent.transport ?? 'ssh';
-  if (!['ssh', 'direct', 'local'].includes(transport)) throw new ConfigError(`${agent.id}: invalid transport`);
-  if (agent.ssh !== undefined && (agent.ssh.startsWith('-') || !/^\S+$/.test(agent.ssh))) {
-    throw new ConfigError(`${agent.id}: ssh must be one host alias without spaces`);
+  const transport = configuredTransport(agent);
+  if (transport === 'ssh') {
+    if (!allowLegacySsh) throw new ConfigError(`${agent.id}: ${LEGACY_SSH_ERROR}`);
+    return {
+      id: agent.id,
+      kind: agent.kind,
+      transport,
+      token: agent.token,
+      tokenEnv: agent.tokenEnv,
+      model: agent.model,
+      openclawAgentId: agent.openclawAgentId,
+      dshProvider: agent.dshProvider,
+      dshCwd: agent.dshCwd,
+      reasoningEffort: agent.reasoningEffort,
+      connectTimeoutMs: agent.connectTimeoutMs,
+    };
   }
-  if (agent.sshHost !== undefined && (agent.sshHost.startsWith('-') || !/^\S+$/.test(agent.sshHost))) {
-    throw new ConfigError(`${agent.id}: sshHost must be a hostname or IP without spaces`);
-  }
-  if (agent.sshUser !== undefined && (agent.sshUser.startsWith('-') || !/^\S+$/.test(agent.sshUser))) {
-    throw new ConfigError(`${agent.id}: sshUser must be a username without spaces`);
-  }
-  if (agent.sshPort !== undefined) port(agent.sshPort, `${agent.id}.sshPort`);
-  if (
-    agent.sshIdentityFile !== undefined &&
-    (!agent.sshIdentityFile.trim() || agent.sshIdentityFile.startsWith('-') || /[\0\r\n]/.test(agent.sshIdentityFile))
-  ) {
-    throw new ConfigError(`${agent.id}: invalid sshIdentityFile`);
-  }
-  if (transport === 'ssh' && !agent.ssh && !agent.sshHost) {
-    throw new ConfigError(`${agent.id}: ssh transport requires an ssh host alias or sshHost`);
+  if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
+  if (agent.acpTransport === 'stdio') {
+    if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
+    if (transport !== 'local') throw new ConfigError(`${agent.id}: ACP stdio requires local transport`);
+    if (typeof agent.acpCommand !== 'string' || !agent.acpCommand.trim()) {
+      throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand`);
+    }
   }
 
-  let parsedHost = agent.host;
+  if (agent.host !== undefined && typeof agent.host !== 'string') throw new ConfigError(`${agent.id}: invalid host`);
+  let parsedHost = agent.host?.trim() || (transport === 'local' ? '127.0.0.1' : '');
   let parsedPort = agent.port;
   let parsedTls = agent.tls;
   let parsedBasePath = agent.basePath;
 
-  if (transport !== 'ssh' && typeof parsedHost === 'string' && /^(https?|wss?):\/\//i.test(parsedHost.trim())) {
+  if (/^(https?|wss?):\/\//i.test(parsedHost)) {
     let url: URL;
     try {
-      url = new URL(parsedHost.trim());
+      url = new URL(parsedHost);
     } catch {
       throw new ConfigError(`${agent.id}: invalid endpoint URL`);
     }
-    if (!url.hostname) throw new ConfigError(`${agent.id}: invalid endpoint URL`);
+    if (!url.hostname || url.username || url.password || url.href.includes('?') || url.href.includes('#')) {
+      throw new ConfigError(`${agent.id}: endpoint URL must not contain credentials, a query, or a fragment`);
+    }
     parsedHost = url.hostname;
-    const isSecure = url.protocol === 'https:' || url.protocol === 'wss:';
-    if (isSecure) parsedTls = true;
-    else if (parsedTls === undefined) parsedTls = false;
-    if (parsedPort === undefined) {
-      parsedPort = url.port ? Number(url.port) : isSecure ? 443 : 80;
-    }
-    if (parsedBasePath === undefined && url.pathname && url.pathname !== '/') {
-      parsedBasePath = url.pathname;
-    }
+    parsedTls = url.protocol === 'https:' || url.protocol === 'wss:';
+    parsedPort = url.port ? Number(url.port) : parsedTls ? 443 : 80;
+    parsedBasePath = url.pathname;
+  }
+  if (!parsedHost) throw new ConfigError(`${agent.id}: direct transport requires a gateway endpoint`);
+  if (parsedHost.startsWith('[') && parsedHost.endsWith(']')) parsedHost = parsedHost.slice(1, -1);
+  if (!isIP(parsedHost) && !/^[\p{L}\p{N}_][\p{L}\p{N}_.-]*$/u.test(parsedHost)) {
+    throw new ConfigError(`${agent.id}: invalid host or endpoint URL`);
   }
 
   if (parsedBasePath !== undefined) {
-    const trimmed = parsedBasePath.trim().replace(/\/+$/, '');
-    if (trimmed && (!trimmed.startsWith('/') || /\s/.test(trimmed))) {
-      throw new ConfigError(`${agent.id}: basePath must start with "/" and contain no spaces`);
+    if (typeof parsedBasePath !== 'string') throw new ConfigError(`${agent.id}: invalid basePath`);
+    const trimmed = parsedBasePath.trim();
+    if (trimmed && (!trimmed.startsWith('/') || /[\s?#\\]/.test(trimmed))) {
+      throw new ConfigError(`${agent.id}: basePath must be a URL path starting with "/"`);
     }
-    parsedBasePath = trimmed || undefined;
+    // OpenClaw uses the exact WebSocket path while HTTP and ACP append their own paths.
+    parsedBasePath =
+      (agent.kind === 'openclaw' && trimmed !== '/' ? trimmed : trimmed.replace(/\/+$/, '')) || undefined;
   }
 
   const defaultPort =
-    transport === 'direct' && parsedTls === true
+    parsedTls === true
       ? 443
       : agent.kind === 'openclaw'
         ? 18_789
@@ -103,37 +117,24 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   const result: AgentConfig = {
     ...agent,
     transport,
-    ...(parsedHost !== undefined ? { host: parsedHost } : {}),
+    host: parsedHost,
     ...(parsedTls !== undefined ? { tls: parsedTls } : {}),
-    ...(parsedBasePath !== undefined ? { basePath: parsedBasePath } : {}),
+    basePath: parsedBasePath,
     port: parsedPort ?? defaultPort,
   };
   if (result.basePath === undefined) delete result.basePath;
   port(result.port!, `${agent.id}.port`);
-  if (transport !== 'ssh' && !result.host) result.host = '127.0.0.1';
-  if (result.host?.startsWith('-')) throw new ConfigError(`${agent.id}: invalid host`);
   if (
-    result.acpRuntimeUser !== undefined &&
-    (result.acpRuntimeUser.startsWith('-') || !/^\S+$/.test(result.acpRuntimeUser))
+    result.acpArgs !== undefined &&
+    (!Array.isArray(result.acpArgs) || result.acpArgs.some((arg) => typeof arg !== 'string'))
   ) {
-    throw new ConfigError(`${agent.id}: acpRuntimeUser must be a username without spaces`);
-  }
-  if (result.acpLauncher !== undefined && (!result.acpLauncher.trim() || /[\0\r\n]/.test(result.acpLauncher))) {
-    throw new ConfigError(`${agent.id}: invalid acpLauncher`);
-  }
-  if (result.acpTransport === 'stdio') {
-    if (result.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
-    if (transport === 'direct') throw new ConfigError(`${agent.id}: ACP stdio requires local or ssh transport`);
-    if (!result.acpCommand?.trim() && !result.acpLauncher?.trim()) {
-      throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand or acpLauncher`);
-    }
-  }
-  if (result.acpArgs?.some((argument) => typeof argument !== 'string')) {
     throw new ConfigError(`${agent.id}: acpArgs must be strings`);
   }
   if (
     result.connectTimeoutMs !== undefined &&
-    (!Number.isSafeInteger(result.connectTimeoutMs) || result.connectTimeoutMs < 100)
+    (!Number.isInteger(result.connectTimeoutMs) ||
+      result.connectTimeoutMs < 100 ||
+      result.connectTimeoutMs > 2_147_483_647)
   ) {
     throw new ConfigError(`${agent.id}: invalid connectTimeoutMs`);
   }
@@ -142,6 +143,14 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
 
 function port(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 1 || value > 65_535) throw new ConfigError(`${name} must be a TCP port`);
+}
+
+export function configuredTransport(agent: AgentConfig): NonNullable<AgentConfig['transport']> {
+  return agent.transport ?? ('ssh' in agent || 'sshHost' in agent ? 'ssh' : 'direct');
+}
+
+export function urlHost(host: string): string {
+  return isIP(host) === 6 ? `[${host}]` : host;
 }
 
 export function secret(agent: AgentConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {

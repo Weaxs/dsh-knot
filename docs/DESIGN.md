@@ -1,6 +1,6 @@
 # DSH Knot design
 
-Status: native and unified ACP v1 paths validated by real model-backed E2E across 24 transport/target/protocol combinations.
+The real model-backed E2E matrix covers native and ACP v1 paths across 18 network, target, and protocol combinations.
 
 ## Goals
 
@@ -17,7 +17,7 @@ The current release intentionally does not write to local dsh sessions through M
 ┌──────────────────────── local dsh ────────────────────────┐
 │ dsh-knot                                                  │
 │  adapters/    ACP provider + native compatibility drivers │
-│  transports/  ssh (default), direct, local                │
+│  transports/  direct (default), local                   │
 │  tools/       agent_list / agent_ask / agent_continue / … │
 │  manager      jobs, output, cancellation, notifications   │
 │  mcp/         read-only session export                    │
@@ -53,7 +53,7 @@ interface AgentAdapter {
 
 ### ACP v1 provider and bridge
 
-The `acp` kind is the single provider for any ACP-compatible endpoint. The official TypeScript SDK negotiates stable protocol v1 and carries JSON-RPC messages over its WebSocket transport or standard NDJSON stdio. Stdio supports local subprocesses and ACP commands started through system OpenSSH. Session aliases are mapped to the actual ACP `sessionId`, so subsequent prompts continue the same conversation. The client uses the SDK's `ActiveSession` plus one event queue to preserve update/stop ordering without losing permission events to abandoned race waiters.
+The `acp` kind is the single provider for ACP-compatible endpoints. The official TypeScript SDK negotiates stable protocol v1 and carries JSON-RPC messages over WebSocket or standard NDJSON stdio for local subprocesses. Session aliases are mapped to the actual ACP `sessionId`, so subsequent prompts continue the same conversation. The client uses the SDK's `ActiveSession` plus one event queue to preserve update/stop ordering without losing permission events to abandoned race waiters.
 
 The optional `dsh-knot-acp` bridge exposes `initialize`, `session/new`, `session/list`, `session/prompt`, `session/cancel`, `session/update`, and `session/request_permission` over WebSocket or `DSH_KNOT_ACP_STDIO=1` stdio mode. Each bridge connection constructs a native adapter for Hermes, OpenClaw, or remote DSH and translates only that adapter's normalized events. A native ACP endpoint bypasses the bridge entirely. Non-loopback bridge listeners require `DSH_KNOT_ACP_TOKEN`; native gateway credentials and ACP bearer tokens remain separate.
 
@@ -94,31 +94,17 @@ The DSH adapter uses the native Web/API connection rather than the plugin's read
 
 Session work uses `session/create`, optional `session/selectModel`, `session/prompt`, repeated `session/wait` calls while the Session is active, `session/list` for discovery, and `session/cancel` for cancellation. RPC arguments use the Remote method's parameter envelope (`request`, or `_request` for `session/list`). The adapter remembers requested-to-actual Session ID mappings so continuations prompt the existing Session instead of creating a new one. Assistant text is read only from durable `assistant/message.data.message.content` records; an empty wait output triggers a durable event read so model failures are reported instead of becoming empty successful jobs. The launch token and API Cookie are never logged.
 
-Remote deployments should keep the native listener on loopback for SSH or configure a concrete bind IP and `--trusted-host` for a private network. The CI container uses a test-only Host-rewrite bridge to preserve that trust boundary.
+Remote deployments should keep the native listener on loopback behind a private proxy or configure a concrete bind IP and `--trusted-host` for a private network. The CI container uses a test-only Host-rewrite bridge to preserve that trust boundary.
 
 ## Transports
 
-### SSH (default)
+### Direct (default)
 
-The plugin executes the system OpenSSH binary directly:
-
-```text
-ssh -T -o BatchMode=yes -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-    -W 127.0.0.1:<gateway-port> <host-alias>
-```
-
-It does not implement SSH, accept passwords, or handle private-key passphrases interactively. Host aliases come from `~/.ssh/config`; OpenSSH owns key types, algorithms, proxy commands, jump hosts, and host-key verification.
-
-For HTTP requests, one SSH process carries one request or SSE stream through a `Duplex` stdio socket. For OpenClaw, one process carries the persistent WebSocket connection. This avoids opening a local forwarding port.
-
-### Direct
-
-`direct` uses the configured hostname and port, with optional TLS. It is intended for Tailscale, Headscale, a LAN, or another trusted network. The Tailscale preset is configuration guidance rather than a separate protocol implementation: use MagicDNS hostnames and restrict gateway listeners and ACLs to the tailnet.
+`direct` uses an explicit gateway URL or a hostname and port, with optional TLS. Use it on Tailscale, Headscale, a LAN, or another trusted network. With Tailscale Serve, keep the gateway on loopback and use its HTTPS endpoint. See the [setup guide](../README.md#quick-start).
 
 ### Local
 
-`local` is the direct transport with `127.0.0.1` as the default host.
+`local` uses `127.0.0.1` as the default host and also supports ACP stdio subprocesses.
 
 ## Jobs and model tools
 
@@ -151,7 +137,7 @@ Authentication uses a bearer token from `token` or `tokenEnv` (default `DSH_KNOT
 
 ### Reverse networking
 
-With SSH, a reverse forward may map remote `127.0.0.1:19400` to the local MCP listener. With Tailscale, bind MCP to the local Tailscale address and use MagicDNS. The listener should never bind `0.0.0.0` merely to make connectivity easier.
+With Tailscale, bind MCP to the local Tailscale address and use MagicDNS. The listener refuses wildcard binds.
 
 The current release has no `dsh_session_post` tool. Adding write access later requires a separate write token, explicit per-session write permission, origin markers, and loop prevention.
 
@@ -160,15 +146,14 @@ The current release has no `dsh_session_post` tool. Adding write access later re
 - Deny session access by default.
 - Keep gateways and MCP on loopback or a trusted tailnet interface.
 - Redact common bearer tokens, API keys, JWTs, cookies, and private keys recursively before returning MCP content.
-- Do not log remote tokens, device private keys, or complete SSH configuration.
+- Do not log remote tokens, device private keys, or complete remote configuration.
 - Answer remote approvals through the user; never automatically approve by default.
-- Spawn OpenSSH directly without a shell.
 - Reuse persistent gateways instead of launching new agent services on every reconnect.
 - Bound request bodies, response bodies, watch payloads, and retained job output.
 
 ## Validation and milestones
 
-Implemented checks cover configuration, redaction, Hermes API/SSE normalization, OpenClaw pairing over a real WebSocket, device identity persistence, native DSH Session RPC, ACP prompt/continuation/tool/permission/cancel flows over the official WebSocket transport and a real NDJSON stdio subprocess, job lifecycle, local and SSH HTTP transports, and MCP authorization/read/watch behavior. The transport matrix also completes real model-backed initial tasks and same-session continuations for Hermes, OpenClaw, and remote DSH over Local, SSH, Tailscale, and Headscale.
+Implemented checks cover configuration, redaction, Hermes API/SSE normalization, OpenClaw pairing over a real WebSocket, device identity persistence, native DSH Session RPC, ACP prompt/continuation/tool/permission/cancel flows over the official WebSocket transport and a real NDJSON stdio subprocess, job lifecycle, HTTP transport, and MCP authorization/read/watch behavior. The transport matrix requires real model-backed initial tasks and same-session continuations for Hermes, OpenClaw, and remote DSH over Local, Tailscale, and Headscale.
 
 Remaining deployment milestones:
 
@@ -184,4 +169,3 @@ Remaining deployment milestones:
 - [ODSH-Bridge OpenClaw pairing reference](https://github.com/Mikoribbit/odsh-bridge)
 - [OpenClaw Gateway handshake](https://docs.openclaw.ai/gateway/protocol/handshake)
 - [Transport integration test infrastructure](E2E.md)
-- [SSH setup guide](SSH.md)

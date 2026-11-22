@@ -17,16 +17,11 @@ export const Config = Schema.object({
     Schema.object({
       id: Schema.string().required().description('Unique agent identifier (letters, digits, ., _, -).'),
       kind: Schema.union(['hermes', 'openclaw', 'dsh', 'acp']).required().description('Target protocol adapter.'),
-      transport: Schema.union(['ssh', 'direct', 'local']).default('ssh').description('Connectivity transport.'),
-      ssh: Schema.string().description('OpenSSH host alias from ~/.ssh/config (optional when sshHost is set).'),
-      sshHost: Schema.string().description(
-        'Direct SSH hostname or IP address (optional alternative to ~/.ssh/config alias).',
+      transport: Schema.union(['direct', 'local', Schema.const('ssh').required().hidden()]).description(
+        'Connectivity transport, defaults to direct.',
       ),
-      sshPort: Schema.number().description('SSH TCP port (default 22).'),
-      sshUser: Schema.string().description('SSH login username (e.g. ubuntu, ec2-user).'),
-      sshIdentityFile: Schema.string().description('Local path to PEM or OpenSSH private key (kept on-device).'),
-      sshConfig: Schema.string().description('Optional custom OpenSSH config file path.'),
-      host: Schema.string().description('Target host or full HTTPS/HTTP endpoint URL for direct or local transport.'),
+      ssh: Schema.string().hidden(),
+      host: Schema.string().description('Target hostname or full HTTP(S)/WS(S) gateway endpoint URL.'),
       port: Schema.number().description('Target TCP port (defaults per protocol, or 443 for HTTPS).'),
       tls: Schema.boolean().description('Use HTTPS/WSS for direct transport.'),
       basePath: Schema.string().description('Optional URL path prefix for direct transport (e.g. /hermes).'),
@@ -36,12 +31,6 @@ export const Config = Schema.object({
       acpTransport: Schema.union(['websocket', 'stdio']).description('ACP transport mode (websocket or stdio).'),
       acpCommand: Schema.string().description('Executable path for ACP stdio agents.'),
       acpArgs: Schema.array(Schema.string()).description('Arguments passed to acpCommand.'),
-      acpRuntimeUser: Schema.string().description(
-        'Optional remote runtime account for ACP stdio when distinct from SSH login user.',
-      ),
-      acpLauncher: Schema.string().description(
-        'Optional server-approved launcher command for ACP stdio (e.g. sudo -n /usr/local/bin/hermes-acp).',
-      ),
       connectTimeoutMs: Schema.number().description('Connection timeout in milliseconds.'),
     }),
   )
@@ -74,7 +63,7 @@ function getService<T>(ctx: Context, key: string): T | undefined {
 }
 
 export async function apply(ctx: Context, input: PluginConfig = {}): Promise<void> {
-  const config = normalizeConfig(input);
+  const config = normalizeConfig(input, { allowLegacySsh: true });
   const stored = loadStoredState();
   const deleted = new Set(stored.deletedIds);
   const merged = config.agents.filter((item) => !deleted.has(item.id));
@@ -108,10 +97,9 @@ export { HermesAdapter } from './adapters/hermes.js';
 export { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 export { OpenClawAdapter } from './adapters/openclaw.js';
 export { normalizeConfig } from './config.js';
-export { runDoctor, sshHint } from './doctor.js';
+export { runDoctor } from './doctor.js';
 export { AgentManager } from './manager.js';
 export { McpServer } from './mcp/server.js';
 export { redact, redactText } from './policy/redact.js';
 export { NodeHttpTransport, transportFor } from './transports/http.js';
-export { StdioSocket, sshArguments } from './transports/stdio-socket.js';
 export type * from './types.js';

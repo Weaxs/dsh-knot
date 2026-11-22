@@ -48,7 +48,7 @@
     <!-- Bottom Feature Chips -->
     <g transform="translate(0, 150)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5">
       <rect x="0" y="0" width="112" height="28" rx="7" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
-      <text x="56" y="18" text-anchor="middle" fill="#E2E8F0">SSH Default</text>
+      <text x="56" y="18" text-anchor="middle" fill="#E2E8F0">Direct &amp; Local</text>
 
       <rect x="124" y="0" width="132" height="28" rx="7" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
       <text x="190" y="18" text-anchor="middle" fill="#E2E8F0">Tailscale Ready</text>
@@ -57,7 +57,7 @@
       <text x="333" y="18" text-anchor="middle" fill="#E2E8F0">Read-Only MCP</text>
 
       <rect x="410" y="0" width="144" height="28" rx="7" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
-      <text x="482" y="18" text-anchor="middle" fill="#E2E8F0">24-Job Live E2E</text>
+      <text x="482" y="18" text-anchor="middle" fill="#E2E8F0">18-Job Live E2E</text>
     </g>
   </g>
 

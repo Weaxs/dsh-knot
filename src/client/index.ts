@@ -48,27 +48,14 @@ interface AgentSummary {
   transport?: 'ssh' | 'direct' | 'local';
   host?: string;
   basePath?: string;
-  ssh?: string;
-  sshHost?: string;
-  sshPort?: number;
-  sshUser?: string;
-  sshIdentityFile?: string;
   port?: number;
   tls?: boolean;
   acpTransport?: 'websocket' | 'stdio';
   acpCommand?: string;
-  acpRuntimeUser?: string;
-  acpLauncher?: string;
   model?: string;
   hasToken?: boolean;
   supportsRespond?: boolean;
   connection?: AgentConnectionState;
-}
-
-interface LocalSshKeyItem {
-  path: string;
-  name: string;
-  permissionsWarning?: string;
 }
 
 interface AgentFormState {
@@ -77,23 +64,15 @@ interface AgentFormState {
   clearToken: boolean;
   id: string;
   kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
-  transport: 'ssh' | 'direct' | 'local';
+  transport: 'direct' | 'local';
   endpoint: string;
-  ssh: string;
-  sshHost: string;
-  sshPort: string;
-  sshUser: string;
-  sshIdentityFile: string;
   host: string;
   port: string;
-  tls: boolean;
   token: string;
   model: string;
   acpTransport: 'websocket' | 'stdio';
   acpCommand: string;
   acpArgsText: string;
-  acpRuntimeUser: string;
-  acpLauncher: string;
 }
 
 interface JobSummary {
@@ -151,9 +130,6 @@ const DICTS: Record<string, Record<string, string>> = {
     checkAll: '检测全部连接',
     checking: '检测中…',
     refresh: '刷新',
-    filterAll: '全部助手',
-    filterSsh: 'SSH',
-    filterDirect: '直连/本地',
     kpiAgents: '已验证连通',
     kpiAgentsSub: '已配置',
     kpiPending: '待你确认审批',
@@ -185,21 +161,15 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldKind: '协议类型',
     fieldTransport: '连接方式',
     transportDirectOpt: '私网 HTTPS / Tailscale Serve（推荐）',
-    transportSshOpt: 'SSH（免公网端口 / 备选）',
     transportLocalOpt: '本机 Local (127.0.0.1)',
-    directSetupTip:
-      '推荐在云主机保持网关仅监听 127.0.0.1，通过 tailscale serve --bg http://127.0.0.1:8642 转发为私网 HTTPS 地址并填入下方。',
-    fieldEndpoint: '私网 HTTPS / HTTP 端点地址',
-    fieldSshHost: 'SSH 主机地址（IP 或域名）',
-    fieldSshPort: 'SSH 端口（默认 22）',
-    fieldSshUser: 'SSH 登录用户（如 ubuntu / ec2-user）',
-    fieldSshKey: '本地 PEM / 私钥路径（仅保留在本机）',
-    fieldSshKeyPick: '从本机已知密钥选择…',
-    fieldSshKeyBrowse: '选择文件',
-    fieldSsh: 'OpenSSH 别名（可选，来自 ~/.ssh/config）',
+    directSetupTip: '将网关通过私网入口提供给本机，再填写完整地址和网关令牌。',
+    hermesSetupTip: '在 Hermes 所在主机启用 API Server，用 Tailscale Serve 转发 8642 端口，并填写 API_SERVER_KEY。',
+    openclawSetupTip:
+      '用 Tailscale Serve 转发 OpenClaw Gateway 的 18789 端口。填写网关令牌，并在 OpenClaw 中批准首次设备配对。',
+    legacySsh: '请编辑并填写网关地址',
+    fieldEndpoint: '网关地址（HTTPS、HTTP 或 WebSocket）',
     fieldHost: '主机地址（IP 或 Tailscale 域名）',
-    fieldPort: '网关端口（留空按协议或 HTTPS 443 默认）',
-    fieldTls: '启用 TLS (HTTPS / WSS)',
+    fieldPort: '本机网关端口（可选）',
     fieldToken: 'Gateway Token / API Key（独立保存，无需环境变量）',
     fieldTokenKeep: '留空则保留当前已保存的 Token',
     fieldClearToken: '清空已保存的 Token',
@@ -207,10 +177,6 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldAcpTransport: 'ACP 传输方式',
     fieldAcpCommand: 'ACP stdio 命令（如 hermes 或绝对路径）',
     fieldAcpArgs: 'ACP 命令参数（空格分隔，如 acp）',
-    fieldAcpRuntimeUser: 'ACP 运行账号（可选，如 root）',
-    fieldAcpRuntimeTip:
-      '若云主机 SSH 登录账号（如 ubuntu）与 Hermes 安装账号（如 sudo 安装的 root）不同，请填写运行账号或服务端已授权的启动器。',
-    fieldAcpLauncher: '服务端授权启动器（可选，如 sudo -n /usr/local/bin/hermes-acp）',
     tokenConfigured: '已配密钥',
     savingAgent: '保存中…',
     savedAgentToast: '已保存配置，正在验证连接…',
@@ -255,9 +221,6 @@ const DICTS: Record<string, Record<string, string>> = {
     checkAll: 'Test all connections',
     checking: 'Testing…',
     refresh: 'Refresh',
-    filterAll: 'All Agents',
-    filterSsh: 'SSH',
-    filterDirect: 'Direct / Local',
     kpiAgents: 'Verified Connected',
     kpiAgentsSub: 'configured',
     kpiPending: 'Pending Approvals',
@@ -290,21 +253,15 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldKind: 'Protocol',
     fieldTransport: 'Transport',
     transportDirectOpt: 'Private HTTPS / Tailscale Serve (Recommended)',
-    transportSshOpt: 'SSH (Fallback / No public port)',
     transportLocalOpt: 'Local (127.0.0.1)',
-    directSetupTip:
-      'Keep the gateway bound to 127.0.0.1 on the VM and forward via Tailscale Serve (tailscale serve --bg http://127.0.0.1:8642), then enter the HTTPS URL and token below.',
-    fieldEndpoint: 'Private HTTPS / HTTP Endpoint URL',
-    fieldSshHost: 'SSH Host (IP or domain)',
-    fieldSshPort: 'SSH Port (default 22)',
-    fieldSshUser: 'SSH Login User (e.g. ubuntu, ec2-user)',
-    fieldSshKey: 'Local PEM / Private Key Path (stays on-device)',
-    fieldSshKeyPick: 'Pick from detected local keys…',
-    fieldSshKeyBrowse: 'Browse…',
-    fieldSsh: 'OpenSSH Alias (optional, from ~/.ssh/config)',
+    directSetupTip: 'Use a private gateway endpoint. Enter the full URL and gateway token below.',
+    hermesSetupTip: 'Enable the Hermes API Server, forward port 8642 using Tailscale Serve, and enter API_SERVER_KEY.',
+    openclawSetupTip:
+      'Forward OpenClaw Gateway port 18789 using Tailscale Serve. Enter the gateway token and approve the first device pairing in OpenClaw.',
+    legacySsh: 'Edit to enter a gateway endpoint',
+    fieldEndpoint: 'Gateway URL (HTTPS, HTTP, or WebSocket)',
     fieldHost: 'Host (IP or Tailscale hostname)',
-    fieldPort: 'Gateway Port (blank for protocol default or 443 for HTTPS)',
-    fieldTls: 'Use TLS (HTTPS / WSS)',
+    fieldPort: 'Local gateway port (optional)',
     fieldToken: 'Gateway Token / API Key (stored per agent, 0600)',
     fieldTokenKeep: 'Leave blank to keep existing token',
     fieldClearToken: 'Clear saved token',
@@ -312,10 +269,6 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldAcpTransport: 'ACP Transport',
     fieldAcpCommand: 'ACP stdio command (e.g. hermes or full path)',
     fieldAcpArgs: 'ACP args (space-separated, e.g. acp)',
-    fieldAcpRuntimeUser: 'ACP Runtime User (optional, e.g. root)',
-    fieldAcpRuntimeTip:
-      'Distinguish from SSH login user if Hermes was installed under root via sudo. Uses sudo -n -u <user> or a server-approved launcher.',
-    fieldAcpLauncher: 'Server-approved launcher (optional, e.g. sudo -n /usr/local/bin/hermes-acp)',
     tokenConfigured: 'Token set',
     savingAgent: 'Saving…',
     savedAgentToast: 'Agent saved — verifying connection…',
@@ -369,9 +322,6 @@ body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1
 .dk-capsule { display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border-radius: 999px; font-size: 12px; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.1)); color: var(--dsw-alias-label-secondary, #52525b); cursor: pointer; }
 .dk-capsule:hover { color: var(--dsw-alias-label-primary, #111827); }
 .dk-capsule-static { cursor: default; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dk-seg-track { display: inline-flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.05)); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); }
-.dk-seg { border: 0; background: transparent; padding: 3px 10px; border-radius: 6px; font-size: 12px; color: var(--dsw-alias-label-secondary, #52525b); cursor: pointer; }
-.dk-seg-on { background: var(--dsw-alias-label-primary, #111827); color: var(--dsw-alias-bg-layer-1, #ffffff); font-weight: 500; }
 .dk-card { background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
 .dk-card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 10px; margin-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.07)); }
 .dk-card-title { font-size: 13.5px; font-weight: 600; }
@@ -458,14 +408,14 @@ async function apiPost<T>(
   }
 }
 
-function defaultPortForKind(kind: AgentFormState['kind'], tls?: boolean): string {
-  if (tls) return '443';
+function defaultPortForKind(kind: AgentFormState['kind']): string {
   return kind === 'openclaw' ? '18789' : kind === 'dsh' ? '18790' : kind === 'acp' ? '18792' : '8642';
 }
 
 function formatDirectEndpoint(agent: AgentSummary): string {
   const scheme = agent.tls ? 'https' : 'http';
-  const host = agent.host ?? '127.0.0.1';
+  const hostname = agent.host ?? '127.0.0.1';
+  const host = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
   const port = agent.port;
   const omitPort = (agent.tls && port === 443) || (!agent.tls && port === 80) || !port;
   return `${scheme}://${host}${omitPort ? '' : `:${port}`}${agent.basePath ?? ''}`;
@@ -480,8 +430,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [lang, setLang] = React.useState<'zh-CN' | 'en'>(initialLang);
     const [state, setState] = React.useState<KnotState | null>(null);
     const [error, setError] = React.useState<string | null>(null);
-    const [filter, setFilter] = React.useState<'all' | 'ssh' | 'direct'>('all');
-    const [doctorByAgent, setDoctorByAgent] = React.useState<Record<string, DoctorStep[]>>({});
     const [expandedDoctor, setExpandedDoctor] = React.useState<Record<string, boolean>>({});
     const [checkingDoctor, setCheckingDoctor] = React.useState(false);
     const [historyAgent, setHistoryAgent] = React.useState('');
@@ -493,11 +441,11 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [chatAgent, setChatAgent] = React.useState('');
     const [chatSessionId, setChatSessionId] = React.useState('');
     const [chatSessionTitle, setChatSessionTitle] = React.useState('');
+    const chatSelection = React.useRef(0);
     const [chatInput, setChatInput] = React.useState('');
     const [chatSending, setChatSending] = React.useState(false);
     const [chatError, setChatError] = React.useState<string | null>(null);
     const [chatActiveJobId, setChatActiveJobId] = React.useState<string | null>(null);
-    const [localKeys, setLocalKeys] = React.useState<LocalSshKeyItem[]>([]);
     const [toast, setToast] = React.useState<string | null>(null);
     const [form, setForm] = React.useState<AgentFormState | null>(null);
     const [saving, setSaving] = React.useState(false);
@@ -529,17 +477,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
         setState(next);
         hasRunningRef.current = next.jobs.some((j) => j.status === 'running' || j.status === 'queued');
         setError(null);
-        setDoctorByAgent((prev) => {
-          let changed = false;
-          const merged = { ...prev };
-          for (const agent of next.agents) {
-            if (agent.connection?.steps && !merged[agent.id]) {
-              merged[agent.id] = agent.connection.steps;
-              changed = true;
-            }
-          }
-          return changed ? merged : prev;
-        });
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
@@ -567,8 +504,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     }, [refreshState]);
 
     React.useEffect(() => {
-      if (!chatAgent && state?.agents.length) {
-        setChatAgent(state.agents[0]!.id);
+      if (!chatAgent && state) {
+        const first = state.agents.find((agent) => agent.transport !== 'ssh');
+        if (first) setChatAgent(first.id);
       }
       if (chatActiveJobId && state?.jobs.length) {
         const active = state.jobs.find((j) => j.id === chatActiveJobId);
@@ -587,13 +525,10 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           onlyAgent ? { agent: onlyAgent } : {},
           30_000,
         );
-        const nextMap: Record<string, DoctorStep[]> = {};
         const nextOpen: Record<string, boolean> = {};
         for (const item of result.agents) {
-          nextMap[item.id] = item.steps;
           nextOpen[item.id] = true;
         }
-        setDoctorByAgent((prev) => ({ ...prev, ...nextMap }));
         setExpandedDoctor((prev) => ({ ...prev, ...nextOpen }));
         await refreshState();
       } catch (err) {
@@ -634,9 +569,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     };
 
     const sendChatMessage = async () => {
-      const targetAgent = chatAgent || state?.agents[0]?.id || '';
       const message = chatInput.trim();
-      if (!targetAgent || !message || chatSending) return;
+      if (!chatAgent || !message || chatBusy) return;
+      const selection = chatSelection.current;
       setChatSending(true);
       setChatError(null);
       try {
@@ -644,40 +579,35 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           ctx,
           '/api/dsh-knot/ask',
           {
-            agentId: targetAgent,
+            agentId: chatAgent,
             message,
             ...(chatSessionId ? { sessionId: chatSessionId } : {}),
           },
           15_000,
         );
-        setChatInput('');
-        setChatAgent(targetAgent);
-        setChatActiveJobId(job.id);
-        if (job.sessionId) setChatSessionId(job.sessionId);
         hasRunningRef.current = true;
+        if (selection === chatSelection.current) {
+          setChatInput('');
+          setChatActiveJobId(job.id);
+          if (job.sessionId) setChatSessionId(job.sessionId);
+        }
         await refreshState();
       } catch (err) {
-        setChatError(err instanceof Error ? err.message : String(err));
+        if (selection === chatSelection.current) setChatError(err instanceof Error ? err.message : String(err));
       } finally {
-        setChatSending(false);
+        if (selection === chatSelection.current) setChatSending(false);
       }
     };
 
     const startChatWith = (agentId: string, sessionId = '', title = '') => {
+      chatSelection.current++;
       setChatAgent(agentId);
       setChatSessionId(sessionId);
       setChatSessionTitle(title);
+      setChatInput('');
+      setChatSending(false);
       setChatActiveJobId(null);
       setChatError(null);
-    };
-
-    const loadLocalKeys = async () => {
-      try {
-        const result = await apiPost<{ keys: LocalSshKeyItem[] }>(ctx, '/api/dsh-knot/ssh-keys', {}, 5_000);
-        setLocalKeys(result.keys ?? []);
-      } catch {
-        setLocalKeys([]);
-      }
     };
 
     const respondApproval = async (jobId: string, requestId: string, choice: string) => {
@@ -708,7 +638,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     };
 
     const openAddForm = () => {
-      void loadLocalKeys();
       setForm({
         editing: false,
         hasToken: false,
@@ -717,27 +646,18 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
         kind: 'hermes',
         transport: 'direct',
         endpoint: '',
-        ssh: '',
-        sshHost: '',
-        sshPort: '',
-        sshUser: '',
-        sshIdentityFile: '',
         host: '',
         port: '',
-        tls: true,
         token: '',
         model: '',
-        acpTransport: 'stdio',
-        acpCommand: 'hermes',
-        acpArgsText: 'acp',
-        acpRuntimeUser: '',
-        acpLauncher: '',
+        acpTransport: 'websocket',
+        acpCommand: '',
+        acpArgsText: '',
       });
     };
 
     const openEditForm = (agent: AgentSummary) => {
-      void loadLocalKeys();
-      const transport = agent.transport ?? 'ssh';
+      const transport = agent.transport === 'local' ? 'local' : 'direct';
       setForm({
         editing: true,
         hasToken: Boolean(agent.hasToken),
@@ -745,22 +665,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
         id: agent.id,
         kind: agent.kind,
         transport,
-        endpoint: transport === 'direct' ? formatDirectEndpoint(agent) : '',
-        ssh: agent.ssh ?? '',
-        sshHost: agent.sshHost ?? '',
-        sshPort: agent.sshPort ? String(agent.sshPort) : '',
-        sshUser: agent.sshUser ?? '',
-        sshIdentityFile: agent.sshIdentityFile ?? '',
+        endpoint: transport === 'direct' && agent.host ? formatDirectEndpoint(agent) : '',
         host: agent.host ?? '127.0.0.1',
         port: agent.port ? String(agent.port) : '',
-        tls: Boolean(agent.tls),
         token: '',
         model: agent.model ?? '',
-        acpTransport: agent.acpTransport ?? 'websocket',
+        acpTransport: transport === 'local' ? (agent.acpTransport ?? 'websocket') : 'websocket',
         acpCommand: agent.acpCommand ?? '',
         acpArgsText: '',
-        acpRuntimeUser: agent.acpRuntimeUser ?? '',
-        acpLauncher: agent.acpLauncher ?? '',
       });
     };
 
@@ -778,27 +690,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           kind: form.kind,
           transport: form.transport,
           endpoint: form.transport === 'direct' ? form.endpoint.trim() : undefined,
-          ssh: form.transport === 'ssh' ? form.ssh.trim() : undefined,
-          sshHost: form.transport === 'ssh' ? form.sshHost.trim() : undefined,
-          sshPort: form.transport === 'ssh' ? (form.sshPort.trim() ? Number(form.sshPort) : '') : undefined,
-          sshUser: form.transport === 'ssh' ? form.sshUser.trim() : undefined,
-          sshIdentityFile: form.transport === 'ssh' ? form.sshIdentityFile.trim() : undefined,
-          host:
-            form.transport === 'local'
-              ? form.host.trim()
-              : form.transport === 'direct' && !form.endpoint.trim()
-                ? form.host.trim()
-                : undefined,
-          port: form.port.trim() ? Number(form.port) : undefined,
-          tls: form.transport === 'direct' && !/^(https?|wss?):\/\//i.test(form.endpoint.trim()) ? form.tls : undefined,
+          host: form.transport === 'local' ? form.host.trim() : undefined,
+          port: form.transport === 'local' ? form.port.trim() || '' : undefined,
           token: form.token,
           clearToken: form.clearToken,
           model: form.model,
           acpTransport: form.kind === 'acp' ? form.acpTransport : undefined,
           acpCommand: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpCommand : undefined,
           ...(acpArgs ? { acpArgs } : {}),
-          acpRuntimeUser: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpRuntimeUser : undefined,
-          acpLauncher: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpLauncher : undefined,
         });
         setForm(null);
         showToast(t('savedAgentToast'));
@@ -827,15 +726,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           setHistoryLoading(false);
         }
         if (chatAgent === id) {
-          setChatAgent('');
-          setChatSessionId('');
-          setChatSessionTitle('');
+          startChatWith('');
         }
-        setDoctorByAgent((prev) => {
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
         setExpandedDoctor((prev) => {
           const next = { ...prev };
           delete next[id];
@@ -869,18 +761,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const runningJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const sharedCount = state?.mcp.allowSessions.length ?? 0;
 
+    const activeChatJob = chatActiveJobId ? jobs.find((job) => job.id === chatActiveJobId) : undefined;
+    const chatBusy = chatSending || activeChatJob?.status === 'queued' || activeChatJob?.status === 'running';
     const chatJobs = jobs
       .filter(
-        (j) => j.agentId === chatAgent && (!chatSessionId || j.sessionId === chatSessionId || j.id === chatActiveJobId),
+        (j) => j.agentId === chatAgent && (chatSessionId ? j.sessionId === chatSessionId : j.id === chatActiveJobId),
       )
       .slice(0, 20)
       .reverse();
-
-    const filteredAgents = agents.filter((a) => {
-      if (filter === 'ssh') return (a.transport ?? 'ssh') === 'ssh';
-      if (filter === 'direct') return (a.transport ?? 'ssh') !== 'ssh';
-      return true;
-    });
 
     const q = historySearch.trim().toLowerCase();
     const filteredHistory = historyItems.filter(
@@ -921,21 +809,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           h(
             'div',
             { className: 'dk-header-right' },
-            h(
-              'div',
-              { className: 'dk-seg-track' },
-              (['all', 'ssh', 'direct'] as const).map((key) =>
-                h(
-                  'button',
-                  {
-                    key,
-                    className: `dk-seg ${filter === key ? 'dk-seg-on' : ''}`,
-                    onClick: () => setFilter(key),
-                  },
-                  t(key === 'all' ? 'filterAll' : key === 'ssh' ? 'filterSsh' : 'filterDirect'),
-                ),
-              ),
-            ),
             h(
               'button',
               {
@@ -1100,23 +973,20 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
             h('span', { className: 'dk-card-title' }, t('agentsHeading')),
             h('button', { className: 'dk-btn dk-btn-primary', onClick: openAddForm }, t('addAgent')),
           ),
-          filteredAgents.length === 0
+          agents.length === 0
             ? h('div', { className: 'dk-muted', style: { padding: '12px 0' } }, t('agentsEmpty'))
             : h(
                 'div',
                 { className: 'dk-agents-grid' },
-                filteredAgents.map((agent) => {
-                  const steps = doctorByAgent[agent.id] ?? agent.connection?.steps;
+                agents.map((agent) => {
+                  const steps = agent.connection?.steps;
                   const connStatus = agent.connection?.status ?? 'unverified';
                   const isOpen = Boolean(expandedDoctor[agent.id]);
-                  const sshLabel = agent.ssh
-                    ? agent.ssh
-                    : `${agent.sshUser ? `${agent.sshUser}@` : ''}${agent.sshHost ?? ''}${agent.sshPort ? `:${agent.sshPort}` : ''}`;
-                  const endpoint =
-                    (agent.transport ?? 'ssh') === 'ssh'
-                      ? agent.kind === 'acp' && agent.acpTransport === 'stdio'
-                        ? `SSH (${sshLabel}) → stdio${agent.acpRuntimeUser ? ` as ${agent.acpRuntimeUser}` : ''}`
-                        : `SSH (${sshLabel}) → :${agent.port ?? ''}`
+                  const legacySsh = agent.transport === 'ssh';
+                  const endpoint = legacySsh
+                    ? t('legacySsh')
+                    : agent.acpTransport === 'stdio'
+                      ? 'Local stdio'
                       : formatDirectEndpoint(agent);
                   return h(
                     'div',
@@ -1160,12 +1030,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
                         h(
                           'button',
-                          { className: 'dk-btn-link', onClick: () => startChatWith(agent.id) },
+                          { className: 'dk-btn-link', disabled: legacySsh, onClick: () => startChatWith(agent.id) },
                           t('chatWithAgent'),
                         ),
                         h(
                           'button',
-                          { className: 'dk-btn-link', onClick: () => void loadHistory(agent.id) },
+                          { className: 'dk-btn-link', disabled: legacySsh, onClick: () => void loadHistory(agent.id) },
                           t('viewHistory'),
                         ),
                         h('button', { className: 'dk-btn', onClick: () => openEditForm(agent) }, t('editAgent')),
@@ -1275,7 +1145,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   onChange: (e: { target: { value: string } }) => startChatWith(e.target.value),
                 },
                 h('option', { value: '' }, t('chatSelectAgent')),
-                agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
+                agents.map((a) => h('option', { key: a.id, value: a.id, disabled: a.transport === 'ssh' }, a.id)),
               ),
               chatSessionId
                 ? h(
@@ -1364,10 +1234,20 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                     className: 'dk-textarea',
                     placeholder: t('chatPlaceholder'),
                     value: chatInput,
-                    disabled: chatSending,
+                    disabled: chatBusy,
                     onInput: (e: { target: { value: string } }) => setChatInput(e.target.value),
-                    onKeyDown: (e: { key: string; shiftKey: boolean; preventDefault: () => void }) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
+                    onKeyDown: (e: {
+                      key: string;
+                      shiftKey: boolean;
+                      nativeEvent: { isComposing: boolean; keyCode: number };
+                      preventDefault: () => void;
+                    }) => {
+                      if (
+                        e.key === 'Enter' &&
+                        !e.shiftKey &&
+                        !e.nativeEvent.isComposing &&
+                        e.nativeEvent.keyCode !== 229
+                      ) {
                         e.preventDefault();
                         void sendChatMessage();
                       }
@@ -1378,7 +1258,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                     {
                       className: 'dk-btn dk-btn-primary',
                       style: { padding: '8px 16px', flexShrink: 0 },
-                      disabled: chatSending || !chatInput.trim(),
+                      disabled: chatBusy || !chatInput.trim(),
                       onClick: () => void sendChatMessage(),
                     },
                     chatSending ? t('chatSending') : t('chatSend'),
@@ -1408,7 +1288,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                     onChange: (e: { target: { value: string } }) => void loadHistory(e.target.value),
                   },
                   h('option', { value: '' }, t('selectAgentPrompt')),
-                  agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
+                  agents.map((a) => h('option', { key: a.id, value: a.id, disabled: a.transport === 'ssh' }, a.id)),
                 ),
               ),
               h('input', {
@@ -1625,15 +1505,20 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         value: form.transport,
                         onChange: (e: { target: { value: string } }) =>
                           setForm((cur) =>
-                            cur ? { ...cur, transport: e.target.value as AgentFormState['transport'] } : null,
+                            cur
+                              ? {
+                                  ...cur,
+                                  transport: e.target.value as AgentFormState['transport'],
+                                  acpTransport: e.target.value === 'direct' ? 'websocket' : cur.acpTransport,
+                                }
+                              : null,
                           ),
                       },
                       h('option', { value: 'direct' }, t('transportDirectOpt')),
-                      h('option', { value: 'ssh' }, t('transportSshOpt')),
                       h('option', { value: 'local' }, t('transportLocalOpt')),
                     ),
                   ),
-                  !(form.kind === 'acp' && form.acpTransport === 'stdio')
+                  form.transport === 'local' && !(form.kind === 'acp' && form.acpTransport === 'stdio')
                     ? h(
                         'label',
                         { className: 'dk-field' },
@@ -1641,10 +1526,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         h('input', {
                           className: 'dk-input dk-mono',
                           type: 'number',
-                          placeholder: defaultPortForKind(
-                            form.kind,
-                            form.transport === 'direct' && (form.tls || /^https:\/\//i.test(form.endpoint.trim())),
-                          ),
+                          placeholder: defaultPortForKind(form.kind),
                           value: form.port,
                           onInput: (e: { target: { value: string } }) =>
                             setForm((cur) => (cur ? { ...cur, port: e.target.value } : null)),
@@ -1656,7 +1538,17 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   ? h(
                       'div',
                       { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
-                      h('div', { className: 'dk-muted', style: { fontSize: '11.5px' } }, t('directSetupTip')),
+                      h(
+                        'div',
+                        { className: 'dk-muted', style: { fontSize: '11.5px' } },
+                        t(
+                          form.kind === 'hermes'
+                            ? 'hermesSetupTip'
+                            : form.kind === 'openclaw'
+                              ? 'openclawSetupTip'
+                              : 'directSetupTip',
+                        ),
+                      ),
                       h(
                         'label',
                         { className: 'dk-field' },
@@ -1665,37 +1557,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                           className: 'dk-input dk-mono',
                           placeholder: 'https://my-vm.tailnet.ts.net',
                           value: form.endpoint,
-                          onInput: (e: { target: { value: string } }) => {
-                            const val = e.target.value;
-                            setForm((cur) =>
-                              cur
-                                ? {
-                                    ...cur,
-                                    endpoint: val,
-                                    ...(val.trim().startsWith('https://') ? { tls: true } : {}),
-                                    ...(val.trim().startsWith('http://') ? { tls: false } : {}),
-                                  }
-                                : null,
-                            );
-                          },
+                          onInput: (e: { target: { value: string } }) =>
+                            setForm((cur) => (cur ? { ...cur, endpoint: e.target.value } : null)),
                         }),
                       ),
-                      !/^(https?|wss?):\/\//i.test(form.endpoint.trim())
-                        ? h(
-                            'label',
-                            { style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' } },
-                            h('input', {
-                              type: 'checkbox',
-                              checked: form.tls,
-                              onChange: (e: { target: { checked: boolean } }) =>
-                                setForm((cur) => (cur ? { ...cur, tls: Boolean(e.target.checked) } : null)),
-                            }),
-                            h('span', null, t('fieldTls')),
-                          )
-                        : null,
                     )
-                  : form.transport === 'local'
-                    ? h(
+                  : form.kind === 'acp' && form.acpTransport === 'stdio'
+                    ? null
+                    : h(
                         'label',
                         { className: 'dk-field' },
                         h('span', null, t('fieldHost')),
@@ -1706,126 +1575,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                           onInput: (e: { target: { value: string } }) =>
                             setForm((cur) => (cur ? { ...cur, host: e.target.value } : null)),
                         }),
-                      )
-                    : h(
-                        'div',
-                        { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
-                        h(
-                          'div',
-                          { className: 'dk-field-row' },
-                          h(
-                            'label',
-                            { className: 'dk-field' },
-                            h('span', null, t('fieldSshHost')),
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              placeholder: 'ec2-1-2-3-4.compute.amazonaws.com',
-                              value: form.sshHost,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, sshHost: e.target.value } : null)),
-                            }),
-                          ),
-                          h(
-                            'label',
-                            { className: 'dk-field' },
-                            h('span', null, t('fieldSshPort')),
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              type: 'number',
-                              placeholder: '22',
-                              value: form.sshPort,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, sshPort: e.target.value } : null)),
-                            }),
-                          ),
-                        ),
-                        h(
-                          'div',
-                          { className: 'dk-field-row' },
-                          h(
-                            'label',
-                            { className: 'dk-field' },
-                            h('span', null, t('fieldSshUser')),
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              placeholder: 'ubuntu',
-                              value: form.sshUser,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, sshUser: e.target.value } : null)),
-                            }),
-                          ),
-                          h(
-                            'label',
-                            { className: 'dk-field' },
-                            h('span', null, t('fieldSsh')),
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              placeholder: 'optional alias (e.g. aws-hermes)',
-                              value: form.ssh,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, ssh: e.target.value } : null)),
-                            }),
-                          ),
-                        ),
-                        h(
-                          'div',
-                          { className: 'dk-field' },
-                          h('span', null, t('fieldSshKey')),
-                          h(
-                            'div',
-                            { style: { display: 'flex', gap: '6px' } },
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              style: { flex: 1, minWidth: 0 },
-                              placeholder: '~/.ssh/aws-hermes.pem',
-                              value: form.sshIdentityFile,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, sshIdentityFile: e.target.value } : null)),
-                            }),
-                            h(
-                              'label',
-                              { className: 'dk-btn', style: { display: 'inline-flex', alignItems: 'center' } },
-                              t('fieldSshKeyBrowse'),
-                              h('input', {
-                                type: 'file',
-                                accept: '.pem,.key,*',
-                                style: { display: 'none' },
-                                onChange: (e: { target: { files?: ArrayLike<{ name: string; path?: string }> } }) => {
-                                  const file = e.target.files?.[0];
-                                  if (!file) return;
-                                  const pickedPath = file.path || `~/.ssh/${file.name}`;
-                                  setForm((cur) => (cur ? { ...cur, sshIdentityFile: pickedPath } : null));
-                                },
-                              }),
-                            ),
-                          ),
-                          localKeys.length > 0
-                            ? h(
-                                'select',
-                                {
-                                  className: 'dk-input dk-mono',
-                                  value: localKeys.some((k) => k.path === form.sshIdentityFile)
-                                    ? form.sshIdentityFile
-                                    : '',
-                                  onChange: (e: { target: { value: string } }) => {
-                                    if (e.target.value) {
-                                      setForm((cur) => (cur ? { ...cur, sshIdentityFile: e.target.value } : null));
-                                    }
-                                  },
-                                },
-                                h('option', { value: '' }, t('fieldSshKeyPick')),
-                                localKeys.map((k) =>
-                                  h(
-                                    'option',
-                                    { key: k.path, value: k.path },
-                                    k.permissionsWarning ? `${k.path} (${k.permissionsWarning})` : k.path,
-                                  ),
-                                ),
-                              )
-                            : null,
-                        ),
                       ),
-                form.kind === 'acp'
+                form.kind === 'acp' && form.transport === 'local'
                   ? h(
                       'div',
                       { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
@@ -1867,49 +1618,16 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                       ),
                       form.acpTransport === 'stdio'
                         ? h(
-                            'div',
-                            { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
-                            h(
-                              'div',
-                              { className: 'dk-field-row' },
-                              h(
-                                'label',
-                                { className: 'dk-field' },
-                                h('span', null, t('fieldAcpArgs')),
-                                h('input', {
-                                  className: 'dk-input dk-mono',
-                                  placeholder: 'acp',
-                                  value: form.acpArgsText,
-                                  onInput: (e: { target: { value: string } }) =>
-                                    setForm((cur) => (cur ? { ...cur, acpArgsText: e.target.value } : null)),
-                                }),
-                              ),
-                              h(
-                                'label',
-                                { className: 'dk-field' },
-                                h('span', null, t('fieldAcpRuntimeUser')),
-                                h('input', {
-                                  className: 'dk-input dk-mono',
-                                  placeholder: 'root (optional)',
-                                  value: form.acpRuntimeUser,
-                                  onInput: (e: { target: { value: string } }) =>
-                                    setForm((cur) => (cur ? { ...cur, acpRuntimeUser: e.target.value } : null)),
-                                }),
-                              ),
-                            ),
-                            h('div', { className: 'dk-muted', style: { fontSize: '11.5px' } }, t('fieldAcpRuntimeTip')),
-                            h(
-                              'label',
-                              { className: 'dk-field' },
-                              h('span', null, t('fieldAcpLauncher')),
-                              h('input', {
-                                className: 'dk-input dk-mono',
-                                placeholder: 'sudo -n /usr/local/bin/hermes-acp',
-                                value: form.acpLauncher,
-                                onInput: (e: { target: { value: string } }) =>
-                                  setForm((cur) => (cur ? { ...cur, acpLauncher: e.target.value } : null)),
-                              }),
-                            ),
+                            'label',
+                            { className: 'dk-field' },
+                            h('span', null, t('fieldAcpArgs')),
+                            h('input', {
+                              className: 'dk-input dk-mono',
+                              placeholder: 'acp',
+                              value: form.acpArgsText,
+                              onInput: (e: { target: { value: string } }) =>
+                                setForm((cur) => (cur ? { ...cur, acpArgsText: e.target.value } : null)),
+                            }),
                           )
                         : null,
                     )

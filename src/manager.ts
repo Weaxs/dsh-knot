@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
-import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
+import { LEGACY_SSH_ERROR, LocalOnlyAbortError, raceAbort, secret } from './config.js';
 import type { AgentAdapter, AgentConfig, AgentConnectionState, AgentJob, DoctorStep, PluginConfig } from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
@@ -29,10 +29,20 @@ export class AgentManager {
   ) {
     this.configs = [...configs];
     this.factory = factory;
-    for (const config of this.configs) this.adapters.set(config.id, this.factory(config));
+    for (const config of this.configs) {
+      if (config.transport === 'ssh') {
+        this.recordDoctorResult(config.id, [{ name: 'transport', ok: false, detail: LEGACY_SSH_ERROR }]);
+      } else {
+        this.adapters.set(config.id, this.factory(config));
+      }
+    }
   }
 
-  recordDoctorResult(agentId: string, steps: DoctorStep[]): AgentConnectionState {
+  recordDoctorResult(
+    agentId: string,
+    steps: DoctorStep[],
+    checkedConfig = this.getConfig(agentId),
+  ): AgentConnectionState {
     const failed = steps.find((step) => !step.ok);
     const state: AgentConnectionState = failed
       ? {
@@ -48,30 +58,16 @@ export class AgentManager {
           checkedAt: Date.now(),
           steps,
         };
-    if (this.adapters.has(agentId)) this.connectionStates.set(agentId, state);
+    if (checkedConfig && this.getConfig(agentId) === checkedConfig && !this.reconfiguring.has(agentId)) {
+      this.connectionStates.set(agentId, state);
+    }
     return state;
   }
 
   list(): Array<
     Pick<
       AgentConfig,
-      | 'id'
-      | 'kind'
-      | 'transport'
-      | 'host'
-      | 'ssh'
-      | 'sshHost'
-      | 'sshPort'
-      | 'sshUser'
-      | 'sshIdentityFile'
-      | 'port'
-      | 'tls'
-      | 'basePath'
-      | 'acpTransport'
-      | 'acpCommand'
-      | 'acpRuntimeUser'
-      | 'acpLauncher'
-      | 'model'
+      'id' | 'kind' | 'transport' | 'host' | 'port' | 'tls' | 'basePath' | 'acpTransport' | 'acpCommand' | 'model'
     > & {
       hasToken: boolean;
       supportsRespond: boolean;
@@ -83,18 +79,11 @@ export class AgentManager {
       kind: config.kind,
       transport: config.transport,
       host: config.host,
-      ssh: config.ssh,
-      sshHost: config.sshHost,
-      sshPort: config.sshPort,
-      sshUser: config.sshUser,
-      sshIdentityFile: config.sshIdentityFile,
       port: config.port,
       tls: config.tls,
       basePath: config.basePath,
       acpTransport: config.acpTransport,
       acpCommand: config.acpCommand,
-      acpRuntimeUser: config.acpRuntimeUser,
-      acpLauncher: config.acpLauncher,
       model: config.model,
       hasToken: Boolean(secret(config)),
       supportsRespond: typeof this.adapters.get(config.id)?.respond === 'function',
@@ -107,6 +96,7 @@ export class AgentManager {
   }
 
   async upsert(config: AgentConfig): Promise<void> {
+    if (config.transport === 'ssh') throw new Error(LEGACY_SSH_ERROR);
     return this.withAgentLock(config.id, async () => {
       this.reconfiguring.add(config.id);
       const existing = this.adapters.get(config.id);
@@ -139,11 +129,10 @@ export class AgentManager {
       if (index >= 0) this.configs.splice(index, 1);
       try {
         await this.abortJobsForAgent(id, existing);
-        if (!existing) return false;
-        await existing.close().catch(() => {
+        await existing?.close().catch(() => {
           /* best-effort cleanup of removed adapter */
         });
-        return true;
+        return index >= 0;
       } finally {
         this.reconfiguring.delete(id);
       }
@@ -152,9 +141,9 @@ export class AgentManager {
 
   adapter(id: string): AgentAdapter {
     const adapter = this.adapters.get(id);
-    if (!adapter)
-      throw new Error(`Unknown agent "${id}". Available: ${[...this.adapters.keys()].join(', ') || '(none)'}`);
-    return adapter;
+    if (adapter) return adapter;
+    if (this.getConfig(id)?.transport === 'ssh') throw new Error(LEGACY_SSH_ERROR);
+    throw new Error(`Unknown agent "${id}". Available: ${[...this.adapters.keys()].join(', ') || '(none)'}`);
   }
 
   start(agentId: string, text: string, sessionId: string | undefined, onDone?: (job: AgentJob) => void): AgentJob {

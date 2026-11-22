@@ -18,11 +18,16 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async health(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const models = await this.json('/v1/models', { signal });
+    if (models?.object !== 'list' || !Array.isArray(models.data)) {
+      throw new Error('Hermes returned an invalid model list from /v1/models');
+    }
     return this.json('/health', { signal });
   }
 
   async listSessions(signal?: AbortSignal): Promise<AgentSession[]> {
-    const value = await this.json('/api/sessions', { signal });
+    // The Runs API cannot resume sessions owned by another Hermes surface.
+    const value = await this.json('/api/sessions?source=api_server', { signal });
     const rows = Array.isArray(value)
       ? value
       : Array.isArray(value.items)
