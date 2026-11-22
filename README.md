@@ -106,7 +106,7 @@ API_SERVER_KEY=<your-random-token>
 
 Restart the gateway with `hermes gateway restart` for that account and profile. Set **Kind** to **Hermes** and use the same `API_SERVER_KEY` as the DSH Knot token. On the same host use `http://127.0.0.1:8642`. For help with profiles and services, see [Hermes API Server](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server).
 
-Hermes history in DSH Knot lists sessions created through the API Server, which the Runs API can continue.
+Connection checks require the authenticated [Runs API capabilities](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server#v1-capabilities). Hermes history in DSH Knot lists sessions created through the API Server, which the Runs API can continue.
 
 ### OpenClaw
 
@@ -114,14 +114,12 @@ Run the authenticated OpenClaw Gateway on `127.0.0.1:18789` with `gateway.auth.m
 
 ### Tailscale Serve
 
-Join the dsh device and the gateway hosts to the same tailnet. Keep each gateway listening on loopback. On each gateway host, run the matching command:
+Join the dsh device and both gateway hosts to the same tailnet, and enable HTTPS there. Keep each gateway listening on loopback.
 
-```bash
-tailscale serve --bg http://127.0.0.1:8642
-tailscale serve --bg http://127.0.0.1:18789
-```
+- **Hermes**: Run `tailscale serve --bg http://127.0.0.1:8642` on the Hermes host.
+- **OpenClaw**: Set `gateway.tailscale.mode` to `serve` in the OpenClaw configuration and restart the Gateway. For an existing external Serve route, follow [OpenClaw's proxy attribution requirements](https://docs.openclaw.ai/gateway/tailscale#externally-managed-serve-and-funnel).
 
-In DSH Knot, choose **Direct / Tailscale** and paste the full HTTPS URL shown by `tailscale serve status` for that service. If both gateways run on the same host, keep OpenClaw at the root and mount Hermes with `tailscale serve --bg --set-path=/hermes http://127.0.0.1:8642`. Include `/hermes` in the Hermes endpoint. See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
+In Remote Agents, choose **Direct / Tailscale**, then paste each host's HTTPS URL and enter its gateway token. For ACP WebSocket endpoints, paste the full WebSocket URL (for example, `wss://agent.example-tailnet.ts.net/acp`). See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
 Tailscale's hosted service coordinates devices, which connect peer to peer when the network permits. Headscale offers self-hosted coordination. For an existing Headscale or WireGuard network, enter the gateway URL reachable over that private network. See [Tailscale connection types](https://tailscale.com/docs/reference/connection-types) and [Headscale setup](https://headscale.net/stable/setup/requirements/).
 
@@ -156,10 +154,6 @@ If you prefer declarative configuration, add agents under `knot` in `cordis.patc
         port: 18790
         tokenEnv: DSH_GATEWAY_TOKEN
 ```
-
-### Migrate existing SSH agents
-
-Existing SSH entries appear disconnected. Edit each agent, select **Direct / Tailscale**, and enter a reachable authenticated gateway endpoint. For declarative entries, replace `transport: ssh` with `transport: direct`, remove the SSH fields, and set `host` to the gateway endpoint. For an ACP stdio agent, use `transport: local` if dsh can run the command locally, or configure an ACP WebSocket endpoint.
 
 ### Verify with `knot_doctor`
 

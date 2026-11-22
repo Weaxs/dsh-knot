@@ -68,7 +68,8 @@ The adapter uses the native API Server:
 - `GET /v1/runs/{id}` as a terminal-status fallback.
 - `POST /v1/runs/{id}/approval` for approval responses.
 - `POST /v1/runs/{id}/stop` for cancellation.
-- `GET /health` and `GET /api/sessions` for discovery and health.
+- Authenticated `GET /v1/capabilities` and `GET /health` for readiness.
+- `GET /api/sessions?source=api_server` for resumable history.
 
 Authentication uses `Authorization: Bearer …`, read from `token` or `tokenEnv` (default `HERMES_API_KEY`). The token is not logged.
 

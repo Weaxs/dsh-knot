@@ -6,7 +6,7 @@ export type AgentKind = 'hermes' | 'openclaw' | 'dsh' | 'acp';
 export interface AgentConfig {
   id: string;
   kind: AgentKind;
-  transport?: TransportKind | 'ssh'; // Legacy SSH entries remain visible for migration.
+  transport?: TransportKind;
   host?: string;
   port?: number;
   tls?: boolean;
@@ -92,6 +92,8 @@ export interface HttpRequest {
   path: string;
   headers?: Record<string, string>;
   body?: unknown;
+  /** Additional time the server may hold the request before sending headers. */
+  responseWaitMs?: number;
   signal?: AbortSignal;
 }
 

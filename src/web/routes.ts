@@ -129,7 +129,7 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: redact(manager.listJobs().slice(0, 50)),
+            jobs: redact(manager.listJobs({ currentOnly: true }).slice(0, 50)),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -163,7 +163,7 @@ export function registerWebRoutes(
           typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId.trim() : undefined;
         if (!agentId) return errorReply('agentId is required', 400);
         if (!message) return errorReply('message is required', 400);
-        const job = manager.start(agentId, message, sessionId);
+        const job = manager.start(agentId, message, sessionId, undefined, true);
         return jsonReply({ ok: true, value: redact(job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
@@ -238,7 +238,6 @@ export function registerWebRoutes(
           const kind = (body.kind ?? existing?.kind) as AgentConfig['kind'];
           const transport = (body.transport ?? existing?.transport ?? 'direct') as AgentConfig['transport'];
           const sameTransport = existing?.transport === transport;
-          const resolvedToken = clearToken ? undefined : incomingToken || existing?.token;
           const endpointInput = typeof body.endpoint === 'string' ? body.endpoint.trim() : undefined;
           const hostInput =
             endpointInput ??
@@ -288,8 +287,6 @@ export function registerWebRoutes(
             port: resolvedPort,
             tls: resolvedTls,
             basePath: resolvedBasePath,
-            token: resolvedToken,
-            tokenEnv: clearToken ? undefined : existing?.tokenEnv,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
             acpTransport,
             acpCommand,
@@ -298,13 +295,28 @@ export function registerWebRoutes(
           for (const key of Object.keys(candidate) as Array<keyof AgentConfig>) {
             if (candidate[key] === undefined) delete candidate[key];
           }
-          const [normalized] = normalizeConfig({ agents: [candidate] }).agents;
-          await manager.upsert(normalized!);
-          updateStoredState((state) => ({
-            ...state,
-            agents: [...state.agents.filter((item) => item.id !== normalized!.id), normalized!],
-            deletedIds: state.deletedIds.filter((item) => item !== normalized!.id),
-          }));
+          const normalized = normalizeConfig({ agents: [candidate] }).agents[0]!;
+          const sameGateway =
+            existing &&
+            sameTransport &&
+            existing.kind === normalized.kind &&
+            existing.host === normalized.host &&
+            existing.port === normalized.port &&
+            Boolean(existing.tls) === Boolean(normalized.tls) &&
+            existing.basePath === normalized.basePath &&
+            (existing.acpTransport ?? 'websocket') === (normalized.acpTransport ?? 'websocket');
+          if (clearToken || incomingToken || !sameGateway) {
+            // An empty token prevents falling back to the previous or ambient gateway credential.
+            normalized.token = clearToken ? '' : incomingToken;
+            delete normalized.tokenEnv;
+          }
+          await manager.upsert(normalized, () => {
+            updateStoredState((state) => ({
+              ...state,
+              agents: [...state.agents.filter((item) => item.id !== id), normalized],
+              deletedIds: state.deletedIds.filter((item) => item !== id),
+            }));
+          });
         });
         return jsonReply({ ok: true, value: { agents: manager.list() } });
       } catch (error) {
@@ -318,12 +330,13 @@ export function registerWebRoutes(
         const id = typeof body.id === 'string' ? body.id.trim() : '';
         if (!id) return errorReply('id is required', 400);
         await withAgentRouteLock(id, async () => {
-          await manager.remove(id);
-          updateStoredState((state) => ({
-            ...state,
-            agents: state.agents.filter((item) => item.id !== id),
-            deletedIds: [...new Set([...state.deletedIds, id])],
-          }));
+          await manager.remove(id, () => {
+            updateStoredState((state) => ({
+              ...state,
+              agents: state.agents.filter((item) => item.id !== id),
+              deletedIds: [...new Set([...state.deletedIds, id])],
+            }));
+          });
         });
         return jsonReply({ ok: true, value: { agents: manager.list() } });
       } catch (error) {

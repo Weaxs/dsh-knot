@@ -1,7 +1,6 @@
 import http, { type IncomingMessage, type RequestOptions } from 'node:http';
 import https from 'node:https';
 import { StringDecoder } from 'node:string_decoder';
-import { configuredTransport, LEGACY_SSH_ERROR } from '../config.js';
 import type { AgentConfig, HttpRequest, HttpResponse, Transport, TransportKind } from '../types.js';
 
 const MAX_BODY = 16 * 1024 * 1024;
@@ -53,7 +52,7 @@ export class NodeHttpTransport implements Transport {
       },
     };
     const driver = secure ? https : http;
-    const timeoutMs = this.config.connectTimeoutMs ?? 15_000;
+    const timeoutMs = Math.min(2_147_483_647, (this.config.connectTimeoutMs ?? 15_000) + (input.responseWaitMs ?? 0));
     return new Promise<IncomingMessage>((resolve, reject) => {
       let headerTimer: NodeJS.Timeout | undefined;
       const clearHeaderTimer = () => {
@@ -137,7 +136,5 @@ function responseCleanup(request: http.ClientRequest, cleanup: () => void): void
 }
 
 export function transportFor(config: AgentConfig): NodeHttpTransport {
-  const kind = configuredTransport(config);
-  if (kind === 'ssh') throw new Error(`${config.id}: ${LEGACY_SSH_ERROR}`);
-  return new NodeHttpTransport(kind, config);
+  return new NodeHttpTransport(config.transport ?? 'direct', config);
 }

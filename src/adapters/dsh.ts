@@ -3,6 +3,8 @@ import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, HttpResponse, Transport } from '../types.js';
 
+const SESSION_WAIT_MS = 30_000;
+
 export class DshAdapter implements AgentAdapter {
   readonly kind = 'dsh' as const;
   private readonly transport: Transport;
@@ -113,7 +115,7 @@ export class DshAdapter implements AgentAdapter {
           'wait',
           {
             sessionId: actualId,
-            timeoutMs: 30_000,
+            timeoutMs: SESSION_WAIT_MS,
             afterSeq,
             maxMessages: 20,
           },
@@ -229,6 +231,7 @@ export class DshAdapter implements AgentAdapter {
       response = await this.transport.request({
         method: 'POST',
         path: `/api/session/${method}`,
+        ...(method === 'wait' ? { responseWaitMs: SESSION_WAIT_MS } : {}),
         headers: { Cookie: this.cookie! },
         body: {
           type: 'client-request',

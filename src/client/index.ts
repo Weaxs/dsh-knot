@@ -45,7 +45,7 @@ interface AgentConnectionState {
 interface AgentSummary {
   id: string;
   kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
-  transport?: 'ssh' | 'direct' | 'local';
+  transport?: 'direct' | 'local';
   host?: string;
   basePath?: string;
   port?: number;
@@ -164,14 +164,12 @@ const DICTS: Record<string, Record<string, string>> = {
     transportLocalOpt: '本机 Local (127.0.0.1)',
     directSetupTip: '将网关通过私网入口提供给本机，再填写完整地址和网关令牌。',
     hermesSetupTip: '在 Hermes 所在主机启用 API Server，用 Tailscale Serve 转发 8642 端口，并填写 API_SERVER_KEY。',
-    openclawSetupTip:
-      '用 Tailscale Serve 转发 OpenClaw Gateway 的 18789 端口。填写网关令牌，并在 OpenClaw 中批准首次设备配对。',
-    legacySsh: '请编辑并填写网关地址',
+    openclawSetupTip: '在 OpenClaw 启用自带的 Tailscale Serve，填写 HTTPS 地址和网关令牌，首次连接时批准设备配对。',
     fieldEndpoint: '网关地址（HTTPS、HTTP 或 WebSocket）',
     fieldHost: '主机地址（IP 或 Tailscale 域名）',
     fieldPort: '本机网关端口（可选）',
     fieldToken: 'Gateway Token / API Key（独立保存，无需环境变量）',
-    fieldTokenKeep: '留空则保留当前已保存的 Token',
+    fieldTokenKeep: '地址不变时留空可保留令牌',
     fieldClearToken: '清空已保存的 Token',
     fieldModel: '默认模型（可选）',
     fieldAcpTransport: 'ACP 传输方式',
@@ -257,13 +255,12 @@ const DICTS: Record<string, Record<string, string>> = {
     directSetupTip: 'Use a private gateway endpoint. Enter the full URL and gateway token below.',
     hermesSetupTip: 'Enable the Hermes API Server, forward port 8642 using Tailscale Serve, and enter API_SERVER_KEY.',
     openclawSetupTip:
-      'Forward OpenClaw Gateway port 18789 using Tailscale Serve. Enter the gateway token and approve the first device pairing in OpenClaw.',
-    legacySsh: 'Edit to enter a gateway endpoint',
+      'Enable OpenClaw-managed Tailscale Serve. Enter the HTTPS URL and gateway token, then approve the first device pairing in OpenClaw.',
     fieldEndpoint: 'Gateway URL (HTTPS, HTTP, or WebSocket)',
     fieldHost: 'Host (IP or Tailscale hostname)',
     fieldPort: 'Local gateway port (optional)',
     fieldToken: 'Gateway Token / API Key (stored per agent, 0600)',
-    fieldTokenKeep: 'Leave blank to keep existing token',
+    fieldTokenKeep: 'Leave blank to keep the token for the same endpoint',
     fieldClearToken: 'Clear saved token',
     fieldModel: 'Model override (optional)',
     fieldAcpTransport: 'ACP Transport',
@@ -441,7 +438,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [chatAgent, setChatAgent] = React.useState('');
     const [chatSessionId, setChatSessionId] = React.useState('');
     const [chatSessionTitle, setChatSessionTitle] = React.useState('');
-    const chatSelection = React.useRef(0);
+    const chatSelection = React.useRef({ agentId: '' });
     const [chatInput, setChatInput] = React.useState('');
     const [chatSending, setChatSending] = React.useState(false);
     const [chatError, setChatError] = React.useState<string | null>(null);
@@ -451,7 +448,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [saving, setSaving] = React.useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-    const historySeq = React.useRef(0);
+    const historySelection = React.useRef({ agentId: '' });
+    const stateRequest = React.useRef(0);
     const hasRunningRef = React.useRef(false);
 
     const t = (key: string): string => DICTS[lang]?.[key] ?? DICTS.en?.[key] ?? key;
@@ -472,13 +470,15 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     }, []);
 
     const refreshState = React.useCallback(async () => {
+      const current = ++stateRequest.current;
       try {
         const next = await apiPost<KnotState>(ctx, '/api/dsh-knot/state', {}, 15_000);
+        if (current !== stateRequest.current) return;
         setState(next);
         hasRunningRef.current = next.jobs.some((j) => j.status === 'running' || j.status === 'queued');
         setError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (current === stateRequest.current) setError(err instanceof Error ? err.message : String(err));
       }
     }, []);
 
@@ -505,8 +505,11 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
 
     React.useEffect(() => {
       if (!chatAgent && state) {
-        const first = state.agents.find((agent) => agent.transport !== 'ssh');
-        if (first) setChatAgent(first.id);
+        const first = state.agents[0];
+        if (first) {
+          chatSelection.current = { agentId: first.id };
+          setChatAgent(first.id);
+        }
       }
       if (chatActiveJobId && state?.jobs.length) {
         const active = state.jobs.find((j) => j.id === chatActiveJobId);
@@ -539,7 +542,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     };
 
     const loadHistory = async (agentId: string) => {
-      const seq = ++historySeq.current;
+      const selection = { agentId };
+      historySelection.current = selection;
       setHistoryAgent(agentId);
       setHistoryLimit(6);
       setHistoryError(null);
@@ -556,15 +560,15 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           { agentId },
           20_000,
         );
-        if (historySeq.current !== seq) return;
+        if (historySelection.current !== selection) return;
         setHistoryItems(result.sessions ?? []);
         setHistoryError(null);
       } catch (err) {
-        if (historySeq.current !== seq) return;
+        if (historySelection.current !== selection) return;
         setHistoryItems([]);
         setHistoryError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (historySeq.current === seq) setHistoryLoading(false);
+        if (historySelection.current === selection) setHistoryLoading(false);
       }
     };
 
@@ -600,7 +604,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     };
 
     const startChatWith = (agentId: string, sessionId = '', title = '') => {
-      chatSelection.current++;
+      chatSelection.current = { agentId };
       setChatAgent(agentId);
       setChatSessionId(sessionId);
       setChatSessionTitle(title);
@@ -685,7 +689,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           form.kind === 'acp' && form.acpTransport === 'stdio' && form.acpArgsText.trim()
             ? form.acpArgsText.trim().split(/\s+/).filter(Boolean)
             : undefined;
-        await apiPost(ctx, '/api/dsh-knot/agent-save', {
+        const { agents } = await apiPost<{ agents: AgentSummary[] }>(ctx, '/api/dsh-knot/agent-save', {
           id: savedId,
           kind: form.kind,
           transport: form.transport,
@@ -699,6 +703,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           acpCommand: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpCommand : undefined,
           ...(acpArgs ? { acpArgs } : {}),
         });
+        if (historySelection.current.agentId === savedId) void loadHistory('');
+        if (chatSelection.current.agentId === savedId) startChatWith(savedId);
+        setState((prev) => (prev ? { ...prev, agents } : prev));
         setForm(null);
         showToast(t('savedAgentToast'));
         await refreshState();
@@ -717,17 +724,10 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       }
       setConfirmDeleteId(null);
       try {
-        await apiPost(ctx, '/api/dsh-knot/agent-delete', { id });
-        if (historyAgent === id) {
-          historySeq.current++;
-          setHistoryAgent('');
-          setHistoryItems([]);
-          setHistoryError(null);
-          setHistoryLoading(false);
-        }
-        if (chatAgent === id) {
-          startChatWith('');
-        }
+        const { agents } = await apiPost<{ agents: AgentSummary[] }>(ctx, '/api/dsh-knot/agent-delete', { id });
+        if (historySelection.current.agentId === id) void loadHistory('');
+        if (chatSelection.current.agentId === id) startChatWith(agents[0]?.id ?? '');
+        setState((prev) => (prev ? { ...prev, agents } : prev));
         setExpandedDoctor((prev) => {
           const next = { ...prev };
           delete next[id];
@@ -761,14 +761,10 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const runningJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
     const sharedCount = state?.mcp.allowSessions.length ?? 0;
 
-    const activeChatJob = chatActiveJobId ? jobs.find((job) => job.id === chatActiveJobId) : undefined;
-    const chatBusy = chatSending || activeChatJob?.status === 'queued' || activeChatJob?.status === 'running';
-    const chatJobs = jobs
-      .filter(
-        (j) => j.agentId === chatAgent && (chatSessionId ? j.sessionId === chatSessionId : j.id === chatActiveJobId),
-      )
-      .slice(0, 20)
-      .reverse();
+    const isChatJob = (job: JobSummary) =>
+      job.agentId === chatAgent && (chatSessionId ? job.sessionId === chatSessionId : job.id === chatActiveJobId);
+    const chatBusy = chatSending || runningJobs.some(isChatJob);
+    const chatJobs = jobs.filter(isChatJob).slice(0, 20).reverse();
 
     const q = historySearch.trim().toLowerCase();
     const filteredHistory = historyItems.filter(
@@ -982,12 +978,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   const steps = agent.connection?.steps;
                   const connStatus = agent.connection?.status ?? 'unverified';
                   const isOpen = Boolean(expandedDoctor[agent.id]);
-                  const legacySsh = agent.transport === 'ssh';
-                  const endpoint = legacySsh
-                    ? t('legacySsh')
-                    : agent.acpTransport === 'stdio'
-                      ? 'Local stdio'
-                      : formatDirectEndpoint(agent);
+                  const endpoint = agent.acpTransport === 'stdio' ? 'Local stdio' : formatDirectEndpoint(agent);
                   return h(
                     'div',
                     { key: agent.id, className: 'dk-subbox' },
@@ -1030,12 +1021,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
                         h(
                           'button',
-                          { className: 'dk-btn-link', disabled: legacySsh, onClick: () => startChatWith(agent.id) },
+                          { className: 'dk-btn-link', onClick: () => startChatWith(agent.id) },
                           t('chatWithAgent'),
                         ),
                         h(
                           'button',
-                          { className: 'dk-btn-link', disabled: legacySsh, onClick: () => void loadHistory(agent.id) },
+                          { className: 'dk-btn-link', onClick: () => void loadHistory(agent.id) },
                           t('viewHistory'),
                         ),
                         h('button', { className: 'dk-btn', onClick: () => openEditForm(agent) }, t('editAgent')),
@@ -1145,7 +1136,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                   onChange: (e: { target: { value: string } }) => startChatWith(e.target.value),
                 },
                 h('option', { value: '' }, t('chatSelectAgent')),
-                agents.map((a) => h('option', { key: a.id, value: a.id, disabled: a.transport === 'ssh' }, a.id)),
+                agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
               ),
               chatSessionId
                 ? h(
@@ -1288,7 +1279,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                     onChange: (e: { target: { value: string } }) => void loadHistory(e.target.value),
                   },
                   h('option', { value: '' }, t('selectAgentPrompt')),
-                  agents.map((a) => h('option', { key: a.id, value: a.id, disabled: a.transport === 'ssh' }, a.id)),
+                  agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
                 ),
               ),
               h('input', {

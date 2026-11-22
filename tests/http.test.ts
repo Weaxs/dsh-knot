@@ -69,4 +69,15 @@ describe('HTTP transport', () => {
     const transport = new NodeHttpTransport('local', { id: 'x', kind: 'hermes', port, connectTimeoutMs: 120 });
     await expect(transport.request({ path: '/health' })).rejects.toThrow(/timed out/);
   });
+
+  it('allows additional time for a deferred HTTP response', async () => {
+    server = http.createServer((_request, response) => {
+      const timer = setTimeout(() => response.end('ready'), 200);
+      response.once('close', () => clearTimeout(timer));
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const transport = new NodeHttpTransport('local', { id: 'x', kind: 'dsh', port, connectTimeoutMs: 100 });
+    await expect(transport.request({ path: '/wait', responseWaitMs: 1_000 })).resolves.toMatchObject({ text: 'ready' });
+  });
 });

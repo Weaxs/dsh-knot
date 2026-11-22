@@ -9,18 +9,15 @@ export class ConfigError extends Error {
 }
 
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/;
-export const LEGACY_SSH_ERROR =
-  'SSH connections are no longer supported. Edit this agent and enter its gateway endpoint.';
 
 export function normalizeConfig(
   input: PluginConfig = {},
-  { allowLegacySsh = false } = {},
 ): Required<Pick<PluginConfig, 'agents' | 'jobTimeoutMs'>> & PluginConfig {
   if (typeof input !== 'object' || input === null || Array.isArray(input))
     throw new ConfigError('config must be an object');
   if (input.agents !== undefined && !Array.isArray(input.agents)) throw new ConfigError('agents must be an array');
   const ids = new Set<string>();
-  const agents = (input.agents ?? []).map((agent) => normalizeAgent(agent, ids, allowLegacySsh));
+  const agents = (input.agents ?? []).map((agent) => normalizeAgent(agent, ids));
   const timeout = input.jobTimeoutMs ?? 1_800_000;
   if (!Number.isSafeInteger(timeout) || timeout < 1_000 || timeout > 86_400_000) {
     throw new ConfigError('jobTimeoutMs must be between 1000 and 86400000');
@@ -32,7 +29,7 @@ export function normalizeConfig(
   return { ...input, agents, jobTimeoutMs: timeout };
 }
 
-function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: boolean): AgentConfig {
+function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   if (typeof agent !== 'object' || agent === null) throw new ConfigError('each agent must be an object');
   if (typeof agent.id !== 'string' || !ID.test(agent.id))
     throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
@@ -40,23 +37,7 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: bo
   ids.add(agent.id);
   if (!['hermes', 'openclaw', 'dsh', 'acp'].includes(agent.kind))
     throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
-  const transport = configuredTransport(agent);
-  if (transport === 'ssh') {
-    if (!allowLegacySsh) throw new ConfigError(`${agent.id}: ${LEGACY_SSH_ERROR}`);
-    return {
-      id: agent.id,
-      kind: agent.kind,
-      transport,
-      token: agent.token,
-      tokenEnv: agent.tokenEnv,
-      model: agent.model,
-      openclawAgentId: agent.openclawAgentId,
-      dshProvider: agent.dshProvider,
-      dshCwd: agent.dshCwd,
-      reasoningEffort: agent.reasoningEffort,
-      connectTimeoutMs: agent.connectTimeoutMs,
-    };
-  }
+  const transport = agent.transport ?? 'direct';
   if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
   if (agent.acpTransport === 'stdio') {
     if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
@@ -71,6 +52,7 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: bo
   let parsedPort = agent.port;
   let parsedTls = agent.tls;
   let parsedBasePath = agent.basePath;
+  const isWebSocket = agent.kind === 'acp' || agent.kind === 'openclaw';
 
   if (/^(https?|wss?):\/\//i.test(parsedHost)) {
     let url: URL;
@@ -82,10 +64,12 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: bo
     if (!url.hostname || url.username || url.password || url.href.includes('?') || url.href.includes('#')) {
       throw new ConfigError(`${agent.id}: endpoint URL must not contain credentials, a query, or a fragment`);
     }
+    // URL.pathname is "/" even when the endpoint omits a path.
+    const hasPath = parsedHost.includes('/', parsedHost.indexOf('://') + 3) || url.pathname !== '/';
     parsedHost = url.hostname;
     parsedTls = url.protocol === 'https:' || url.protocol === 'wss:';
     parsedPort = url.port ? Number(url.port) : parsedTls ? 443 : 80;
-    parsedBasePath = url.pathname;
+    parsedBasePath = isWebSocket && !hasPath ? undefined : url.pathname;
   }
   if (!parsedHost) throw new ConfigError(`${agent.id}: direct transport requires a gateway endpoint`);
   if (parsedHost.startsWith('[') && parsedHost.endsWith(']')) parsedHost = parsedHost.slice(1, -1);
@@ -99,10 +83,9 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: bo
     if (trimmed && (!trimmed.startsWith('/') || /[\s?#\\]/.test(trimmed))) {
       throw new ConfigError(`${agent.id}: basePath must be a URL path starting with "/"`);
     }
-    // OpenClaw uses the exact WebSocket path while HTTP and ACP append their own paths.
-    parsedBasePath =
-      (agent.kind === 'openclaw' && trimmed !== '/' ? trimmed : trimmed.replace(/\/+$/, '')) || undefined;
+    parsedBasePath = (isWebSocket ? trimmed : trimmed.replace(/\/+$/, '')) || undefined;
   }
+  if (agent.kind === 'acp' && agent.acpTransport !== 'stdio') parsedBasePath ??= '/acp';
 
   const defaultPort =
     parsedTls === true
@@ -143,10 +126,6 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>, allowLegacySsh: bo
 
 function port(value: number, name: string): void {
   if (!Number.isInteger(value) || value < 1 || value > 65_535) throw new ConfigError(`${name} must be a TCP port`);
-}
-
-export function configuredTransport(agent: AgentConfig): NonNullable<AgentConfig['transport']> {
-  return agent.transport ?? ('ssh' in agent || 'sshHost' in agent ? 'ssh' : 'direct');
 }
 
 export function urlHost(host: string): string {

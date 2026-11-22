@@ -17,14 +17,11 @@ export const Config = Schema.object({
     Schema.object({
       id: Schema.string().required().description('Unique agent identifier (letters, digits, ., _, -).'),
       kind: Schema.union(['hermes', 'openclaw', 'dsh', 'acp']).required().description('Target protocol adapter.'),
-      transport: Schema.union(['direct', 'local', Schema.const('ssh').required().hidden()]).description(
-        'Connectivity transport, defaults to direct.',
-      ),
-      ssh: Schema.string().hidden(),
+      transport: Schema.union(['direct', 'local']).description('Connectivity transport, defaults to direct.'),
       host: Schema.string().description('Target hostname or full HTTP(S)/WS(S) gateway endpoint URL.'),
       port: Schema.number().description('Target TCP port (defaults per protocol, or 443 for HTTPS).'),
       tls: Schema.boolean().description('Use HTTPS/WSS for direct transport.'),
-      basePath: Schema.string().description('Optional URL path prefix for direct transport (e.g. /hermes).'),
+      basePath: Schema.string().description('HTTP path prefix or exact Gateway WebSocket path.'),
       token: Schema.string().role('secret').description('Gateway bearer or launch token for this agent.'),
       tokenEnv: Schema.string().description('Optional environment variable fallback holding the token.'),
       model: Schema.string().description('Optional remote model override.'),
@@ -63,7 +60,7 @@ function getService<T>(ctx: Context, key: string): T | undefined {
 }
 
 export async function apply(ctx: Context, input: PluginConfig = {}): Promise<void> {
-  const config = normalizeConfig(input, { allowLegacySsh: true });
+  const config = normalizeConfig(input);
   const stored = loadStoredState();
   const deleted = new Set(stored.deletedIds);
   const merged = config.agents.filter((item) => !deleted.has(item.id));

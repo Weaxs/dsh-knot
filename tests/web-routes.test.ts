@@ -73,12 +73,8 @@ describe('web UI host routes & schemastery Config', () => {
 
   it('serves state, doctor, sessions, respond, cancel, and live mcp-share toggles', async () => {
     const config: AgentConfig = { id: 'hermes-local', kind: 'hermes', transport: 'local', port: 8642 };
-    writeFileSync(
-      join(stateDir, 'agents.json'),
-      JSON.stringify([{ id: 'legacy', kind: 'hermes', ssh: 'gpu-box', token: 'legacy-secret-token' }]),
-    );
     const adapter = new StubAdapter('hermes-local');
-    const manager = new AgentManager([config, ...loadStoredState().agents], 10_000, () => adapter);
+    const manager = new AgentManager([config], 10_000, () => adapter);
     mcp = new McpServer({ port: 0, token: 'secret-tok', allowSessions: [] }, sessionsController);
     await mcp.start();
 
@@ -112,12 +108,8 @@ describe('web UI host routes & schemastery Config', () => {
 
     const initial = await post(WEB_ROUTES.state);
     expect(initial.ok).toBe(true);
-    expect(initial.value.agents).toHaveLength(2);
+    expect(initial.value.agents).toHaveLength(1);
     expect(initial.value.agents[0].connection.status).toBe('unverified');
-    expect(initial.value.agents[1]).toMatchObject({ id: 'legacy', connection: { status: 'error' } });
-    expect(JSON.stringify(initial)).not.toMatch(/gpu-box|legacy-secret-token/);
-    const legacyAsk = await post(WEB_ROUTES.ask, { agentId: 'legacy', message: 'hello' });
-    expect(legacyAsk).toMatchObject({ ok: false, error: expect.stringMatching(/enter its gateway endpoint/) });
     expect(initial.value.mcp.enabled).toBe(true);
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
@@ -145,9 +137,13 @@ describe('web UI host routes & schemastery Config', () => {
     expect(asked.ok).toBe(true);
     expect(asked.value.prompt).toBe('hello from panel');
     expect(asked.value.sessionId).toBe('remote-1');
+    const duplicate = await post(WEB_ROUTES.ask, {
+      agentId: 'hermes-local',
+      message: 'overlapping turn',
+      sessionId: 'remote-1',
+    });
+    expect(duplicate).toMatchObject({ ok: false, error: expect.stringMatching(/active or cancelling job/) });
     await post(WEB_ROUTES.cancel, { jobId: asked.value.id });
-
-    expect(routes.has('/api/dsh-knot/ssh-keys')).toBe(false);
 
     const job = manager.start('hermes-local', 'test', undefined);
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -185,7 +181,6 @@ describe('web UI host routes & schemastery Config', () => {
       id: 'hermes-second',
       kind: 'hermes',
       transport: 'direct',
-      host: '100.64.0.9',
       model: 'deepseek-chat',
     });
     expect(edited.ok).toBe(true);
@@ -193,15 +188,15 @@ describe('web UI host routes & schemastery Config', () => {
     expect(manager.getConfig('hermes-second')?.tls).toBe(true);
     expect(manager.getConfig('hermes-second')?.acpArgs).toEqual(['--flag']);
 
-    // Clearing token via clearToken: true removes the stored token, and switching transport strips stale fields
+    vi.stubEnv('HERMES_API_KEY', 'ambient-secret');
+    // Switching gateways clears the saved token and suppresses the ambient fallback.
     const cleared = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
       kind: 'hermes',
       transport: 'local',
-      clearToken: true,
     });
     expect(cleared.ok).toBe(true);
-    expect(manager.getConfig('hermes-second')?.token).toBeUndefined();
+    expect(cleared.value.agents.find((agent: { id: string }) => agent.id === 'hermes-second')?.hasToken).toBe(false);
     expect(manager.getConfig('hermes-second')?.host).toBe('127.0.0.1');
     expect(manager.getConfig('hermes-second')?.tls).toBeUndefined();
 
@@ -247,30 +242,6 @@ describe('web UI host routes & schemastery Config', () => {
       basePath: '/hermes',
     });
 
-    const rejectedSsh = await post(WEB_ROUTES.agentSave, {
-      id: 'ssh-agent',
-      kind: 'hermes',
-      transport: 'ssh',
-    });
-    expect(rejectedSsh).toMatchObject({
-      ok: false,
-      error: expect.stringMatching(/SSH connections are no longer supported/),
-    });
-
-    const migrated = await post(WEB_ROUTES.agentSave, {
-      id: 'legacy',
-      transport: 'direct',
-      endpoint: 'https://legacy.tailnet.ts.net',
-    });
-    expect(migrated.ok).toBe(true);
-    expect(loadStoredState().agents.find((agent) => agent.id === 'legacy')).toMatchObject({
-      transport: 'direct',
-      host: 'legacy.tailnet.ts.net',
-      port: 443,
-      tls: true,
-      token: 'legacy-secret-token',
-    });
-
     // Deleted static agent stays deleted when plugin reloads
     const registeredTools: string[] = [];
     const effects: Array<() => Promise<void>> = [];
@@ -282,6 +253,18 @@ describe('web UI host routes & schemastery Config', () => {
       { agents: [config] },
     );
     for (const cleanup of effects) await cleanup();
+
+    const diskBlocked = join(stateDir, 'agents.json');
+    vi.stubEnv('DSH_KNOT_STATE_DIR', diskBlocked);
+    const failedSave = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      endpoint: 'https://replacement.tailnet.ts.net',
+    });
+    const failedDelete = await post(WEB_ROUTES.agentDelete, { id: 'aws-tailscale' });
+    expect(failedSave.ok).toBe(false);
+    expect(failedDelete.ok).toBe(false);
+    expect(manager.getConfig('aws-tailscale')?.host).toBe('aws-box.tail1234.ts.net');
+    vi.stubEnv('DSH_KNOT_STATE_DIR', stateDir);
 
     // Corrupted agents.json throws instead of silently wiping state
     writeFileSync(join(stateDir, 'agents.json'), '{broken-json', 'utf8');

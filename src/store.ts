@@ -27,7 +27,7 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
   const raw = JSON.parse(text) as unknown;
   if (Array.isArray(raw)) {
     return {
-      agents: normalizeConfig({ agents: raw as AgentConfig[] }, { allowLegacySsh: true }).agents,
+      agents: normalizeConfig({ agents: raw as AgentConfig[] }).agents,
       deletedIds: [],
     };
   }
@@ -35,9 +35,7 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
     throw new Error(`Invalid state format in ${file}`);
   }
   const record = raw as { agents?: unknown; deletedIds?: unknown; allowSessions?: unknown };
-  const agents = Array.isArray(record.agents)
-    ? normalizeConfig({ agents: record.agents as AgentConfig[] }, { allowLegacySsh: true }).agents
-    : [];
+  const agents = Array.isArray(record.agents) ? normalizeConfig({ agents: record.agents as AgentConfig[] }).agents : [];
   const deletedIds = Array.isArray(record.deletedIds)
     ? [...new Set(record.deletedIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))]
     : [];
@@ -49,7 +47,7 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
 
 export function saveStoredState(state: StoredKnotState, file = defaultAgentsFile()): StoredKnotState {
   const normalized: StoredKnotState = {
-    agents: normalizeConfig({ agents: state.agents }, { allowLegacySsh: true }).agents,
+    agents: normalizeConfig({ agents: state.agents }).agents,
     deletedIds: [...new Set(state.deletedIds.filter((id) => id && !state.agents.some((a) => a.id === id)))],
     ...(state.allowSessions !== undefined ? { allowSessions: [...new Set(state.allowSessions)] } : {}),
   };

@@ -18,9 +18,16 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async health(signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const models = await this.json('/v1/models', { signal });
-    if (models?.object !== 'list' || !Array.isArray(models.data)) {
-      throw new Error('Hermes returned an invalid model list from /v1/models');
+    const capabilities = await this.json('/v1/capabilities', { signal });
+    const features = capabilities?.features;
+    if (
+      capabilities?.object !== 'hermes.api_server.capabilities' ||
+      features?.run_submission !== true ||
+      features.run_status !== true ||
+      features.run_events_sse !== true ||
+      features.run_stop !== true
+    ) {
+      throw new Error('Hermes API Server does not advertise the required Runs API capabilities');
     }
     return this.json('/health', { signal });
   }
@@ -127,10 +134,12 @@ export class HermesAdapter implements AgentAdapter {
       if (state === 'completed') yield { type: 'final', text: finalText || output, stopReason: state };
       else if (state === 'cancelled' || state === 'canceled')
         yield { type: 'final', text: finalText || output, stopReason: 'cancelled' };
-      else if (state)
+      else
         yield {
           type: 'error',
-          text: String(status.error ?? `Hermes stream ended while run was ${state}`),
+          text: String(
+            status.error ?? (state ? `Hermes stream ended while run was ${state}` : 'Hermes returned no run status'),
+          ),
           stopReason: state,
         };
     }

@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeConfig } from '../src/config.js';
-import { Config } from '../src/index.js';
 import { redact, redactText } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
@@ -21,17 +20,6 @@ describe('configuration and policy', () => {
     ]);
   });
 
-  it('keeps legacy SSH entries disabled only when loading config', () => {
-    const legacy = { id: 'old', kind: 'acp', ssh: 'gpu', acpCommand: 'remote-agent', token: 'gateway-key' } as const;
-    const direct = { id: 'current', kind: 'hermes', host: 'https://example.test' } as const;
-    const input = Config({ agents: [legacy, direct] });
-    expect(() => normalizeConfig(input)).toThrow(/SSH connections are no longer supported/);
-    const normalized = normalizeConfig(input, { allowLegacySsh: true });
-    expect(normalized.agents[0]).toMatchObject({ id: 'old', transport: 'ssh', token: 'gateway-key' });
-    expect(normalized.agents[0]?.acpCommand).toBeUndefined();
-    expect(normalized.agents[1]).toMatchObject({ id: 'current', transport: 'direct', port: 443 });
-  });
-
   it('rejects duplicate ids, invalid ports, and direct stdio or missing endpoints', () => {
     expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'hermes' }] })).toThrow(/gateway endpoint/);
     expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'hermes', transport: 'local', port: 0 }] })).toThrow(
@@ -48,6 +36,16 @@ describe('configuration and policy', () => {
         ],
       }),
     ).toThrow(/duplicate/);
+  });
+
+  it.each([
+    ['gateway.test', '/acp'],
+    ['wss://gateway.test', '/acp'],
+    ['wss://gateway.test/', '/'],
+    ['wss://gateway.test/agent/endpoint/', '/agent/endpoint/'],
+  ])('uses the ACP WebSocket path for %s', (host, basePath) => {
+    const [agent] = normalizeConfig({ agents: [{ id: 'acp', kind: 'acp', host }] }).agents;
+    expect(agent?.basePath).toBe(basePath);
   });
 
   it.each(['https://user:password@example.test', 'https://example.test/?token=secret', 'wss://example.test/#fragment'])(

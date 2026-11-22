@@ -1,4 +1,4 @@
-import { LEGACY_SSH_ERROR, secret, urlHost } from './config.js';
+import { secret, urlHost } from './config.js';
 import type { AgentManager } from './manager.js';
 import { redactText } from './policy/redact.js';
 import type { AgentConfig, DoctorStep } from './types.js';
@@ -10,37 +10,35 @@ export async function runDoctor(
   only?: string,
   signal?: AbortSignal,
 ): Promise<{ agents: Array<{ id: string; steps: DoctorStep[] }> }> {
+  signal?.throwIfAborted();
   const configs = manager.configs.filter((config) => !only || config.id === only);
   if (only && configs.length === 0) throw new Error(`Unknown agent "${only}"`);
   return {
     agents: await Promise.all(
       configs.map(async (config) => {
         const steps: DoctorStep[] = [];
-        if (config.transport === 'ssh') {
-          steps.push({ name: 'transport', ok: false, detail: LEGACY_SSH_ERROR });
-        } else {
-          const isWebSocket = config.kind === 'openclaw' || config.kind === 'acp';
-          const scheme = `${isWebSocket ? 'ws' : 'http'}${config.tls ? 's' : ''}`;
-          const host = urlHost(config.host ?? '127.0.0.1');
-          const detail =
-            config.acpTransport === 'stdio'
-              ? 'Starting a local ACP process.'
-              : `Connecting to ${scheme}://${host}:${config.port}${config.basePath ?? ''}.`;
-          steps.push({ name: `${config.transport ?? 'direct'}-transport`, ok: true, detail });
-          const timeout = AbortSignal.timeout(config.connectTimeoutMs ?? 15_000);
-          const healthSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-          try {
-            const health = await manager.adapter(config.id).health(healthSignal);
-            if (health.ok === false) throw new Error('The gateway reported unhealthy status.');
-            steps.push({ name: 'gateway-health', ok: true, detail: 'Gateway connection verified.' });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            const token = secret(config);
-            const detail = redactText(token ? message.replaceAll(token, '[REDACTED]') : message).slice(0, 2_048);
-            steps.push({ name: 'gateway-health', ok: false, detail, hint: gatewayHint(config, detail) });
-          }
+        const isWebSocket = config.kind === 'openclaw' || config.kind === 'acp';
+        const scheme = `${isWebSocket ? 'ws' : 'http'}${config.tls ? 's' : ''}`;
+        const host = urlHost(config.host ?? '127.0.0.1');
+        const detail =
+          config.acpTransport === 'stdio'
+            ? 'Starting a local ACP process.'
+            : `Connecting to ${scheme}://${host}:${config.port}${config.basePath ?? ''}.`;
+        steps.push({ name: `${config.transport ?? 'direct'}-transport`, ok: true, detail });
+        const timeout = AbortSignal.timeout(config.connectTimeoutMs ?? 15_000);
+        const healthSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        try {
+          const health = await manager.adapter(config.id).health(healthSignal);
+          if (health.ok === false) throw new Error('The gateway reported unhealthy status.');
+          steps.push({ name: 'gateway-health', ok: true, detail: 'Gateway connection verified.' });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const token = secret(config);
+          const detail = redactText(token ? message.replaceAll(token, '[REDACTED]') : message).slice(0, 2_048);
+          steps.push({ name: 'gateway-health', ok: false, detail, hint: gatewayHint(config, detail) });
         }
-        manager.recordDoctorResult(config.id, steps, config);
+        signal?.throwIfAborted();
+        manager.recordDoctorResult(config, steps);
         return { id: config.id, steps };
       }),
     ),

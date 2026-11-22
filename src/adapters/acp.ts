@@ -1,6 +1,5 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { StringDecoder } from 'node:string_decoder';
 import {
   type ActiveSession,
   type ActiveSessionMessage,
@@ -41,7 +40,6 @@ export class AcpAdapter implements AgentAdapter {
   private readonly pumping = new Set<string>();
   private connection?: ClientConnection;
   private child?: ChildProcess;
-  private childStderr = '';
   private connecting?: Promise<void>;
   private capabilities?: AgentCapabilities;
 
@@ -351,9 +349,9 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async connect(signal?: AbortSignal): Promise<void> {
-    if (this.connection && !this.connection.signal.aborted) return;
     if (signal?.aborted) throw signal.reason ?? new Error('request aborted');
     if (!this.connecting) {
+      if (this.connection && !this.connection.signal.aborted) return;
       this.connecting = this.open()
         .catch(async (error) => {
           this.connection?.close();
@@ -405,30 +403,26 @@ export class AcpAdapter implements AgentAdapter {
     const connection = app.connect(stream);
     this.connection = connection;
     connection.closed.then(() => {
-      if (this.connection === connection) this.clearSessions();
-      const stderr = this.childStderr.trim();
-      const closeErr = new Error(stderr ? `ACP connection closed (${stderr})` : 'ACP connection closed');
+      if (this.connection !== connection) return;
+      this.clearSessions();
+      const closeErr = new Error('ACP connection closed');
       for (const queue of this.queues.values()) queue.fail(closeErr);
       for (const [requestId, pending] of this.permissions) {
         pending.resolve({ outcome: { outcome: 'cancelled' } });
         this.permissions.delete(requestId);
       }
     });
-    let initialized: { agentCapabilities?: AgentCapabilities };
-    try {
-      initialized = await withTimeout(
-        connection.agent.request(methods.agent.initialize, {
-          protocolVersion: PROTOCOL_VERSION,
-          clientInfo: { name: 'dsh-knot', version: VERSION },
-          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        }),
-        this.config.connectTimeoutMs ?? 30_000,
-        'ACP initialize',
-      );
-    } catch (error) {
-      const stderr = this.childStderr.trim();
-      const base = error instanceof Error ? error.message : String(error);
-      throw new Error(stderr && !base.includes(stderr) ? `${base} (${stderr})` : base);
+    const initialized = await withTimeout(
+      connection.agent.request(methods.agent.initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: { name: 'dsh-knot', version: VERSION },
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      }),
+      this.config.connectTimeoutMs ?? 30_000,
+      'ACP initialize',
+    );
+    if (initialized.protocolVersion !== PROTOCOL_VERSION) {
+      throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}`);
     }
     this.capabilities = initialized.agentCapabilities;
   }
@@ -436,9 +430,9 @@ export class AcpAdapter implements AgentAdapter {
   private openWebSocket() {
     const host = urlHost(this.config.host ?? '127.0.0.1');
     const protocol = this.config.tls ? 'wss' : 'ws';
-    const basePath = this.config.basePath?.replace(/\/+$/, '') ?? '';
+    const path = this.config.basePath ?? '/acp';
     const token = secret(this.config);
-    return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${basePath}/acp`, {
+    return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${path}`, {
       WebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
     });
@@ -448,27 +442,20 @@ export class AcpAdapter implements AgentAdapter {
     if (this.config.transport !== 'local' || !this.config.acpCommand?.trim()) {
       throw new Error('ACP stdio requires local transport and acpCommand');
     }
-    this.childStderr = '';
-    const stderrDecoder = new StringDecoder('utf8');
     const child = spawn(this.config.acpCommand, this.config.acpArgs ?? [], {
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // ACP agents can write credentials and session content to stderr.
+      stdio: ['pipe', 'pipe', 'ignore'],
       windowsHide: true,
     });
     this.child = child;
-    child.stderr?.on('data', (chunk: Buffer) => {
-      this.childStderr = (this.childStderr + stderrDecoder.write(chunk)).slice(-8_192);
-    });
-    child.stderr?.on('end', () => {
-      this.childStderr = (this.childStderr + stderrDecoder.end()).slice(-8_192);
-    });
-    child.on('error', (error) => {
-      for (const queue of this.queues.values()) queue.fail(error);
-      child.stdin!.destroy();
-      child.stdout!.destroy();
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      const failure = new Error(`ACP process error${error.code ? ` (${error.code})` : ''}`);
+      child.stdin.destroy(failure);
+      child.stdout.destroy(failure);
     });
     return ndJsonStream(
-      Writable.toWeb(child.stdin!) as unknown as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
+      Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
     );
   }
 
