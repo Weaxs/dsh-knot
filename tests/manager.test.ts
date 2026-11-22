@@ -95,6 +95,7 @@ describe('AgentManager', () => {
   it.each(['manual', 'timeout'])('keeps an exclusive session locked during %s remote cancellation', async (mode) => {
     let acknowledge!: () => void;
     let cancellations = 0;
+    let closed = false;
     const pending = new Promise<void>((resolve) => {
       acknowledge = resolve;
     });
@@ -112,6 +113,10 @@ describe('AgentManager', () => {
         cancellations++;
         return pending;
       }
+
+      override async close() {
+        closed = true;
+      }
     }
     const manager = new AgentManager(
       [config],
@@ -124,8 +129,15 @@ describe('AgentManager', () => {
     const retry = manager.cancel(job.id);
     expect(() => manager.start(config.id, 'tool turn', 'shared')).toThrow(/active or cancelling job/);
     expect(cancellations).toBe(1);
-    acknowledge();
-    await Promise.all([cancelling, retry]);
+    const replacing = manager.upsert({ ...config, port: 443 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(closed).toBe(false);
+    } finally {
+      acknowledge();
+      await Promise.all([cancelling, retry, replacing]);
+    }
+    expect(closed).toBe(true);
     await manager.close();
   });
 

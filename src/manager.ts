@@ -356,13 +356,15 @@ export class AgentManager {
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
-      if (job.agentId !== agentId || ['completed', 'failed', 'cancelled'].includes(job.status)) continue;
+      if (job.agentId !== agentId || job.status === 'completed' || job.status === 'failed') continue;
+      const cancelling = this.jobOwners.get(id)?.cancelling;
+      if (job.status === 'cancelled' && !cancelling) continue;
       const owned = this.isLatestSessionJob(job);
       job.status = 'cancelled';
       delete job.pendingApproval;
       job.updatedAt = Date.now();
       this.controllers.get(id)?.abort(new LocalOnlyAbortError(`agent "${agentId}" reconfigured`));
-      if (owned && job.sessionId) {
+      if (cancelling || (owned && job.sessionId)) {
         remoteCancels.push(
           this.cancelRemote(job, deadlineSignal).catch(() => {
             /* best-effort remote cancel during reconfigure; bounded by 5s deadline */
