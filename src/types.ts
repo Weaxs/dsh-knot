@@ -9,10 +9,15 @@ export interface AgentConfig {
   kind: AgentKind;
   transport?: TransportKind;
   ssh?: string;
+  sshHost?: string;
+  sshPort?: number;
+  sshUser?: string;
+  sshIdentityFile?: string;
   sshConfig?: string;
   host?: string;
   port?: number;
   tls?: boolean;
+  basePath?: string;
   token?: string;
   tokenEnv?: string;
   origin?: string;
@@ -24,7 +29,25 @@ export interface AgentConfig {
   acpTransport?: 'websocket' | 'stdio';
   acpCommand?: string;
   acpArgs?: string[];
+  acpRuntimeUser?: string;
+  acpLauncher?: string;
   connectTimeoutMs?: number;
+}
+
+export interface DoctorStep {
+  name: string;
+  ok: boolean;
+  detail: string;
+  hint?: string;
+}
+
+export interface AgentConnectionState {
+  status: 'unverified' | 'connected' | 'error';
+  checkedAt?: number;
+  failedStep?: string;
+  error?: string;
+  hint?: string;
+  steps?: DoctorStep[];
 }
 
 export interface McpConfig {
@@ -101,6 +124,7 @@ export interface AgentJob {
   id: string;
   agentId: string;
   sessionId?: string;
+  prompt?: string;
   status: JobStatus;
   createdAt: number;
   updatedAt: number;

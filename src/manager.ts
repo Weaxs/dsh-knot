@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
-import type { AgentAdapter, AgentConfig, AgentJob, PluginConfig } from './types.js';
+import type { AgentAdapter, AgentConfig, AgentConnectionState, AgentJob, DoctorStep, PluginConfig } from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
@@ -20,6 +20,7 @@ export class AgentManager {
   private readonly latestSessionJob = new Map<string, string>();
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
+  private readonly connectionStates = new Map<string, AgentConnectionState>();
 
   constructor(
     configs: AgentConfig[],
@@ -31,33 +32,74 @@ export class AgentManager {
     for (const config of this.configs) this.adapters.set(config.id, this.factory(config));
   }
 
+  recordDoctorResult(agentId: string, steps: DoctorStep[]): AgentConnectionState {
+    const failed = steps.find((step) => !step.ok);
+    const state: AgentConnectionState = failed
+      ? {
+          status: 'error',
+          checkedAt: Date.now(),
+          failedStep: failed.name,
+          error: failed.detail,
+          hint: failed.hint,
+          steps,
+        }
+      : {
+          status: 'connected',
+          checkedAt: Date.now(),
+          steps,
+        };
+    if (this.adapters.has(agentId)) this.connectionStates.set(agentId, state);
+    return state;
+  }
+
   list(): Array<
     Pick<
       AgentConfig,
-      'id' | 'kind' | 'transport' | 'host' | 'ssh' | 'port' | 'tls' | 'acpTransport' | 'acpCommand' | 'model'
+      | 'id'
+      | 'kind'
+      | 'transport'
+      | 'host'
+      | 'ssh'
+      | 'sshHost'
+      | 'sshPort'
+      | 'sshUser'
+      | 'sshIdentityFile'
+      | 'port'
+      | 'tls'
+      | 'basePath'
+      | 'acpTransport'
+      | 'acpCommand'
+      | 'acpRuntimeUser'
+      | 'acpLauncher'
+      | 'model'
     > & {
       hasToken: boolean;
       supportsRespond: boolean;
+      connection: AgentConnectionState;
     }
   > {
-    return this.configs.map(
-      ({ id, kind, transport, host, ssh, port, tls, acpTransport, acpCommand, model, ...rest }) => ({
-        id,
-        kind,
-        transport,
-        host,
-        ssh,
-        port,
-        tls,
-        acpTransport,
-        acpCommand,
-        model,
-        hasToken: Boolean(
-          secret({ id, kind, transport, host, ssh, port, tls, acpTransport, acpCommand, model, ...rest }),
-        ),
-        supportsRespond: typeof this.adapters.get(id)?.respond === 'function',
-      }),
-    );
+    return this.configs.map((config) => ({
+      id: config.id,
+      kind: config.kind,
+      transport: config.transport,
+      host: config.host,
+      ssh: config.ssh,
+      sshHost: config.sshHost,
+      sshPort: config.sshPort,
+      sshUser: config.sshUser,
+      sshIdentityFile: config.sshIdentityFile,
+      port: config.port,
+      tls: config.tls,
+      basePath: config.basePath,
+      acpTransport: config.acpTransport,
+      acpCommand: config.acpCommand,
+      acpRuntimeUser: config.acpRuntimeUser,
+      acpLauncher: config.acpLauncher,
+      model: config.model,
+      hasToken: Boolean(secret(config)),
+      supportsRespond: typeof this.adapters.get(config.id)?.respond === 'function',
+      connection: this.connectionStates.get(config.id) ?? { status: 'unverified' },
+    }));
   }
 
   getConfig(id: string): AgentConfig | undefined {
@@ -69,6 +111,7 @@ export class AgentManager {
       this.reconfiguring.add(config.id);
       const existing = this.adapters.get(config.id);
       this.adapters.delete(config.id);
+      this.connectionStates.delete(config.id);
       try {
         await this.abortJobsForAgent(config.id, existing);
         if (existing) {
@@ -91,6 +134,7 @@ export class AgentManager {
       this.reconfiguring.add(id);
       const existing = this.adapters.get(id);
       this.adapters.delete(id);
+      this.connectionStates.delete(id);
       const index = this.configs.findIndex((item) => item.id === id);
       if (index >= 0) this.configs.splice(index, 1);
       try {
@@ -142,6 +186,7 @@ export class AgentManager {
       id,
       agentId,
       ...(remoteSession ? { sessionId: remoteSession } : {}),
+      prompt: text.slice(0, 4_000),
       status: 'queued',
       createdAt: Date.now(),
       updatedAt: Date.now(),

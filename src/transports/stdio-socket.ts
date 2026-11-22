@@ -1,12 +1,36 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { Duplex } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentConfig } from '../types.js';
 
-export function sshBaseArguments(config: AgentConfig): string[] {
-  if (!config.ssh) throw new Error(`${config.id}: an SSH host alias is required`);
+export function resolveLocalPath(filePath: string): string {
+  const trimmed = filePath.trim();
+  if (trimmed === '~') return homedir();
+  if (trimmed.startsWith('~/')) return join(homedir(), trimmed.slice(2));
+  return trimmed;
+}
+
+export function sshTarget(config: AgentConfig): string {
+  const target = config.ssh?.trim() || config.sshHost?.trim();
+  if (!target) throw new Error(`${config.id}: an SSH host alias or sshHost is required`);
+  return target;
+}
+
+export function sshConnectionFlags(config: AgentConfig): string[] {
   return [
-    ...(config.sshConfig ? ['-F', config.sshConfig] : []),
+    ...(config.sshConfig ? ['-F', resolveLocalPath(config.sshConfig)] : []),
+    ...(config.sshPort ? ['-p', String(config.sshPort)] : []),
+    ...(config.sshUser ? ['-l', config.sshUser] : []),
+    ...(config.sshIdentityFile ? ['-i', resolveLocalPath(config.sshIdentityFile), '-o', 'IdentitiesOnly=yes'] : []),
+  ];
+}
+
+export function sshBaseArguments(config: AgentConfig): string[] {
+  sshTarget(config);
+  return [
+    ...sshConnectionFlags(config),
     '-T',
     '-o',
     'BatchMode=yes',
@@ -22,7 +46,7 @@ export function sshBaseArguments(config: AgentConfig): string[] {
 }
 
 export function sshArguments(config: AgentConfig): string[] {
-  return [...sshBaseArguments(config), '-W', `127.0.0.1:${config.port}`, config.ssh!];
+  return [...sshBaseArguments(config), '-W', `127.0.0.1:${config.port}`, sshTarget(config)];
 }
 
 export function shellQuote(argument: string): string {
@@ -49,6 +73,10 @@ export class StdioSocket extends Duplex {
       if (code !== 0 && !this.destroyed) this.destroy(new Error(this.stderr.trim() || `ssh exited with code ${code}`));
       else this.push(null);
     });
+  }
+
+  lastStderr(): string {
+    return this.stderr.trim();
   }
 
   override _read(): void {

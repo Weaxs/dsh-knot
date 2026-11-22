@@ -103,6 +103,7 @@ describe('web UI host routes & schemastery Config', () => {
     const initial = await post(WEB_ROUTES.state);
     expect(initial.ok).toBe(true);
     expect(initial.value.agents).toHaveLength(1);
+    expect(initial.value.agents[0].connection.status).toBe('unverified');
     expect(initial.value.mcp.enabled).toBe(true);
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
@@ -118,6 +119,23 @@ describe('web UI host routes & schemastery Config', () => {
     const doc = await post(WEB_ROUTES.doctor, { agent: 'hermes-local' });
     expect(doc.ok).toBe(true);
     expect(doc.value.agents[0].steps.every((s: any) => s.ok)).toBe(true);
+
+    const afterDoc = await post(WEB_ROUTES.state);
+    expect(afterDoc.value.agents[0].connection.status).toBe('connected');
+
+    const asked = await post(WEB_ROUTES.ask, {
+      agentId: 'hermes-local',
+      message: 'hello from panel',
+      sessionId: 'remote-1',
+    });
+    expect(asked.ok).toBe(true);
+    expect(asked.value.prompt).toBe('hello from panel');
+    expect(asked.value.sessionId).toBe('remote-1');
+    await post(WEB_ROUTES.cancel, { jobId: asked.value.id });
+
+    const keys = await post(WEB_ROUTES.sshKeys);
+    expect(keys.ok).toBe(true);
+    expect(Array.isArray(keys.value.keys)).toBe(true);
 
     const job = manager.start('hermes-local', 'test', undefined);
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -198,6 +216,46 @@ describe('web UI host routes & schemastery Config', () => {
     expect(savedIds).toContain('concurrent-a');
     expect(savedIds).toContain('concurrent-b');
 
+    // Saving Tailscale Serve HTTPS endpoint and direct SSH + ACP runtime user fields
+    const tsSaved = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-tailscale',
+      kind: 'hermes',
+      transport: 'direct',
+      endpoint: 'https://aws-box.tail1234.ts.net/hermes',
+      token: 'ts-secret',
+    });
+    expect(tsSaved.ok).toBe(true);
+    expect(manager.getConfig('aws-tailscale')).toMatchObject({
+      host: 'aws-box.tail1234.ts.net',
+      port: 443,
+      tls: true,
+      basePath: '/hermes',
+    });
+
+    const sshSaved = await post(WEB_ROUTES.agentSave, {
+      id: 'aws-ssh-acp',
+      kind: 'acp',
+      transport: 'ssh',
+      sshHost: 'ec2-1-2-3-4.compute.amazonaws.com',
+      sshPort: 22,
+      sshUser: 'ubuntu',
+      sshIdentityFile: '~/.ssh/aws.pem',
+      acpTransport: 'stdio',
+      acpCommand: '/root/.local/bin/hermes',
+      acpArgs: ['acp'],
+      acpRuntimeUser: 'root',
+      acpLauncher: 'sudo -n /usr/local/bin/hermes-acp',
+    });
+    expect(sshSaved.ok).toBe(true);
+    expect(manager.getConfig('aws-ssh-acp')).toMatchObject({
+      sshHost: 'ec2-1-2-3-4.compute.amazonaws.com',
+      sshPort: 22,
+      sshUser: 'ubuntu',
+      sshIdentityFile: '~/.ssh/aws.pem',
+      acpRuntimeUser: 'root',
+      acpLauncher: 'sudo -n /usr/local/bin/hermes-acp',
+    });
+
     // Deleted static agent stays deleted when plugin reloads
     const registeredTools: string[] = [];
     const effects: Array<() => Promise<void>> = [];
@@ -213,6 +271,71 @@ describe('web UI host routes & schemastery Config', () => {
     // Corrupted agents.json throws instead of silently wiping state
     writeFileSync(join(process.env.DSH_KNOT_STATE_DIR, 'agents.json'), '{broken-json', 'utf8');
     expect(() => loadStoredState()).toThrow();
+
+    await manager.close();
+  });
+
+  it('bounds hanging sessions requests and records failedStep on doctor errors', async () => {
+    const hangingAdapter: AgentAdapter = {
+      id: 'slow-hermes',
+      kind: 'hermes',
+      async health() {
+        throw new Error('socket hang up');
+      },
+      async listSessions(signal) {
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('sessions timed out')), { once: true });
+        });
+      },
+      async *prompt() {},
+      async cancel() {},
+      async close() {},
+    };
+    const manager = new AgentManager(
+      [{ id: 'slow-hermes', kind: 'hermes', transport: 'local', port: 8642, connectTimeoutMs: 120 }],
+      10_000,
+      () => hangingAdapter,
+    );
+    const routes = new Map<string, (req: Request) => Promise<Response>>();
+    registerWebRoutes(
+      {
+        connection: {
+          fetch: {
+            register(route: { path: string; fetch: (req: Request) => Promise<Response> }) {
+              routes.set(route.path, route.fetch);
+              return () => routes.delete(route.path);
+            },
+          },
+        },
+        effect() {},
+      } as any,
+      manager,
+      undefined,
+      undefined,
+    );
+    const post = async (path: string, body: Record<string, unknown> = {}) => {
+      const res = await routes.get(path)!(
+        new Request(`http://localhost${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }),
+      );
+      return (await res.json()) as any;
+    };
+
+    const sessionsRes = await post(WEB_ROUTES.sessions, { agentId: 'slow-hermes' });
+    expect(sessionsRes.ok).toBe(false);
+    expect(sessionsRes.error).toMatch(/timed out/i);
+
+    const docRes = await post(WEB_ROUTES.doctor, { agent: 'slow-hermes' });
+    expect(docRes.ok).toBe(true);
+    const stateRes = await post(WEB_ROUTES.state);
+    expect(stateRes.value.agents[0].connection).toMatchObject({
+      status: 'error',
+      failedStep: 'gateway-health',
+    });
+    expect(stateRes.value.agents[0].connection.error).toContain('socket hang up');
 
     await manager.close();
   });

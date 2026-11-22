@@ -17,8 +17,8 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       output,
       async execute(args, exec) {
         const agents = manager.list();
-        if (!args.health) return { agents };
-        return {
+        if (!args.health) return plain({ agents });
+        return plain({
           agents: await Promise.all(
             agents.map(async (agent) => {
               try {
@@ -28,7 +28,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
               }
             }),
           ),
-        };
+        });
       },
     }),
   );

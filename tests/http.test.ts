@@ -34,4 +34,28 @@ describe('HTTP transport', () => {
     expect(result.status).toBe(200);
     expect(JSON.parse(result.text)).toEqual({ method: 'POST', body: '{"input":"hello"}' });
   });
+
+  it('prepends basePath on direct requests and bounds stalled headers with connectTimeoutMs', async () => {
+    let seenUrl = '';
+    server = http.createServer((request, response) => {
+      seenUrl = request.url ?? '';
+      if (seenUrl.endsWith('/stall')) return;
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ url: seenUrl }));
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    const transport = new NodeHttpTransport('direct', {
+      id: 'ts',
+      kind: 'hermes',
+      transport: 'direct',
+      host: '127.0.0.1',
+      port,
+      basePath: '/hermes',
+      connectTimeoutMs: 120,
+    });
+    const ok = await transport.request({ path: '/health' });
+    expect(JSON.parse(ok.text)).toEqual({ url: '/hermes/health' });
+    await expect(transport.request({ path: '/stall' })).rejects.toThrow(/timed out/);
+  });
 });

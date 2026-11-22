@@ -4,7 +4,7 @@ import type { Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentConfig, HttpRequest, HttpResponse, Transport } from '../types.js';
-import { openSshSocket } from './stdio-socket.js';
+import { openSshSocket, type StdioSocket } from './stdio-socket.js';
 
 const MAX_BODY = 16 * 1024 * 1024;
 
@@ -39,7 +39,16 @@ export class NodeHttpTransport implements Transport {
     const payload = input.body === undefined ? undefined : Buffer.from(JSON.stringify(input.body));
     const host = this.kind === 'ssh' ? '127.0.0.1' : (this.config.host ?? '127.0.0.1');
     const secure = this.kind !== 'ssh' && this.config.tls === true;
-    const factory = this.kind === 'ssh' ? () => openSshSocket(this.config) : undefined;
+    const basePath = this.kind !== 'ssh' && this.config.basePath ? this.config.basePath.replace(/\/+$/, '') : '';
+    const path = basePath ? `${basePath}${input.path.startsWith('/') ? input.path : `/${input.path}`}` : input.path;
+    let sshSocket: StdioSocket | undefined;
+    const factory =
+      this.kind === 'ssh'
+        ? () => {
+            sshSocket = openSshSocket(this.config);
+            return sshSocket;
+          }
+        : undefined;
     const customAgent = factory ? new http.Agent() : undefined;
     if (customAgent && factory) customAgent.createConnection = factory as unknown as () => Socket;
     const options: RequestOptions = {
@@ -47,7 +56,7 @@ export class NodeHttpTransport implements Transport {
       host,
       port: this.config.port,
       method: input.method ?? 'GET',
-      path: input.path,
+      path,
       agent: customAgent ?? false,
       headers: {
         Accept: 'application/json, text/event-stream',
@@ -56,8 +65,17 @@ export class NodeHttpTransport implements Transport {
       },
     };
     const driver = secure ? https : http;
+    const timeoutMs = this.config.connectTimeoutMs ?? 15_000;
     return new Promise<IncomingMessage>((resolve, reject) => {
+      let headerTimer: NodeJS.Timeout | undefined;
+      const clearHeaderTimer = () => {
+        if (headerTimer) {
+          clearTimeout(headerTimer);
+          headerTimer = undefined;
+        }
+      };
       const request = driver.request(options, (response) => {
+        clearHeaderTimer();
         request.setTimeout(0);
         if ((response.statusCode ?? 500) >= 400) {
           const decoder = new StringDecoder('utf8');
@@ -84,17 +102,33 @@ export class NodeHttpTransport implements Transport {
         }
         resolve(response);
       });
-      if (this.kind !== 'ssh' && this.config.connectTimeoutMs) {
-        request.setTimeout(this.config.connectTimeoutMs, () => {
-          request.destroy(new Error(`request timed out after ${this.config.connectTimeoutMs}ms`));
-        });
-      }
-      request.on('error', reject);
+      headerTimer = setTimeout(() => {
+        const stderr = sshSocket?.lastStderr();
+        const detail = stderr ? ` (ssh: ${stderr})` : '';
+        request.destroy(new Error(`request timed out after ${timeoutMs}ms${detail}`));
+      }, timeoutMs);
+      request.on('error', (error: Error) => {
+        clearHeaderTimer();
+        const stderr = sshSocket?.lastStderr();
+        if (stderr && !error.message.includes(stderr)) {
+          reject(new Error(`${error.message} (ssh: ${stderr})`));
+        } else {
+          reject(error);
+        }
+      });
       const signal = input.signal;
-      const abort = () => request.destroy(new Error('request aborted'));
-      if (signal?.aborted) request.destroy(new Error('request aborted'));
-      else signal?.addEventListener('abort', abort, { once: true });
+      const abort = () => {
+        clearHeaderTimer();
+        request.destroy(new Error('request aborted'));
+      };
+      if (signal?.aborted) {
+        clearHeaderTimer();
+        request.destroy(new Error('request aborted'));
+      } else {
+        signal?.addEventListener('abort', abort, { once: true });
+      }
       responseCleanup(request, () => {
+        clearHeaderTimer();
         signal?.removeEventListener('abort', abort);
         customAgent?.destroy();
       });

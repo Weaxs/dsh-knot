@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { acpStdioSpawnSpec } from '../src/adapters/acp.js';
 import { normalizeConfig } from '../src/config.js';
 import { sshHint } from '../src/doctor.js';
 import { redact, redactText } from '../src/policy/redact.js';
@@ -79,5 +80,96 @@ describe('configuration and policy', () => {
     expect(sshHint('Too many authentication failures')).toMatch(/IdentitiesOnly/);
     expect(sshHint('no matching host key type found. Their offer: ssh-rsa')).toMatch(/HostKeyAlgorithms/);
     expect(sshHint('Enter passphrase for key')).toMatch(/ssh-agent/);
+    expect(sshHint('sudo: a password is required')).toMatch(/acpLauncher|NOPASSWD/);
+    expect(sshHint('bash: hermes: command not found')).toMatch(/PATH|runtime user/);
+    expect(sshHint('socket hang up')).toMatch(/127\.0\.0\.1:8642/);
+    expect(sshHint('request timed out after 15000ms')).toMatch(/443|timed out/i);
+  });
+
+  it('parses Tailscale Serve HTTPS endpoints and defaults TLS direct ports to 443', () => {
+    const value = normalizeConfig({
+      agents: [
+        { id: 'ts-https', kind: 'hermes', transport: 'direct', host: 'https://aws-hermes.tail1234.ts.net' },
+        {
+          id: 'ts-prefix',
+          kind: 'hermes',
+          transport: 'direct',
+          host: 'https://aws-hermes.tail1234.ts.net:8443/hermes/',
+        },
+        { id: 'tls-no-port', kind: 'hermes', transport: 'direct', host: 'aws-hermes.tail1234.ts.net', tls: true },
+      ],
+    });
+    expect(value.agents[0]).toMatchObject({ host: 'aws-hermes.tail1234.ts.net', port: 443, tls: true });
+    expect(value.agents[0]?.basePath).toBeUndefined();
+    expect(value.agents[1]).toMatchObject({
+      host: 'aws-hermes.tail1234.ts.net',
+      port: 8443,
+      tls: true,
+      basePath: '/hermes',
+    });
+    expect(value.agents[2]).toMatchObject({ host: 'aws-hermes.tail1234.ts.net', port: 443, tls: true });
+  });
+
+  it('supports direct SSH host, port, user, and local PEM key without an ~/.ssh/config alias', () => {
+    const [agent] = normalizeConfig({
+      agents: [
+        {
+          id: 'aws-direct-ssh',
+          kind: 'hermes',
+          transport: 'ssh',
+          sshHost: 'ec2-1-2-3-4.compute.amazonaws.com',
+          sshPort: 2222,
+          sshUser: 'ubuntu',
+          sshIdentityFile: '/keys/aws.pem',
+        },
+      ],
+    }).agents;
+    const args = sshArguments(agent!);
+    expect(args).toContain('-p');
+    expect(args).toContain('2222');
+    expect(args).toContain('-l');
+    expect(args).toContain('ubuntu');
+    expect(args).toContain('-i');
+    expect(args).toContain('/keys/aws.pem');
+    expect(args).toContain('IdentitiesOnly=yes');
+    expect(args.slice(-3)).toEqual(['-W', '127.0.0.1:8642', 'ec2-1-2-3-4.compute.amazonaws.com']);
+  });
+
+  it('supports ACP stdio runtime user and server-approved launcher over direct SSH', () => {
+    const [withRuntimeUser] = normalizeConfig({
+      agents: [
+        {
+          id: 'aws-acp-root',
+          kind: 'acp',
+          transport: 'ssh',
+          sshHost: '1.2.3.4',
+          sshUser: 'ubuntu',
+          sshIdentityFile: '/keys/aws.pem',
+          acpTransport: 'stdio',
+          acpCommand: '/root/.local/bin/hermes',
+          acpArgs: ['acp'],
+          acpRuntimeUser: 'root',
+        },
+      ],
+    }).agents;
+    const specUser = acpStdioSpawnSpec(withRuntimeUser!);
+    expect(specUser.command).toBe('ssh');
+    expect(specUser.args.at(-1)).toBe("'sudo' '-n' '-u' 'root' '--' '/root/.local/bin/hermes' 'acp'");
+
+    const [withLauncher] = normalizeConfig({
+      agents: [
+        {
+          id: 'aws-acp-launcher',
+          kind: 'acp',
+          transport: 'ssh',
+          sshHost: '1.2.3.4',
+          sshUser: 'ubuntu',
+          acpTransport: 'stdio',
+          acpLauncher: 'sudo -n /usr/local/bin/hermes-acp',
+        },
+      ],
+    }).agents;
+    const specLauncher = acpStdioSpawnSpec(withLauncher!);
+    expect(specLauncher.args.at(-1)).toBe("'sudo' '-n' '/usr/local/bin/hermes-acp'");
   });
 });

@@ -40,17 +40,93 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   if (agent.ssh !== undefined && (agent.ssh.startsWith('-') || !/^\S+$/.test(agent.ssh))) {
     throw new ConfigError(`${agent.id}: ssh must be one host alias without spaces`);
   }
-  if (transport === 'ssh' && !agent.ssh) throw new ConfigError(`${agent.id}: ssh transport requires an ssh host alias`);
+  if (agent.sshHost !== undefined && (agent.sshHost.startsWith('-') || !/^\S+$/.test(agent.sshHost))) {
+    throw new ConfigError(`${agent.id}: sshHost must be a hostname or IP without spaces`);
+  }
+  if (agent.sshUser !== undefined && (agent.sshUser.startsWith('-') || !/^\S+$/.test(agent.sshUser))) {
+    throw new ConfigError(`${agent.id}: sshUser must be a username without spaces`);
+  }
+  if (agent.sshPort !== undefined) port(agent.sshPort, `${agent.id}.sshPort`);
+  if (
+    agent.sshIdentityFile !== undefined &&
+    (!agent.sshIdentityFile.trim() || agent.sshIdentityFile.startsWith('-') || /[\0\r\n]/.test(agent.sshIdentityFile))
+  ) {
+    throw new ConfigError(`${agent.id}: invalid sshIdentityFile`);
+  }
+  if (transport === 'ssh' && !agent.ssh && !agent.sshHost) {
+    throw new ConfigError(`${agent.id}: ssh transport requires an ssh host alias or sshHost`);
+  }
+
+  let parsedHost = agent.host;
+  let parsedPort = agent.port;
+  let parsedTls = agent.tls;
+  let parsedBasePath = agent.basePath;
+
+  if (transport !== 'ssh' && typeof parsedHost === 'string' && /^(https?|wss?):\/\//i.test(parsedHost.trim())) {
+    let url: URL;
+    try {
+      url = new URL(parsedHost.trim());
+    } catch {
+      throw new ConfigError(`${agent.id}: invalid endpoint URL`);
+    }
+    if (!url.hostname) throw new ConfigError(`${agent.id}: invalid endpoint URL`);
+    parsedHost = url.hostname;
+    const isSecure = url.protocol === 'https:' || url.protocol === 'wss:';
+    if (isSecure) parsedTls = true;
+    else if (parsedTls === undefined) parsedTls = false;
+    if (parsedPort === undefined) {
+      parsedPort = url.port ? Number(url.port) : isSecure ? 443 : 80;
+    }
+    if (parsedBasePath === undefined && url.pathname && url.pathname !== '/') {
+      parsedBasePath = url.pathname;
+    }
+  }
+
+  if (parsedBasePath !== undefined) {
+    const trimmed = parsedBasePath.trim().replace(/\/+$/, '');
+    if (trimmed && (!trimmed.startsWith('/') || /\s/.test(trimmed))) {
+      throw new ConfigError(`${agent.id}: basePath must start with "/" and contain no spaces`);
+    }
+    parsedBasePath = trimmed || undefined;
+  }
+
   const defaultPort =
-    agent.kind === 'openclaw' ? 18_789 : agent.kind === 'dsh' ? 18_790 : agent.kind === 'acp' ? 18_792 : 8_642;
-  const result: AgentConfig = { ...agent, transport, port: agent.port ?? defaultPort };
+    transport === 'direct' && parsedTls === true
+      ? 443
+      : agent.kind === 'openclaw'
+        ? 18_789
+        : agent.kind === 'dsh'
+          ? 18_790
+          : agent.kind === 'acp'
+            ? 18_792
+            : 8_642;
+  const result: AgentConfig = {
+    ...agent,
+    transport,
+    ...(parsedHost !== undefined ? { host: parsedHost } : {}),
+    ...(parsedTls !== undefined ? { tls: parsedTls } : {}),
+    ...(parsedBasePath !== undefined ? { basePath: parsedBasePath } : {}),
+    port: parsedPort ?? defaultPort,
+  };
+  if (result.basePath === undefined) delete result.basePath;
   port(result.port!, `${agent.id}.port`);
   if (transport !== 'ssh' && !result.host) result.host = '127.0.0.1';
   if (result.host?.startsWith('-')) throw new ConfigError(`${agent.id}: invalid host`);
+  if (
+    result.acpRuntimeUser !== undefined &&
+    (result.acpRuntimeUser.startsWith('-') || !/^\S+$/.test(result.acpRuntimeUser))
+  ) {
+    throw new ConfigError(`${agent.id}: acpRuntimeUser must be a username without spaces`);
+  }
+  if (result.acpLauncher !== undefined && (!result.acpLauncher.trim() || /[\0\r\n]/.test(result.acpLauncher))) {
+    throw new ConfigError(`${agent.id}: invalid acpLauncher`);
+  }
   if (result.acpTransport === 'stdio') {
     if (result.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
     if (transport === 'direct') throw new ConfigError(`${agent.id}: ACP stdio requires local or ssh transport`);
-    if (!result.acpCommand?.trim()) throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand`);
+    if (!result.acpCommand?.trim() && !result.acpLauncher?.trim()) {
+      throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand or acpLauncher`);
+    }
   }
   if (result.acpArgs?.some((argument) => typeof argument !== 'string')) {
     throw new ConfigError(`${agent.id}: acpArgs must be strings`);

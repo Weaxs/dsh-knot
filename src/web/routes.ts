@@ -1,3 +1,6 @@
+import { readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { Context } from '@deepseek-ai/cordis';
 import { normalizeConfig } from '../config.js';
 import { runDoctor } from '../doctor.js';
@@ -23,13 +26,62 @@ interface ConnectionHostFace {
 export const WEB_ROUTES = {
   state: '/api/dsh-knot/state',
   doctor: '/api/dsh-knot/doctor',
+  ask: '/api/dsh-knot/ask',
   respond: '/api/dsh-knot/respond',
   cancel: '/api/dsh-knot/cancel',
   sessions: '/api/dsh-knot/sessions',
+  sshKeys: '/api/dsh-knot/ssh-keys',
   mcpShare: '/api/dsh-knot/mcp-share',
   agentSave: '/api/dsh-knot/agent-save',
   agentDelete: '/api/dsh-knot/agent-delete',
 } as const;
+
+const SSH_NON_KEY_FILES = new Set([
+  'config',
+  'known_hosts',
+  'known_hosts.old',
+  'authorized_keys',
+  'authorized_keys2',
+  'environment',
+  'rc',
+]);
+
+function discoverLocalSshKeys(): Array<{ path: string; name: string; permissionsWarning?: string }> {
+  const home = homedir();
+  const found: Array<{ path: string; name: string; permissionsWarning?: string }> = [];
+  const seen = new Set<string>();
+  const scanDir = (dir: string, onlyPem: boolean) => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      if (name.startsWith('.') || name.endsWith('.pub') || SSH_NON_KEY_FILES.has(name)) continue;
+      if (onlyPem && !/\.(pem|key)$/i.test(name)) continue;
+      const full = join(dir, name);
+      if (seen.has(full)) continue;
+      try {
+        const st = statSync(full);
+        if (!st.isFile() || st.size === 0 || st.size > 65_536) continue;
+        seen.add(full);
+        const mode = st.mode & 0o777;
+        const permissionsWarning =
+          process.platform !== 'win32' && (mode & 0o077) !== 0
+            ? `Mode 0${mode.toString(8)} is too open; run chmod 600`
+            : undefined;
+        const displayPath = full.startsWith(`${home}/`) ? `~/${full.slice(home.length + 1)}` : full;
+        found.push({ path: displayPath, name, ...(permissionsWarning ? { permissionsWarning } : {}) });
+      } catch {
+        /* skip unreadable files */
+      }
+      if (found.length >= 50) return;
+    }
+  };
+  scanDir(join(home, '.ssh'), false);
+  return found;
+}
 
 function jsonReply(value: unknown, status = 200): Response {
   return Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
@@ -153,6 +205,30 @@ export function registerWebRoutes(
       }
     });
 
+    register(WEB_ROUTES.ask, async (request) => {
+      try {
+        const body = await parseBody(request);
+        const agentId = typeof body.agentId === 'string' ? body.agentId.trim() : '';
+        const message = typeof body.message === 'string' ? body.message.trim() : '';
+        const sessionId =
+          typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId.trim() : undefined;
+        if (!agentId) return errorReply('agentId is required', 400);
+        if (!message) return errorReply('message is required', 400);
+        const job = manager.start(agentId, message, sessionId);
+        return jsonReply({ ok: true, value: redact(job) });
+      } catch (error) {
+        return errorReply(error instanceof Error ? error.message : String(error), 400);
+      }
+    });
+
+    register(WEB_ROUTES.sshKeys, async () => {
+      try {
+        return jsonReply({ ok: true, value: { keys: discoverLocalSshKeys() } });
+      } catch (error) {
+        return errorReply(error instanceof Error ? error.message : String(error), 500);
+      }
+    });
+
     register(WEB_ROUTES.respond, async (request) => {
       try {
         const body = await parseBody(request);
@@ -184,7 +260,9 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const agentId = typeof body.agentId === 'string' ? body.agentId : '';
         if (!agentId) return errorReply('agentId is required', 400);
-        const items = await manager.adapter(agentId).listSessions(request.signal);
+        const timeoutMs = manager.getConfig(agentId)?.connectTimeoutMs ?? 15_000;
+        const boundedSignal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
+        const items = await manager.adapter(agentId).listSessions(boundedSignal);
         return jsonReply({ ok: true, value: { agentId, sessions: redact(items.slice(0, 100)) } });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
@@ -219,7 +297,16 @@ export function registerWebRoutes(
           const kind = (body.kind ?? existing?.kind) as AgentConfig['kind'];
           const transport = ((body.transport ?? existing?.transport) as AgentConfig['transport']) ?? 'ssh';
           const resolvedToken = clearToken ? undefined : incomingToken || existing?.token;
-          const resolvedTls = typeof body.tls === 'boolean' ? body.tls : existing?.tls;
+          const endpointInput = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+          const hostInput =
+            endpointInput || (typeof body.host === 'string' ? body.host.trim() || undefined : existing?.host);
+          const resolvedTls = typeof body.tls === 'boolean' ? body.tls : endpointInput ? undefined : existing?.tls;
+          const resolvedBasePath =
+            typeof body.basePath === 'string'
+              ? body.basePath.trim() || undefined
+              : endpointInput
+                ? undefined
+                : existing?.basePath;
           const acpTransport =
             kind === 'acp'
               ? body.acpTransport === 'stdio' || body.acpTransport === 'websocket'
@@ -232,6 +319,18 @@ export function registerWebRoutes(
                 ? body.acpCommand.trim() || undefined
                 : existing?.acpCommand
               : undefined;
+          const acpRuntimeUser =
+            kind === 'acp' && acpTransport === 'stdio'
+              ? typeof body.acpRuntimeUser === 'string'
+                ? body.acpRuntimeUser.trim() || undefined
+                : existing?.acpRuntimeUser
+              : undefined;
+          const acpLauncher =
+            kind === 'acp' && acpTransport === 'stdio'
+              ? typeof body.acpLauncher === 'string'
+                ? body.acpLauncher.trim() || undefined
+                : existing?.acpLauncher
+              : undefined;
           const candidate: AgentConfig = {
             ...(existing ?? {}),
             id,
@@ -243,19 +342,43 @@ export function registerWebRoutes(
                   ? body.ssh.trim() || undefined
                   : existing?.ssh
                 : undefined,
-            host:
-              transport !== 'ssh'
-                ? typeof body.host === 'string'
-                  ? body.host.trim() || undefined
-                  : existing?.host
+            sshHost:
+              transport === 'ssh'
+                ? typeof body.sshHost === 'string'
+                  ? body.sshHost.trim() || undefined
+                  : existing?.sshHost
                 : undefined,
+            sshPort:
+              transport === 'ssh'
+                ? body.sshPort !== undefined && body.sshPort !== ''
+                  ? Number(body.sshPort)
+                  : body.sshPort === ''
+                    ? undefined
+                    : existing?.sshPort
+                : undefined,
+            sshUser:
+              transport === 'ssh'
+                ? typeof body.sshUser === 'string'
+                  ? body.sshUser.trim() || undefined
+                  : existing?.sshUser
+                : undefined,
+            sshIdentityFile:
+              transport === 'ssh'
+                ? typeof body.sshIdentityFile === 'string'
+                  ? body.sshIdentityFile.trim() || undefined
+                  : existing?.sshIdentityFile
+                : undefined,
+            host: transport !== 'ssh' ? hostInput : undefined,
             port: body.port !== undefined && body.port !== '' ? Number(body.port) : undefined,
             tls: transport === 'direct' && resolvedTls ? true : undefined,
+            basePath: transport !== 'ssh' ? resolvedBasePath : undefined,
             token: resolvedToken,
             tokenEnv: clearToken ? undefined : existing?.tokenEnv,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
             acpTransport,
             acpCommand,
+            acpRuntimeUser,
+            acpLauncher,
             ...(Array.isArray(body.acpArgs) ? { acpArgs: body.acpArgs.map(String) } : {}),
           };
           for (const key of Object.keys(candidate) as Array<keyof AgentConfig>) {
