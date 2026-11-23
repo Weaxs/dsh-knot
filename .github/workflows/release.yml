@@ -44,7 +44,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           publish() {
             if [[ "$(npm view "$1@$version" version 2>/dev/null)" != "$version" ]]; then
-              npx --yes npm@11.20.0 publish --access public --provenance
+              npx --yes npm@11.20.0 publish --access public --provenance --tag latest
             fi
           }
 
@@ -62,6 +62,13 @@ jobs:
           test -f icon.svg
           test -f locale/en.json
           publish dsh-knot
+      - name: Deprecate the withdrawn 0.3.0 packages
+        if: env.RELEASE_TAG == 'v0.2.1'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm deprecate '@weaxs/dsh-knot@0.3.0' 'Withdrawn. Use 0.2.1.'
+          npm deprecate 'dsh-knot@0.3.0' 'Withdrawn. Use 0.2.1.'
       - name: Create GitHub Release
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
