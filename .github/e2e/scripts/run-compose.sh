@@ -23,8 +23,11 @@ cleanup() {
   local log=".github/e2e/generated/e2e-$mode-$target-$E2E_PROTOCOL.log"
   "${compose[@]}" logs --no-color > "$log" 2>&1
   if [[ "$mode" == tailscale ]]; then
-    # If logout cannot finish, the ephemeral device ages out after it disconnects.
-    "${compose[@]}" exec -T "${target}-tailscale" timeout 8s tailscale --socket=/tmp/tailscaled.sock logout >> "$log" 2>&1
+    if "${compose[@]}" exec -T "${target}-tailscale" timeout 20s tailscale --socket=/tmp/tailscaled.sock logout 2>&1 | tee -a "$log"; then
+      echo "Logged out the $target Tailscale sidecar."
+    else
+      echo "::warning::Could not log out the $target Tailscale sidecar. An inactive ephemeral device will age out."
+    fi
   fi
   "${compose[@]}" down -v --remove-orphans >> "$log" 2>&1
   if [[ "$mode" == headscale && -f "${RUNNER_TEMP:-/tmp}/headscale-e2e.log" ]]; then
