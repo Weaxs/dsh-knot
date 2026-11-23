@@ -95,6 +95,7 @@ interface JobSummary {
   createdAt: number;
   updatedAt: number;
   text: string;
+  thought?: string;
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
@@ -223,6 +224,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatStopUnconfirmed: '尚未确认远端任务已停止',
     chatBack: '助手设置',
     chatPreparing: '正在生成…',
+    chatThought: '思考',
     chatToolActivity: '执行过程',
     chatToolInput: '工具参数',
     chatToolRunning: '执行中',
@@ -324,6 +326,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatStopUnconfirmed: 'The remote stop has not been confirmed',
     chatBack: 'Agent settings',
     chatPreparing: 'Generating…',
+    chatThought: 'Thinking',
     chatToolActivity: 'Activity',
     chatToolInput: 'Tool input',
     chatToolRunning: 'Running',
@@ -397,6 +400,7 @@ body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1
 .dk-chat-turn { display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow-wrap: anywhere; }
 .dk-chat-activity { color: var(--dsw-alias-label-secondary, #6b7280); font-size: 12px; }
 .dk-chat-activity summary { cursor: pointer; }
+.dk-chat-thought { padding-inline-start: 12px; margin: 6px 0 0 4px; border-inline-start: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); }
 .dk-chat-activity ul { list-style: none; margin: 6px 0 0 15px; padding: 0; }
 .dk-chat-activity li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 4px 12px; padding-block: 3px; }
 .dk-chat-activity-name { color: var(--dsw-alias-label-primary, #111827); }
@@ -904,6 +908,21 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         'div',
         { key: job.id, className: 'dk-chat-turn' },
         showPrompt && job.prompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
+        job.thought
+          ? h(
+              'details',
+              { className: 'dk-chat-activity' },
+              h('summary', null, t('chatThought')),
+              h(MarkdownText, {
+                className: 'dk-chat-thought',
+                text: job.thought,
+                streaming: active,
+                labels: MARKDOWN_LABELS[lang],
+                variant: 'compact',
+                omitHtml: true,
+              }),
+            )
+          : null,
         job.tools?.length
           ? h(
               'details',

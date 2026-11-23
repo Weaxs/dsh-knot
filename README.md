@@ -48,7 +48,7 @@ When loaded in `dsh web`, **dsh-knot** registers the **Remote Agents / 远端助
 
 - **Approve or cancel in one click**: Remote approval prompts and active background jobs appear at the top of the panel.
 - **Inspect connections**: Run `knot_doctor` across all configured agents or expand per-agent gateway checks.
-- **Chat with remote agents**: Click **Chat** on an assistant to open its conversation view. Follow replies and reported tool activity, or reopen a remote session and continue it. Hermes loads recent messages directly from its API server.
+- **Chat with remote agents**: Click **Chat** on an assistant to open its conversation view. Expand **Thinking** or **Activity** to see reasoning or tool activity when the agent reports it. For OpenClaw, see [reasoning visibility settings](https://docs.openclaw.ai/tools/thinking#reasoning-visibility-reasoning). Reopen a remote session to continue it. Hermes loads recent messages directly from its API server.
 - **Control local sharing**: Toggle which local dsh sessions are visible over the separate read-only MCP listener.
 
 ---

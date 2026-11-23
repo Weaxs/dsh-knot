@@ -58,7 +58,7 @@ export interface PluginConfig {
 }
 
 export interface AgentEvent {
-  type: 'text' | 'tool' | 'approval' | 'final' | 'error';
+  type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
   name?: string;
   phase?: 'start' | 'end';
@@ -146,6 +146,7 @@ export interface AgentJob {
   createdAt: number;
   updatedAt: number;
   text: string;
+  thought?: string;
   tools?: AgentToolActivity[];
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';

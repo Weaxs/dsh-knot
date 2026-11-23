@@ -18,6 +18,7 @@ export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 const MAX_JOBS = 200;
 const MAX_JOB_TOOLS = 50;
+const MAX_JOB_THOUGHT_LENGTH = 16_000;
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -478,7 +479,9 @@ export class AgentManager {
           }
         }
         if (event.type === 'text' && event.text) job.text = (job.text + event.text).slice(-2_000_000);
-        else if (event.type === 'tool' && event.phase) recordToolActivity(job, event);
+        else if (event.type === 'thought' && event.text) {
+          job.thought = ((job.thought ?? '') + event.text).slice(-MAX_JOB_THOUGHT_LENGTH);
+        } else if (event.type === 'tool' && event.phase) recordToolActivity(job, event);
         else if (event.type === 'approval') {
           job.pendingApproval = { requestId: event.requestId ?? '', choices: event.choices ?? [], text: event.text };
         } else if (event.type === 'error') throw new Error(event.text ?? 'remote agent failed');
@@ -527,12 +530,11 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
       ? tools.findIndex((tool) => tool.status === 'running' && tool.name === (name || 'tool'))
       : -1;
   const previous = tools[index];
-  if (previous && event.phase === 'start') return;
-  const inputPreview = previous?.inputPreview ?? event.inputPreview;
+  const inputPreview = event.inputPreview ?? previous?.inputPreview;
   const activity: AgentToolActivity = {
     id: previous?.id ?? callId ?? randomUUID(),
     name: name || previous?.name || 'tool',
-    status: event.phase === 'start' ? 'running' : event.failed ? 'failed' : 'completed',
+    status: event.phase === 'start' ? (previous?.status ?? 'running') : event.failed ? 'failed' : 'completed',
     ...(inputPreview ? { inputPreview } : {}),
   };
   job.tools = previous

@@ -18,7 +18,7 @@ afterEach(async () => {
 });
 
 describe('OpenClaw WebSocket wire protocol', () => {
-  it('performs the challenge handshake and JSON-RPC calls', async () => {
+  it('performs the challenge handshake and streams thought and tool events separately from the response', async () => {
     const received: any[] = [];
     server = new WebSocketServer({ host: '127.0.0.1', port: 0, path: '/gateway/', handleProtocols: () => 'json' });
     server.on('connection', (socket, request) => {
@@ -54,6 +54,21 @@ describe('OpenClaw WebSocket wire protocol', () => {
               payload: { runId: 'run-wire', sessionKey: frame.params.sessionKey },
             }),
           );
+          for (const [runId, itemId, text, delta] of [
+            ['other-run', 'item-1', 'bad thought', 'bad thought'],
+            ['run-wire', 'item-1', 'Check', 'Check'],
+            ['run-wire', 'item-1', 'Check the weather.', ' the weather.'],
+            ['run-wire', 'item-1', 'Check the weather. Search.', 'Check the weather. Search.'],
+            ['run-wire', 'item-2', 'Verify.', 'Verify.'],
+          ]) {
+            socket.send(
+              JSON.stringify({
+                type: 'event',
+                event: 'agent',
+                payload: { runId, stream: 'thinking', data: { itemId, text, delta } },
+              }),
+            );
+          }
           socket.send(
             JSON.stringify({
               type: 'event',
@@ -104,6 +119,13 @@ describe('OpenClaw WebSocket wire protocol', () => {
     expect(await adapter.health()).toEqual({ ok: true });
     const events = [];
     for await (const event of adapter.prompt('agent:main:wire', 'hello')) events.push(event);
+    expect(events.filter((event) => event.type === 'thought').map(({ text }) => text)).toEqual([
+      'Check',
+      ' the weather.',
+      ' Search.',
+      '\n\nVerify.',
+    ]);
+    expect(events.filter((event) => event.type === 'text')).toEqual([{ type: 'text', text: 'wire ' }]);
     expect(events.filter((event) => event.type === 'tool')).toEqual([
       {
         type: 'tool',

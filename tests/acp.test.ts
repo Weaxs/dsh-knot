@@ -24,8 +24,9 @@ class FakeNativeAdapter implements AgentAdapter {
   async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
     this.prompts.push({ sessionId: sessionId ?? '', text });
     yield { type: 'text', text: 'hello ' };
-    yield { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'test-tool' };
-    yield { type: 'tool', phase: 'end', requestId: 'tool-1', name: 'test-tool' };
+    yield { type: 'thought', text: 'Checking tool availability' };
+    yield { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'test-tool', inputPreview: 'README.md' };
+    yield { type: 'tool', phase: 'end', requestId: 'tool-1', name: 'test-tool', failed: true };
     yield { type: 'approval', requestId: 'permission-1', choices: ['approve', 'reject'], text: 'Allow the test?' };
     while (!this.choice) await new Promise((resolve) => setTimeout(resolve, 1));
     yield { type: 'text', text: 'world' };
@@ -118,7 +119,11 @@ describe('ACP provider and bridge', () => {
     const createdSessionId = first.at(-1)?.sessionId;
     expect(createdSessionId).toBeTruthy();
     expect(first.at(-1)).toMatchObject({ type: 'final', text: 'hello world', stopReason: 'end_turn' });
-    expect(first.filter((event) => event.type === 'tool')).toHaveLength(2);
+    expect(first.filter((event) => event.type === 'thought' || event.type === 'tool')).toMatchObject([
+      { type: 'thought', text: 'Checking tool availability', sessionId: createdSessionId },
+      { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'test-tool', inputPreview: 'README.md' },
+      { type: 'tool', phase: 'end', requestId: 'tool-1', failed: true },
+    ]);
     expect(native.choice).toBe('approve');
 
     native.choice = undefined;
@@ -156,6 +161,9 @@ describe('ACP provider and bridge', () => {
       resumed.push(event);
       if (event.type === 'approval') await freshAdapter.respond(createdSessionId!, event.requestId!, 'approve');
     }
+    expect(resumed).toEqual(
+      expect.arrayContaining(first.filter((event) => event.type === 'thought' || event.type === 'tool')),
+    );
     expect(resumed.at(-1)).toMatchObject({ type: 'final', text: 'hello world', sessionId: createdSessionId });
     expect(native.prompts.at(-1)?.sessionId).toBe(createdSessionId);
 
@@ -218,6 +226,17 @@ describe('ACP provider and bridge', () => {
     expect(await adapter.health()).toMatchObject({ ok: true, protocol: 'acp', protocolVersion: 1 });
     const events = [];
     for await (const event of adapter.prompt(undefined, 'hello')) events.push(event);
+    expect(events.filter((event) => event.type === 'thought' || event.type === 'tool')).toMatchObject([
+      { type: 'thought', text: 'Looking up a file' },
+      { type: 'tool', phase: 'start', requestId: 'stdio-tool', name: 'read_file' },
+      {
+        type: 'tool',
+        phase: 'start',
+        requestId: 'stdio-tool',
+        inputPreview: JSON.stringify({ path: 'README.md', password: '[REDACTED]' }, null, 2),
+      },
+      { type: 'tool', phase: 'end', requestId: 'stdio-tool', failed: true },
+    ]);
     expect(events.at(-1)).toMatchObject({
       type: 'final',
       text: 'stdio:hello',

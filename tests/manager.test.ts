@@ -186,13 +186,15 @@ describe('AgentManager', () => {
     expect(manager.get(job.id).pendingApproval).toBeUndefined();
   });
 
-  it('keeps tool activity for the current turn without exposing tool payloads', async () => {
+  it('keeps bounded thoughts and tool activity separate from the reply', async () => {
     let finish!: () => void;
     const finishTurn = new Promise<void>((resolve) => {
       finish = resolve;
     });
     class ToolAdapter extends FakeAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'thought', text: `${'x'.repeat(16_000)}Check the ` };
+        yield { type: 'thought', text: 'README first.' };
         yield {
           type: 'tool',
           requestId: 'a',
@@ -202,9 +204,11 @@ describe('AgentManager', () => {
           inputPreview: 'README.md',
         };
         yield { type: 'tool', requestId: 'b', phase: 'start', name: 'read_file' };
+        yield { type: 'tool', requestId: 'b', phase: 'start', inputPreview: 'MISSING.md' };
         yield { type: 'tool', requestId: 'c', phase: 'start', name: 'terminal' };
         await finishTurn;
         yield { type: 'tool', requestId: 'b', phase: 'end', failed: true };
+        yield { type: 'tool', requestId: 'b', phase: 'start', inputPreview: 'MISSING.md' };
         yield { type: 'tool', requestId: 'a', phase: 'end' };
         yield { type: 'final', text: 'Done' };
       }
@@ -214,6 +218,10 @@ describe('AgentManager', () => {
     try {
       await vi.waitFor(() => expect(manager.getCurrentJob(config.id, job.id)?.tools).toHaveLength(3));
       expect(job.tools?.map(({ status }) => status)).toEqual(['running', 'running', 'running']);
+      expect(job.tools?.[1]?.inputPreview).toBe('MISSING.md');
+      expect(job.thought).toHaveLength(16_000);
+      expect(job.thought?.endsWith('Check the README first.')).toBe(true);
+      expect(job.text).toBe('');
     } finally {
       finish();
     }
@@ -224,7 +232,9 @@ describe('AgentManager', () => {
       ['terminal', 'interrupted'],
     ]);
     expect(completed.tools?.[0]?.inputPreview).toBe('README.md');
+    expect(completed.tools?.[1]?.inputPreview).toBe('MISSING.md');
     expect(JSON.stringify(completed.tools)).not.toContain('private tool arguments');
+    expect(completed.text).toBe('Done');
     await manager.close();
   });
 

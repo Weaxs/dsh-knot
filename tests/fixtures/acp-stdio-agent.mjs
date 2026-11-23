@@ -9,10 +9,16 @@ app.onRequest(methods.agent.initialize, () => ({
 app.onRequest(methods.agent.session.new, () => ({ sessionId: 'stdio-session' }));
 app.onRequest(methods.agent.session.prompt, async ({ params, client }) => {
   const text = params.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
-  await client.notify(methods.client.session.update, {
-    sessionId: params.sessionId,
-    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `stdio:${text}` } },
+  const notify = (update) => client.notify(methods.client.session.update, { sessionId: params.sessionId, update });
+  await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Looking up a file' } });
+  await notify({ sessionUpdate: 'tool_call', toolCallId: 'stdio-tool', title: 'Read file', name: 'read_file' });
+  await notify({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'stdio-tool',
+    rawInput: { path: 'README.md', password: 'pretend-password' },
   });
+  await notify({ sessionUpdate: 'tool_call_update', toolCallId: 'stdio-tool', status: 'failed' });
+  await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `stdio:${text}` } });
   return { stopReason: 'end_turn' };
 });
 app.onNotification(methods.agent.session.cancel, () => {});

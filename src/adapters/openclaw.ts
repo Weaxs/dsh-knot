@@ -7,6 +7,8 @@ import { VERSION } from '../version.js';
 import { GatewayWebSocket } from './gateway-ws.js';
 import { loadOrCreateIdentity, signClaim } from './openclaw-identity.js';
 
+const MAX_THOUGHT_SNAPSHOT_LENGTH = 64_000;
+
 export class OpenClawAdapter implements AgentAdapter {
   readonly kind = 'openclaw' as const;
   private readonly transport: Transport;
@@ -52,6 +54,7 @@ export class OpenClawAdapter implements AgentAdapter {
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
     let output = '';
+    let lastThought: { itemId?: string; snapshot?: string } | undefined;
     try {
       if (sessionId) {
         await this.gateway.request(
@@ -149,6 +152,27 @@ export class OpenClawAdapter implements AgentAdapter {
         const eventName = String(payload.event ?? payload.type ?? frame.event ?? '');
         const nested =
           payload.data && typeof payload.data === 'object' ? (payload.data as Record<string, unknown>) : undefined;
+        if (frame.event === 'agent' && payload.stream === 'thinking') {
+          if (eventRun === runId && nested) {
+            const itemId = typeof nested.itemId === 'string' ? nested.itemId : undefined;
+            const snapshot = typeof nested.text === 'string' ? nested.text : undefined;
+            let thought = typeof nested.delta === 'string' ? nested.delta : snapshot;
+            const previous = lastThought?.itemId === itemId ? lastThought?.snapshot : undefined;
+            // OpenClaw can resend the full snapshot at the message boundary as its delta.
+            if (snapshot && previous && thought?.endsWith(snapshot) && snapshot.startsWith(previous)) {
+              thought = snapshot.slice(previous.length);
+            }
+            if (thought) {
+              const separator = itemId && lastThought?.itemId && lastThought.itemId !== itemId ? '\n\n' : '';
+              yield { type: 'thought', text: separator + thought };
+            }
+            lastThought = {
+              itemId,
+              snapshot: snapshot && snapshot.length <= MAX_THOUGHT_SNAPSHOT_LENGTH ? snapshot : undefined,
+            };
+          }
+          continue;
+        }
         if (frame.event === 'agent' && payload.stream === 'tool') {
           if (eventRun === runId && nested && (nested.phase === 'start' || nested.phase === 'result')) {
             const requestId = nested.toolCallId;

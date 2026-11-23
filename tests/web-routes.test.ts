@@ -29,6 +29,7 @@ class StubAdapter implements AgentAdapter {
     return [{ id: 'message-1', role: 'assistant' as const, text: `${sessionId}: Bearer very-secret-value` }];
   }
   async *prompt(): AsyncIterable<AgentEvent> {
+    yield { type: 'thought', text: 'Checking Bearer very-secret-value' };
     yield { type: 'approval', requestId: 'req-1', choices: ['approve', 'deny'], text: 'Run pytest?' };
     await new Promise((resolve) => setTimeout(resolve, 200));
     yield { type: 'final', text: 'done' };
@@ -162,7 +163,7 @@ describe('web UI host routes & schemastery Config', () => {
     });
     expect(await post(WEB_ROUTES.job, { agentId: 'hermes-local', revision, jobId: asked.value.id })).toMatchObject({
       ok: true,
-      value: { id: asked.value.id, sessionId: 'remote-1' },
+      value: { id: asked.value.id, sessionId: 'remote-1', thought: 'Checking [REDACTED]', text: '' },
     });
     const duplicate = await post(WEB_ROUTES.ask, {
       agentId: 'hermes-local',

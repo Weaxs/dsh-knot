@@ -16,6 +16,7 @@ import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
@@ -196,7 +197,7 @@ export class AcpAdapter implements AgentAdapter {
             yield { type: 'final', text: output, stopReason: next.value.value.stopReason, sessionId: actualId };
             return;
           }
-          const event = acpEvent(next.value.value.update);
+          const event = acpEvent(next.value.value.update, secret(this.config));
           if (!event) continue;
           if (event.type === 'text' && event.text) output += event.text;
           yield { ...event, sessionId: actualId };
@@ -376,7 +377,7 @@ export class AcpAdapter implements AgentAdapter {
     const app = client({ name: 'dsh-knot' });
     app.onNotification(methods.client.session.update, ({ params }) => {
       if (!this.loadedSessions.has(params.sessionId) || this.activeSessions.has(params.sessionId)) return;
-      const event = acpEvent(params.update);
+      const event = acpEvent(params.update, secret(this.config));
       if (event) this.queues.get(params.sessionId)?.push({ kind: 'native', value: event });
     });
     app.onRequest(methods.client.session.requestPermission, ({ params }) => {
@@ -485,24 +486,22 @@ function permissionKey(sessionId: string, requestId: string): string {
   return `${sessionId}\0${requestId}`;
 }
 
-function acpEvent(update: SessionUpdate): AgentEvent | undefined {
+function acpEvent(update: SessionUpdate, token?: string): AgentEvent | undefined {
   if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
     return { type: 'text', text: update.content.text };
   }
-  if (update.sessionUpdate === 'tool_call') {
-    return {
-      type: 'tool',
-      phase: 'start',
-      requestId: update.toolCallId,
-      name: update.name ?? update.title,
-    };
+  if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') {
+    return { type: 'thought', text: update.content.text };
   }
-  if (update.sessionUpdate === 'tool_call_update') {
+  if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+    const inputPreview = toolInputPreview(update.rawInput, token);
     return {
       type: 'tool',
       phase: update.status === 'completed' || update.status === 'failed' ? 'end' : 'start',
       requestId: update.toolCallId,
-      name: update.name ?? update.title ?? update.toolCallId,
+      name: update.name ?? update.title ?? undefined,
+      ...(inputPreview ? { inputPreview } : {}),
+      ...(update.status === 'failed' ? { failed: true } : {}),
     };
   }
   if (update.sessionUpdate === 'notice' && update.severity === 'error') {

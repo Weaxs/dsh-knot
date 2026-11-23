@@ -184,12 +184,19 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       if (event.type === 'text' && event.text) {
         output += event.text;
         await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+      } else if (event.type === 'thought' && event.text) {
+        await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
       } else if (event.type === 'tool') {
         const key = event.requestId ?? event.name ?? 'tool';
         const toolCallId = toolIds.get(key) ?? event.requestId ?? randomUUID();
         toolIds.set(key, toolCallId);
         if (event.phase === 'end') {
-          await notify({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
+          await notify({
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: event.failed ? 'failed' : 'completed',
+            rawInput: event.inputPreview,
+          });
         } else {
           await notify({
             sessionUpdate: 'tool_call',
@@ -198,6 +205,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
             name: event.name,
             kind: 'other',
             status: 'in_progress',
+            rawInput: event.inputPreview,
           });
         }
       } else if (event.type === 'approval') {
