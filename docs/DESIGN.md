@@ -49,7 +49,7 @@ interface AgentAdapter {
 }
 ```
 
-`AgentEvent` is a small normalized vocabulary: text, tool activity, approval, final result, or error. Adapter-specific payloads never reach model tools directly.
+`AgentEvent` is a small normalized vocabulary: text, tool activity, approval, final result, or error. When a gateway reports tool input, the adapter sends a bounded, redacted preview to the Remote Agents chat. Model tools receive tool names and status.
 
 ### ACP v1 provider and bridge
 

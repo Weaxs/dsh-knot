@@ -163,10 +163,10 @@ describe('Hermes API Server adapter', () => {
     class ToolEventsTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {
         return incoming(
-          'id: 1\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-1"}\n\n' +
-            'id: 2\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-2"}\n\n' +
+          'id: 1\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-1","preview":"DSH adapters"}\n\n' +
+            'id: 2\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-2","preview":"export HERMES_API_KEY=private-value"}\n\n' +
             'id: 3\ndata: {"event":"tool.progress","delta":"internal tool update"}\n\n' +
-            'id: 4\ndata: {"event":"tool.completed","tool":"search","tool_call_id":"call-2","error":false}\n\n' +
+            'id: 4\ndata: {"event":"tool.completed","tool":"search","tool_call_id":"call-2","error":false,"preview":"private result"}\n\n' +
             'id: 5\ndata: {"event":"tool.completed","tool":"search","tool_call_id":"call-1","error":true}\n\n' +
             'id: 6\nevent: tool.failed\ndata: {"tool_name":"file"}\n\n' +
             'id: 7\ndata: {"event":"run.completed","output":"done","completed":true}\n\n',
@@ -181,8 +181,8 @@ describe('Hermes API Server adapter', () => {
     const events = [];
     for await (const event of adapter.prompt('session-1', 'Search')) events.push(event);
     expect(events).toEqual([
-      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-1' },
-      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-2' },
+      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-1', inputPreview: 'DSH adapters' },
+      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-2', inputPreview: '[REDACTED]' },
       { type: 'tool', phase: 'end', name: 'search', requestId: 'call-2' },
       { type: 'tool', phase: 'end', name: 'search', requestId: 'call-1', failed: true },
       { type: 'tool', phase: 'end', name: 'file', failed: true },

@@ -455,7 +455,7 @@ describe('web UI host routes & schemastery Config', () => {
       }
       if (req === '@deepseek-ai/dsh-client-ui-primitives') {
         const render = () => null;
-        return { Button: render, MarkdownText: render, UserMessageBubble: render };
+        return { Button: render, CommandText: render, MarkdownText: render, UserMessageBubble: render };
       }
       return origLoad(req, parent, isMain);
     };

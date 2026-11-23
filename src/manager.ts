@@ -528,10 +528,12 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
       : -1;
   const previous = tools[index];
   if (previous && event.phase === 'start') return;
+  const inputPreview = previous?.inputPreview ?? event.inputPreview;
   const activity: AgentToolActivity = {
     id: previous?.id ?? callId ?? randomUUID(),
     name: name || previous?.name || 'tool',
     status: event.phase === 'start' ? 'running' : event.failed ? 'failed' : 'completed',
+    ...(inputPreview ? { inputPreview } : {}),
   };
   job.tools = previous
     ? tools.map((tool, i) => (i === index ? activity : tool))

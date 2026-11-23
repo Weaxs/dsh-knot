@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type {
   AgentAdapter,
@@ -126,10 +127,15 @@ export class HermesAdapter implements AgentAdapter {
           if (!started && !ended) continue;
           const name = event.tool ?? event.name ?? event.tool_name;
           const requestId = event.tool_call_id;
+          const inputPreview =
+            started && typeof event.preview === 'string'
+              ? toolInputPreview(event.preview, secret(this.config))
+              : undefined;
           yield {
             type: 'tool',
             phase: ended ? 'end' : 'start',
             name: typeof name === 'string' && name ? name : 'tool',
+            ...(inputPreview ? { inputPreview } : {}),
             ...(typeof requestId === 'string' && requestId ? { requestId } : {}),
             ...(ended && (type === 'tool.failed' || event.error === true) ? { failed: true } : {}),
           };

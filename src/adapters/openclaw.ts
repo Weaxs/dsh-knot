@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
@@ -151,10 +152,13 @@ export class OpenClawAdapter implements AgentAdapter {
         if (frame.event === 'agent' && payload.stream === 'tool') {
           if (eventRun === runId && nested && (nested.phase === 'start' || nested.phase === 'result')) {
             const requestId = nested.toolCallId;
+            const inputPreview =
+              nested.phase === 'start' ? toolInputPreview(nested.args, secret(this.config)) : undefined;
             yield {
               type: 'tool',
               phase: nested.phase === 'result' ? 'end' : 'start',
               name: typeof nested.name === 'string' && nested.name ? nested.name : 'tool',
+              ...(inputPreview ? { inputPreview } : {}),
               ...(typeof requestId === 'string' && requestId ? { requestId } : {}),
               ...(nested.phase === 'result' && nested.isError === true ? { failed: true } : {}),
             };

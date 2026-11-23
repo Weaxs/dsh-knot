@@ -10,6 +10,34 @@ const PATTERNS: RegExp[] = [
 const SENSITIVE_KEY =
   /^(?:authorization|x[-_]api[-_]key|cookie|set[-_]cookie|password|passwd|secret|client[-_]secret|api[-_]?key|private[-_]?key|(?:access|refresh|session|auth|id)?[-_]?token)$/i;
 
+const CREDENTIAL_INPUT =
+  /(?:(?:\b|[_-])(?:authorization|api[-_]?key|token|password|passwd|secret|cookie)["']?\s*[:=]|--[\w-]*(?:key|token|password|passwd|secret)\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
+
+export function toolInputPreview(value: unknown, token?: string): string | undefined {
+  const display = (text: string): string => {
+    const masked = token ? text.replaceAll(token, '[REDACTED]') : text;
+    return CREDENTIAL_INPUT.test(masked) ? '[REDACTED]' : redactText(masked);
+  };
+  let preview: string;
+  if (typeof value === 'string') preview = display(value).trim();
+  else if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const fields = Object.entries(value)
+      .filter(([, field]) => ['string', 'number', 'boolean'].includes(typeof field))
+      .slice(0, 8)
+      .map(([key, field]) => [
+        display(key).slice(0, 120),
+        SENSITIVE_KEY.test(key) || CREDENTIAL_INPUT.test(`${key}=`)
+          ? '[REDACTED]'
+          : typeof field === 'string'
+            ? display(field).slice(0, 500)
+            : field,
+      ]);
+    if (!fields.length) return undefined;
+    preview = JSON.stringify(Object.fromEntries(fields), null, 2);
+  } else return undefined;
+  return preview.length > 500 ? `${preview.slice(0, 500)}…` : preview || undefined;
+}
+
 export function redactText(text: string): string {
   return PATTERNS.reduce((value, pattern) => value.replace(pattern, '[REDACTED]'), text);
 }

@@ -63,6 +63,7 @@ export interface AgentEvent {
   name?: string;
   phase?: 'start' | 'end';
   failed?: boolean;
+  inputPreview?: string;
   requestId?: string;
   choices?: string[];
   stopReason?: string;
@@ -133,6 +134,7 @@ export interface AgentToolActivity {
   id: string;
   name: string;
   status: 'running' | 'completed' | 'failed' | 'interrupted';
+  inputPreview?: string;
 }
 
 export interface AgentJob {

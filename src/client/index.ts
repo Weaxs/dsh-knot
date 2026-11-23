@@ -12,6 +12,7 @@ interface ReactModule {
 
 interface ChatPrimitives {
   Button: unknown;
+  CommandText: unknown;
   MarkdownText: unknown;
   UserMessageBubble: unknown;
 }
@@ -97,7 +98,7 @@ interface JobSummary {
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
-  tools?: Array<{ id: string; name: string; status: ToolStatus }>;
+  tools?: Array<{ id: string; name: string; status: ToolStatus; inputPreview?: string }>;
 }
 
 interface LocalSessionSummary {
@@ -223,6 +224,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatBack: '助手设置',
     chatPreparing: '正在生成…',
     chatToolActivity: '执行过程',
+    chatToolInput: '工具参数',
     chatToolRunning: '执行中',
     chatToolCompleted: '已完成',
     chatToolFailed: '失败',
@@ -323,6 +325,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatBack: 'Agent settings',
     chatPreparing: 'Generating…',
     chatToolActivity: 'Activity',
+    chatToolInput: 'Tool input',
     chatToolRunning: 'Running',
     chatToolCompleted: 'Completed',
     chatToolFailed: 'Failed',
@@ -395,8 +398,9 @@ body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1
 .dk-chat-activity { color: var(--dsw-alias-label-secondary, #6b7280); font-size: 12px; }
 .dk-chat-activity summary { cursor: pointer; }
 .dk-chat-activity ul { list-style: none; margin: 6px 0 0 15px; padding: 0; }
-.dk-chat-activity li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; padding-block: 3px; }
+.dk-chat-activity li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 4px 12px; padding-block: 3px; }
 .dk-chat-activity-name { color: var(--dsw-alias-label-primary, #111827); }
+.dk-chat-activity-input { grid-column: 1 / -1; min-width: 0; }
 .dk-chat-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .dk-chat-form { width: min(100%, 760px); box-sizing: border-box; margin-inline: auto; padding-top: 10px; }
 .dk-chat-composer { display: flex; gap: 8px; align-items: end; }
@@ -665,7 +669,7 @@ interface ThreadProps {
 
 function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
-  const { Button, MarkdownText, UserMessageBubble } = primitives;
+  const { Button, CommandText, MarkdownText, UserMessageBubble } = primitives;
 
   return function ChatThread({
     agent,
@@ -925,6 +929,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
                     { key: tool.id },
                     h('span', { className: 'dk-chat-activity-name' }, tool.name),
                     h('span', null, t(TOOL_STATUS_LABEL[tool.status])),
+                    tool.inputPreview
+                      ? h(CommandText, {
+                          className: 'dk-chat-activity-input',
+                          text: tool.inputPreview,
+                          label: t('chatToolInput'),
+                        })
+                      : null,
                   ),
                 ),
               ),

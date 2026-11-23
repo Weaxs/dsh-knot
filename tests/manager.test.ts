@@ -193,7 +193,14 @@ describe('AgentManager', () => {
     });
     class ToolAdapter extends FakeAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
-        yield { type: 'tool', requestId: 'a', phase: 'start', name: 'read_file', text: 'private tool arguments' };
+        yield {
+          type: 'tool',
+          requestId: 'a',
+          phase: 'start',
+          name: 'read_file',
+          text: 'private tool arguments',
+          inputPreview: 'README.md',
+        };
         yield { type: 'tool', requestId: 'b', phase: 'start', name: 'read_file' };
         yield { type: 'tool', requestId: 'c', phase: 'start', name: 'terminal' };
         await finishTurn;
@@ -216,6 +223,7 @@ describe('AgentManager', () => {
       ['read_file', 'failed'],
       ['terminal', 'interrupted'],
     ]);
+    expect(completed.tools?.[0]?.inputPreview).toBe('README.md');
     expect(JSON.stringify(completed.tools)).not.toContain('private tool arguments');
     await manager.close();
   });

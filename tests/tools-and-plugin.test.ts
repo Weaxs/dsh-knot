@@ -18,6 +18,8 @@ class MockAdapter implements AgentAdapter {
     return [];
   }
   async *prompt(): AsyncIterable<AgentEvent> {
+    yield { type: 'tool', phase: 'start', name: 'terminal', inputPreview: 'UI-only command' };
+    yield { type: 'tool', phase: 'end', name: 'terminal' };
     yield { type: 'final', text: 'done' };
   }
   async cancel(_sessionId: string, signal?: AbortSignal) {
@@ -68,6 +70,9 @@ describe('plugin entry, tools and doctor', () => {
     expect(asked.status).toBe('completed');
     expect(asked.text).toBe('done');
     expect(followups).toHaveLength(1);
+    expect(manager.get(asked.id).tools?.[0]?.inputPreview).toBe('UI-only command');
+    expect(asked.tools).toEqual([{ id: expect.any(String), name: 'terminal', status: 'completed' }]);
+    expect(JSON.stringify(followups)).not.toContain('UI-only command');
 
     const doctorResult = await runDoctor(manager, 'local-hermes', controller.signal);
     expect(doctorResult.agents[0]?.steps.every((step) => step.ok)).toBe(true);

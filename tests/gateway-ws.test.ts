@@ -69,7 +69,13 @@ describe('OpenClaw WebSocket wire protocol', () => {
                 payload: {
                   runId: 'run-wire',
                   stream: 'tool',
-                  data: { phase, name: 'search', toolCallId: 'tool-wire', isError: phase === 'result' },
+                  data: {
+                    phase,
+                    name: 'search',
+                    toolCallId: 'tool-wire',
+                    isError: phase === 'result',
+                    args: { query: 'weather', password: 'secret-value', page: 1 },
+                  },
                 },
               }),
             );
@@ -99,7 +105,13 @@ describe('OpenClaw WebSocket wire protocol', () => {
     const events = [];
     for await (const event of adapter.prompt('agent:main:wire', 'hello')) events.push(event);
     expect(events.filter((event) => event.type === 'tool')).toEqual([
-      { type: 'tool', phase: 'start', name: 'search', requestId: 'tool-wire' },
+      {
+        type: 'tool',
+        phase: 'start',
+        name: 'search',
+        requestId: 'tool-wire',
+        inputPreview: JSON.stringify({ query: 'weather', password: '[REDACTED]', page: 1 }, null, 2),
+      },
       { type: 'tool', phase: 'end', name: 'search', requestId: 'tool-wire', failed: true },
     ]);
     expect(events.at(-1)).toMatchObject({ type: 'final', text: 'wire result' });
