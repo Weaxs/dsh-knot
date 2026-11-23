@@ -1,6 +1,6 @@
 x-tailscale-environment: &tailscale-environment
   TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
-  TS_STATE_DIR: /var/lib/tailscale
+  # Let containerboot use in-memory state for short-lived test nodes.
   TS_USERSPACE: "false"
   TS_ACCEPT_DNS: "false"
 
@@ -22,8 +22,6 @@ services:
     environment:
       <<: *tailscale-environment
       TS_HOSTNAME: hermes-e2e-${E2E_NODE_SUFFIX}
-    volumes:
-      - hermes-tailscale-state:/var/lib/tailscale
 
   openclaw-tailscale:
     <<: *tailscale-service
@@ -35,8 +33,6 @@ services:
     environment:
       <<: *tailscale-environment
       TS_HOSTNAME: openclaw-e2e-${E2E_NODE_SUFFIX}
-    volumes:
-      - openclaw-tailscale-state:/var/lib/tailscale
 
   dsh-tailscale:
     <<: *tailscale-service
@@ -48,10 +44,3 @@ services:
     environment:
       <<: *tailscale-environment
       TS_HOSTNAME: dsh-e2e-${E2E_NODE_SUFFIX}
-    volumes:
-      - dsh-tailscale-state:/var/lib/tailscale
-
-volumes:
-  hermes-tailscale-state:
-  openclaw-tailscale-state:
-  dsh-tailscale-state:
