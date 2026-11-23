@@ -86,6 +86,8 @@ For Tailscale mode, also export `TAILSCALE_AUTHKEY` and connect the local machin
 
 ## Logs and cleanup
 
+Tailscale sidecars use in-memory state, which registers them as ephemeral devices. They log out on graceful shutdown, and the Tailscale GitHub Action logs out the runner in its post step. After an abrupt stop, Tailscale removes ephemeral devices after a period of inactivity. See [Tailscale ephemeral nodes](https://tailscale.com/docs/features/ephemeral-nodes).
+
 Each script uses a unique Compose project and removes containers, networks, and volumes on exit. On failure, the workflow uploads container and adapter logs as artifacts. Logs should not contain model credentials, but hostnames, device IDs, session IDs, and model output are expected test data.
 
 Model calls cost money and can take several minutes. Each job has a 35-minute timeout, and adapter tasks have their own timeout as well.
