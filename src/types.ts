@@ -58,10 +58,13 @@ export interface PluginConfig {
 }
 
 export interface AgentEvent {
-  type: 'text' | 'tool' | 'approval' | 'final' | 'error';
+  type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
   name?: string;
-  phase?: 'start' | 'end';
+  title?: string;
+  phase?: 'pending' | 'start' | 'end';
+  failed?: boolean;
+  inputPreview?: string;
   requestId?: string;
   choices?: string[];
   stopReason?: string;
@@ -75,12 +78,28 @@ export interface AgentSession {
   updatedAt?: string | number;
 }
 
+export interface AgentTranscriptMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface AgentPromptOptions {
+  idempotencyKey?: string;
+}
+
 export interface AgentAdapter {
   readonly id: string;
   readonly kind: AgentKind;
   health(signal?: AbortSignal): Promise<Record<string, unknown>>;
   listSessions(signal?: AbortSignal): Promise<AgentSession[]>;
-  prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent>;
+  getSessionMessages?(sessionId: string, signal?: AbortSignal): Promise<AgentTranscriptMessage[]>;
+  prompt(
+    sessionId: string | undefined,
+    text: string,
+    signal?: AbortSignal,
+    options?: AgentPromptOptions,
+  ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
@@ -112,6 +131,14 @@ export interface Transport {
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
+export interface AgentToolActivity {
+  id: string;
+  name: string;
+  title?: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
+  inputPreview?: string;
+}
+
 export interface AgentJob {
   id: string;
   agentId: string;
@@ -121,6 +148,9 @@ export interface AgentJob {
   createdAt: number;
   updatedAt: number;
   text: string;
+  thought?: string;
+  tools?: AgentToolActivity[];
   error?: string;
+  remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
 }

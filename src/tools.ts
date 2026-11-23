@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { runDoctor } from './doctor.js';
 import type { AgentManager } from './manager.js';
+import type { AgentJob } from './types.js';
 
 const output = {
   schema: { type: 'json' as const },
@@ -47,7 +48,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       output,
       async execute(args, exec) {
         const job = manager.start(args.agent, args.task, args.session, (completed) => notifyAgent(exec, completed));
-        return plain(args.wait ? await manager.wait(job.id, exec.signal) : job);
+        return plain(modelJob(args.wait ? await manager.wait(job.id, exec.signal) : job));
       },
     }),
   );
@@ -65,7 +66,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       output,
       async execute(args, exec) {
         const job = manager.start(args.agent, args.message, args.session, (completed) => notifyAgent(exec, completed));
-        return plain(args.wait ? await manager.wait(job.id, exec.signal) : job);
+        return plain(modelJob(args.wait ? await manager.wait(job.id, exec.signal) : job));
       },
     }),
   );
@@ -80,7 +81,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       },
       output,
       async execute(args, exec) {
-        return plain(args.wait ? await manager.wait(args.job, exec.signal) : manager.get(args.job));
+        return plain(modelJob(args.wait ? await manager.wait(args.job, exec.signal) : manager.get(args.job)));
       },
     }),
   );
@@ -92,7 +93,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       parameters: { job: { type: 'string', required: true } },
       output,
       async execute(args, exec) {
-        return plain(await manager.cancel(args.job, exec.signal));
+        return plain(modelJob(await manager.cancel(args.job, exec.signal)));
       },
     }),
   );
@@ -113,7 +114,7 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
       },
       output,
       async execute(args, exec) {
-        return plain(await manager.respond(args.job, args.choice, exec.signal, args.request_id));
+        return plain(modelJob(await manager.respond(args.job, args.choice, exec.signal, args.request_id)));
       },
     }),
   );
@@ -164,12 +165,16 @@ function plain(value: unknown): any {
   return JSON.parse(JSON.stringify(value));
 }
 
-function notifyAgent(exec: { agent?: unknown }, job: unknown): void {
+function modelJob({ thought: _thought, tools, ...job }: AgentJob): AgentJob {
+  return { ...job, ...(tools ? { tools: tools.map(({ id, name, status }) => ({ id, name, status })) } : {}) };
+}
+
+function notifyAgent(exec: { agent?: unknown }, job: AgentJob): void {
   const agent = exec.agent as { followup?: (message: unknown) => void } | undefined;
   if (!agent?.followup) return;
   agent.followup({
     role: 'user',
-    content: [{ type: 'text', text: `Remote agent job update:\n${JSON.stringify(job)}` }],
+    content: [{ type: 'text', text: `Remote agent job update:\n${JSON.stringify(modelJob(job))}` }],
     source: { kind: 'knot' },
   });
 }

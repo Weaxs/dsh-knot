@@ -16,6 +16,7 @@ import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
 import { VERSION } from '../version.js';
@@ -103,7 +104,7 @@ export class AcpAdapter implements AgentAdapter {
   async *prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent> {
     let actualId = sessionId ?? '';
     let output = '';
-    const queue = new AsyncQueue<PromptMessage>();
+    const queue = new AsyncQueue<PromptMessage>(1_024, 'error');
     try {
       await this.connect(signal);
       let active = sessionId ? this.activeSessions.get(sessionId) : undefined;
@@ -196,7 +197,7 @@ export class AcpAdapter implements AgentAdapter {
             yield { type: 'final', text: output, stopReason: next.value.value.stopReason, sessionId: actualId };
             return;
           }
-          const event = acpEvent(next.value.value.update);
+          const event = acpEvent(next.value.value.update, secret(this.config));
           if (!event) continue;
           if (event.type === 'text' && event.text) output += event.text;
           yield { ...event, sessionId: actualId };
@@ -220,10 +221,19 @@ export class AcpAdapter implements AgentAdapter {
         }
         yield { type: 'final', text: output, stopReason: 'cancelled', ...(actualId ? { sessionId: actualId } : {}) };
       } else {
+        if (queue.failure && actualId && this.connection?.signal.aborted === false) {
+          const deadline = AbortSignal.timeout(5_000);
+          await raceAbort(this.cancel(actualId, deadline), deadline).catch(() => {
+            /* best-effort remote cancel when the event queue cannot accept more updates */
+          });
+        }
         yield { type: 'error', text: error instanceof Error ? error.message : String(error) };
       }
     } finally {
-      if (actualId && this.queues.get(actualId) === queue) this.queues.delete(actualId);
+      if (actualId && this.queues.get(actualId) === queue) {
+        this.queues.delete(actualId);
+        this.cancelPermissions(actualId);
+      }
       queue.finish();
     }
   }
@@ -232,11 +242,7 @@ export class AcpAdapter implements AgentAdapter {
     await this.connect(signal);
     const actualId = this.sessionIds.get(sessionId) ?? sessionId;
     await this.connection!.agent.notify(methods.agent.session.cancel, { sessionId: actualId });
-    for (const [requestId, pending] of this.permissions) {
-      if (pending.sessionId !== actualId) continue;
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-      this.permissions.delete(requestId);
-    }
+    this.cancelPermissions(actualId);
   }
 
   async respond(sessionId: string, requestId: string, choice: string): Promise<void> {
@@ -249,10 +255,7 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
-    for (const [requestId, pending] of this.permissions) {
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-      this.permissions.delete(requestId);
-    }
+    this.cancelPermissions();
     for (const queue of this.queues.values()) queue.finish();
     this.queues.clear();
     this.clearSessions();
@@ -261,6 +264,14 @@ export class AcpAdapter implements AgentAdapter {
     this.connecting = undefined;
     await this.closeProcess();
     await this.transport.close();
+  }
+
+  private cancelPermissions(sessionId?: string): void {
+    for (const [requestId, pending] of this.permissions) {
+      if (sessionId !== undefined && pending.sessionId !== sessionId) continue;
+      this.permissions.delete(requestId);
+      pending.resolve({ outcome: { outcome: 'cancelled' } });
+    }
   }
 
   private trackInFlight(sessionId: string, promise: Promise<unknown>): void {
@@ -376,10 +387,12 @@ export class AcpAdapter implements AgentAdapter {
     const app = client({ name: 'dsh-knot' });
     app.onNotification(methods.client.session.update, ({ params }) => {
       if (!this.loadedSessions.has(params.sessionId) || this.activeSessions.has(params.sessionId)) return;
-      const event = acpEvent(params.update);
+      const event = acpEvent(params.update, secret(this.config));
       if (event) this.queues.get(params.sessionId)?.push({ kind: 'native', value: event });
     });
     app.onRequest(methods.client.session.requestPermission, ({ params }) => {
+      const queue = this.queues.get(params.sessionId);
+      if (!queue || queue.failure) return { outcome: { outcome: 'cancelled' } };
       const requestId = params.toolCall.toolCallId;
       const key = permissionKey(params.sessionId, requestId);
       const previous = this.permissions.get(key);
@@ -387,7 +400,7 @@ export class AcpAdapter implements AgentAdapter {
         previous.resolve({ outcome: { outcome: 'cancelled' } });
         this.permissions.delete(key);
       }
-      this.queues.get(params.sessionId)?.push({
+      queue.push({
         kind: 'native',
         value: {
           type: 'approval',
@@ -407,10 +420,7 @@ export class AcpAdapter implements AgentAdapter {
       this.clearSessions();
       const closeErr = new Error('ACP connection closed');
       for (const queue of this.queues.values()) queue.fail(closeErr);
-      for (const [requestId, pending] of this.permissions) {
-        pending.resolve({ outcome: { outcome: 'cancelled' } });
-        this.permissions.delete(requestId);
-      }
+      this.cancelPermissions();
     });
     const initialized = await withTimeout(
       connection.agent.request(methods.agent.initialize, {
@@ -485,24 +495,24 @@ function permissionKey(sessionId: string, requestId: string): string {
   return `${sessionId}\0${requestId}`;
 }
 
-function acpEvent(update: SessionUpdate): AgentEvent | undefined {
+function acpEvent(update: SessionUpdate, token?: string): AgentEvent | undefined {
   if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
     return { type: 'text', text: update.content.text };
   }
-  if (update.sessionUpdate === 'tool_call') {
-    return {
-      type: 'tool',
-      phase: 'start',
-      requestId: update.toolCallId,
-      name: update.name ?? update.title,
-    };
+  if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') {
+    return { type: 'thought', text: update.content.text };
   }
-  if (update.sessionUpdate === 'tool_call_update') {
+  if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+    const inputPreview = toolInputPreview(update.rawInput, token);
+    const status = update.status ?? (update.sessionUpdate === 'tool_call' ? 'pending' : undefined);
     return {
       type: 'tool',
-      phase: update.status === 'completed' || update.status === 'failed' ? 'end' : 'start',
+      phase: status === 'in_progress' ? 'start' : status === 'pending' || status === undefined ? status : 'end',
       requestId: update.toolCallId,
-      name: update.name ?? update.title ?? update.toolCallId,
+      name: toolInputPreview(update.name, token),
+      title: !update.name ? toolInputPreview(update.title, token) : undefined,
+      ...(inputPreview ? { inputPreview } : {}),
+      ...(update.status === 'failed' ? { failed: true } : {}),
     };
   }
   if (update.sessionUpdate === 'notice' && update.severity === 'error') {

@@ -18,6 +18,9 @@ class MockAdapter implements AgentAdapter {
     return [];
   }
   async *prompt(): AsyncIterable<AgentEvent> {
+    yield { type: 'thought', text: 'UI-only thought' };
+    yield { type: 'tool', phase: 'start', name: 'terminal', title: 'UI-only title', inputPreview: 'UI-only command' };
+    yield { type: 'tool', phase: 'end', name: 'terminal' };
     yield { type: 'final', text: 'done' };
   }
   async cancel(_sessionId: string, signal?: AbortSignal) {
@@ -67,7 +70,15 @@ describe('plugin entry, tools and doctor', () => {
     );
     expect(asked.status).toBe('completed');
     expect(asked.text).toBe('done');
+    expect(asked).not.toHaveProperty('thought');
     expect(followups).toHaveLength(1);
+    expect(manager.get(asked.id).thought).toBe('UI-only thought');
+    expect(manager.get(asked.id).tools?.[0]?.inputPreview).toBe('UI-only command');
+    expect(manager.get(asked.id).tools?.[0]?.title).toBe('UI-only title');
+    expect(asked.tools).toEqual([{ id: expect.any(String), name: 'terminal', status: 'completed' }]);
+    expect(JSON.stringify(followups)).not.toContain('UI-only command');
+    expect(JSON.stringify(followups)).not.toContain('UI-only title');
+    expect(JSON.stringify(followups)).not.toContain('UI-only thought');
 
     const doctorResult = await runDoctor(manager, 'local-hermes', controller.signal);
     expect(doctorResult.agents[0]?.steps.every((step) => step.ok)).toBe(true);

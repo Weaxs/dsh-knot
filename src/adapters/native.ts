@@ -11,10 +11,10 @@ export function createNativeAdapter(config: AgentConfig): AgentAdapter {
   throw new Error(`${config.id}: native adapters are unavailable for kind ${config.kind}`);
 }
 
-export function createNativeSessionId(config: AgentConfig): string {
-  if (config.kind === 'hermes') return `dsh_${randomUUID()}`;
+export function createNativeSessionId(config: AgentConfig, id: string = randomUUID()): string {
+  if (config.kind === 'hermes') return `dsh_${id}`;
   if (config.kind === 'openclaw') {
-    return `agent:${config.openclawAgentId ?? 'main'}:dsh-knot:${randomUUID()}`;
+    return `agent:${config.openclawAgentId ?? 'main'}:dsh-knot:${id}`;
   }
-  return randomUUID();
+  return id;
 }

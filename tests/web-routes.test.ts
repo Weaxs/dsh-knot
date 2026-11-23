@@ -25,7 +25,11 @@ class StubAdapter implements AgentAdapter {
   async listSessions() {
     return [{ id: 'remote-1', title: 'Remote Task', updatedAt: '2026-11-20T00:00:00Z' }];
   }
+  async getSessionMessages(sessionId: string) {
+    return [{ id: 'message-1', role: 'assistant' as const, text: `${sessionId}: Bearer very-secret-value` }];
+  }
   async *prompt(): AsyncIterable<AgentEvent> {
+    yield { type: 'thought', text: 'Checking Bearer very-secret-value' };
     yield { type: 'approval', requestId: 'req-1', choices: ['approve', 'deny'], text: 'Run pytest?' };
     await new Promise((resolve) => setTimeout(resolve, 200));
     yield { type: 'final', text: 'done' };
@@ -109,10 +113,40 @@ describe('web UI host routes & schemastery Config', () => {
     const initial = await post(WEB_ROUTES.state);
     expect(initial.ok).toBe(true);
     expect(initial.value.agents).toHaveLength(1);
+    expect(initial.value.agents[0].supportsSessionMessages).toBe(true);
     expect(initial.value.agents[0].connection.status).toBe('unverified');
     expect(initial.value.mcp.enabled).toBe(true);
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
+
+    const olderStop = {
+      id: 'unconfirmed-stop',
+      agentId: config.id,
+      sessionId: 'remote-1',
+      status: 'cancelled' as const,
+      remoteStop: 'unconfirmed' as const,
+      createdAt: 1,
+      updatedAt: 1,
+      text: '',
+    };
+    const jobList = vi.spyOn(manager, 'listJobs').mockReturnValue([
+      ...Array.from({ length: 50 }, (_, index) => ({
+        id: `recent-${index}`,
+        agentId: config.id,
+        status: 'completed' as const,
+        createdAt: 2,
+        updatedAt: 2,
+        text: 'finished',
+      })),
+      olderStop,
+    ]);
+    try {
+      const state = await post(WEB_ROUTES.state);
+      expect(state.value.jobs).toHaveLength(50);
+      expect(state.value.jobs[0]).toEqual(olderStop);
+    } finally {
+      jobList.mockRestore();
+    }
 
     const toggled = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggled.ok).toBe(true);
@@ -122,6 +156,15 @@ describe('web UI host routes & schemastery Config', () => {
     const remoteSessions = await post(WEB_ROUTES.sessions, { agentId: 'hermes-local', revision });
     expect(remoteSessions.ok).toBe(true);
     expect(remoteSessions.value.sessions[0].id).toBe('remote-1');
+    const transcript = await post(WEB_ROUTES.sessionMessages, {
+      agentId: 'hermes-local',
+      revision,
+      sessionId: 'remote-1',
+    });
+    expect(transcript).toEqual({
+      ok: true,
+      value: { messages: [{ id: 'message-1', role: 'assistant', text: 'remote-1: [REDACTED]' }] },
+    });
 
     const doc = await post(WEB_ROUTES.doctor, { agent: 'hermes-local' });
     expect(doc.ok).toBe(true);
@@ -130,15 +173,27 @@ describe('web UI host routes & schemastery Config', () => {
     const afterDoc = await post(WEB_ROUTES.state);
     expect(afterDoc.value.agents[0].connection.status).toBe('connected');
 
-    const asked = await post(WEB_ROUTES.ask, {
+    const submission = {
       agentId: 'hermes-local',
       revision,
       message: 'hello from panel',
       sessionId: 'remote-1',
-    });
+      clientMessageId: 'submission-id-0001',
+    };
+    const [asked, replay] = await Promise.all([post(WEB_ROUTES.ask, submission), post(WEB_ROUTES.ask, submission)]);
     expect(asked.ok).toBe(true);
     expect(asked.value.prompt).toBe('hello from panel');
     expect(asked.value.sessionId).toBe('remote-1');
+    expect(replay.value.id).toBe(asked.value.id);
+    expect(manager.listJobs()).toHaveLength(1);
+    expect(await post(WEB_ROUTES.ask, { ...submission, message: 'changed retry' })).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/different conversation or gateway/),
+    });
+    expect(await post(WEB_ROUTES.job, { agentId: 'hermes-local', revision, jobId: asked.value.id })).toMatchObject({
+      ok: true,
+      value: { id: asked.value.id, sessionId: 'remote-1', thought: 'Checking [REDACTED]', text: '' },
+    });
     const duplicate = await post(WEB_ROUTES.ask, {
       agentId: 'hermes-local',
       revision,
@@ -260,12 +315,14 @@ describe('web UI host routes & schemastery Config', () => {
     expect(slash.ok).toBe(true);
     expect(manager.getConfig('openclaw')?.token).toBe('claw-test-secret');
     const staleSession = { agentId: 'openclaw', revision: oldRevision, sessionId: 'agent:main:main' };
-    const [staleAsk, staleHistory] = await Promise.all([
+    const [staleAsk, staleHistory, staleMessages] = await Promise.all([
       post(WEB_ROUTES.ask, { ...staleSession, message: 'stale turn' }),
       post(WEB_ROUTES.sessions, staleSession),
+      post(WEB_ROUTES.sessionMessages, staleSession),
     ]);
     expect(staleAsk).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
     expect(staleHistory).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
+    expect(staleMessages).toMatchObject({ ok: false, error: expect.stringMatching(/gateway configuration changed/) });
 
     // Deleted static agent stays deleted when plugin reloads
     const registeredTools: string[] = [];
@@ -425,6 +482,10 @@ describe('web UI host routes & schemastery Config', () => {
           useCallback: (fn: unknown) => fn,
           useRef: (v: unknown) => ({ current: v }),
         };
+      }
+      if (req === '@deepseek-ai/dsh-client-ui-primitives') {
+        const render = () => null;
+        return { Button: render, CommandText: render, MarkdownText: render, UserMessageBubble: render };
       }
       return origLoad(req, parent, isMain);
     };

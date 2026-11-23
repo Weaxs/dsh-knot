@@ -42,14 +42,15 @@ interface AgentAdapter {
   kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
   health(signal?): Promise<Record<string, unknown>>;
   listSessions(signal?): Promise<AgentSession[]>;
-  prompt(sessionId: string | undefined, text: string, signal?): AsyncIterable<AgentEvent>;
+  getSessionMessages?(sessionId: string, signal?): Promise<AgentTranscriptMessage[]>;
+  prompt(sessionId: string | undefined, text: string, signal?, options?: AgentPromptOptions): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?): Promise<void>;
   respond?(sessionId: string, requestId: string, choice: string, signal?): Promise<void>;
   close(): Promise<void>;
 }
 ```
 
-`AgentEvent` is a small normalized vocabulary: text, tool activity, approval, final result, or error. Adapter-specific payloads never reach model tools directly.
+`AgentEvent` normalizes reply text, streamed thought text, tool activity, approvals, final results, and errors. The Remote Agents chat displays bounded thought text and, when a gateway reports tool input, a bounded, redacted preview. Model tools receive reply text, tool names, and status.
 
 ### ACP v1 provider and bridge
 
@@ -70,6 +71,7 @@ The adapter uses the native API Server:
 - `POST /v1/runs/{id}/stop` for cancellation.
 - Authenticated `GET /v1/capabilities` and `GET /health` for readiness.
 - `GET /api/sessions?source=api_server` for resumable history.
+- `GET /api/sessions/{id}/messages?inline_images=false` for the recent text transcript in Remote Agents.
 
 Authentication uses `Authorization: Bearer …`, read from `token` or `tokenEnv` (default `HERMES_API_KEY`). The token is not logged.
 

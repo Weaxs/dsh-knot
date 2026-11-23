@@ -2,9 +2,12 @@ import { createPublicKey, verify as verifySignature } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { GatewayWebSocket } from '../src/adapters/gateway-ws.js';
 import { OpenClawAdapter } from '../src/adapters/openclaw.js';
 import { loadOrCreateIdentity, signClaim } from '../src/adapters/openclaw-identity.js';
+import { AsyncQueue } from '../src/async-queue.js';
+import { LocalOnlyAbortError } from '../src/config.js';
 
 class FakeGateway {
   calls: Array<{ method: string; params: any }> = [];
@@ -13,7 +16,7 @@ class FakeGateway {
   async openWebSocket() {
     this.isOpen = true;
   }
-  async nextEvent() {
+  async nextEvent(): Promise<IteratorResult<Record<string, any>>> {
     if (this.challenge) {
       this.challenge = false;
       return {
@@ -26,11 +29,13 @@ class FakeGateway {
       value: { type: 'event', event: 'agent', payload: { runId: 'run-1', type: 'message.delta', delta: 'ok' } },
     };
   }
-  subscribeEvents() {
+  subscribeEvents(): ReturnType<GatewayWebSocket['subscribeEvents']> {
+    let active = true;
     return {
-      next: () => this.nextEvent(),
-      error: () => undefined,
-      unsubscribe: () => {},
+      next: () => (active ? this.nextEvent() : Promise.resolve({ done: true, value: undefined })),
+      unsubscribe: () => {
+        active = false;
+      },
     };
   }
   async request(method: string, params: any) {
@@ -81,11 +86,10 @@ describe('OpenClaw adapter', () => {
     expect(gateway.calls.at(-1)?.method).toBe('sessions.abort');
   });
 
-  it('fans out concurrent run events without stealing and reports terminal error status as error', async () => {
+  it('isolates streamed text and approval lifecycle across concurrent runs', async () => {
     process.env.OPENCLAW_GATEWAY_TOKEN = 'token';
     process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-'));
-    const { AsyncQueue } = await import('../src/async-queue.js');
-    const subscribers = new Set<InstanceType<typeof AsyncQueue<Record<string, any>>>>();
+    const subscribers = new Set<AsyncQueue<Record<string, any>>>();
     let runSeq = 0;
     const waitResolvers = new Map<string, (val: Record<string, any>) => void>();
     const gateway = {
@@ -144,27 +148,111 @@ describe('OpenClaw adapter', () => {
     };
     const p1 = collect('s1', 'task 1');
     const p2 = collect('s2', 'task 2');
-    await new Promise((r) => setTimeout(r, 10));
+    await vi.waitFor(() => expect(waitResolvers.size).toBe(2));
     emit({
       type: 'event',
       event: 'agent',
       payload: { runId: 'run-2', type: 'message.delta', data: { delta: 'from-2' } },
     });
     emit({ type: 'event', event: 'agent', payload: { runId: 'run-1', type: 'message.delta', delta: 'from-1' } });
-    await new Promise((r) => setTimeout(r, 10));
+    emit({ type: 'event', event: 'agent', payload: { type: 'message.delta', delta: 'unrouted' } });
+    emit({
+      type: 'event',
+      event: 'exec.approval.requested',
+      payload: { id: 'approval-1', request: { sessionKey: 's1', command: 'pwd' } },
+    });
+    emit({
+      type: 'event',
+      event: 'exec.approval.requested',
+      payload: { id: 'approval-2', request: { sessionKey: 's2', runId: 'run-2', command: 'ls' } },
+    });
+    emit({
+      type: 'event',
+      event: 'exec.approval.requested',
+      payload: { id: 'old-approval', request: { sessionKey: 's1', runId: 'old-run', command: 'pwd' } },
+    });
+    emit({
+      type: 'event',
+      event: 'exec.approval.requested',
+      payload: { id: 'global-approval', request: { command: 'pwd' } },
+    });
+    emit({
+      type: 'event',
+      event: 'exec.approval.resolved',
+      payload: { id: 'approval-1', request: { sessionKey: 's1', command: 'pwd' }, decision: 'deny' },
+    });
     waitResolvers.get('run-1')!({ status: 'ok', terminalReply: { text: 'from-1' } });
     waitResolvers.get('run-2')!({ status: 'error', error: 'model crashed' });
     const [e1, e2] = await Promise.all([p1, p2]);
-    expect(e1.some((e) => e.type === 'text' && e.text === 'from-1')).toBe(true);
-    expect(e1.at(-1)).toMatchObject({ type: 'final', text: 'from-1' });
-    expect(e2.some((e) => e.type === 'text' && e.text === 'from-2')).toBe(true);
-    expect(e2.at(-1)).toMatchObject({ type: 'error', text: 'model crashed', stopReason: 'error' });
+    expect(e1).toEqual([
+      { type: 'text', text: 'from-1' },
+      { type: 'approval', requestId: 'approval-1', text: 'pwd', choices: [] },
+      { type: 'approval', phase: 'end', requestId: 'approval-1' },
+      { type: 'final', text: 'from-1', stopReason: 'ok' },
+    ]);
+    expect(e2).toEqual([
+      { type: 'text', text: 'from-2' },
+      { type: 'approval', requestId: 'approval-2', text: 'ls', choices: [] },
+      { type: 'error', text: 'model crashed', stopReason: 'error' },
+    ]);
+  });
+
+  it.each([false, true])('cleans up a long stream on abort (local only: %s)', async (localOnly) => {
+    process.env.OPENCLAW_GATEWAY_TOKEN = 'token';
+    process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-'));
+    const queue = new AsyncQueue<Record<string, unknown>>(1_024, 'error');
+    let markWaitStarted!: (signal: AbortSignal) => void;
+    const waitStarted = new Promise<AbortSignal>((resolve) => {
+      markWaitStarted = resolve;
+    });
+    class WaitingGateway extends FakeGateway {
+      override subscribeEvents() {
+        return {
+          next: (signal?: AbortSignal) => queue.next(signal),
+          unsubscribe: () => queue.finish(),
+        };
+      }
+
+      override request(method: string, params: any, _timeout?: number, signal?: AbortSignal): Promise<any> {
+        if (method !== 'agent.wait') return super.request(method, params);
+        markWaitStarted(signal!);
+        return new Promise((_, reject) => {
+          signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+        });
+      }
+    }
+    const gateway = new WaitingGateway();
+    const adapter = new OpenClawAdapter(
+      'claw',
+      { id: 'claw', kind: 'openclaw', transport: 'local' },
+      undefined,
+      gateway as any,
+    );
+    const controller = new AbortController();
+    const iterator = adapter.prompt('long-session', 'work', controller.signal)[Symbol.asyncIterator]();
+    let next = iterator.next();
+    const waitSignal = await waitStarted;
+    const frame = { type: 'event', event: 'agent', payload: { runId: 'run-1', delta: '.' } };
+    let output = '';
+    for (let index = 0; index < 2_048; index++) {
+      queue.push(frame);
+      output += (await next).value?.text;
+      next = iterator.next();
+    }
+    expect(output).toBe('.'.repeat(2_048));
+    controller.abort(localOnly ? new LocalOnlyAbortError('stop') : new Error('stop'));
+    await expect(next).resolves.toMatchObject({ done: true });
+    expect(waitSignal.aborted).toBe(true);
+    await expect(queue.next()).resolves.toMatchObject({ done: true });
+    expect(gateway.calls.filter(({ method }) => method === 'sessions.abort')).toEqual(
+      localOnly ? [] : [{ method: 'sessions.abort', params: { key: 'long-session' } }],
+    );
+    await adapter.close();
   });
 
   it('fails the run when the subscriber queue overflows even if agent.wait resolves ok first', async () => {
     process.env.OPENCLAW_GATEWAY_TOKEN = 'token';
     process.env.DSH_KNOT_STATE_DIR = mkdtempSync(join(tmpdir(), 'dsh-knot-'));
-    const { AsyncQueue } = await import('../src/async-queue.js');
     const queue = new AsyncQueue<Record<string, any>>(1, 'error');
     const gateway = {
       isOpen: true,
@@ -180,7 +268,6 @@ describe('OpenClaw adapter', () => {
       subscribeEvents() {
         return {
           next: (sig?: AbortSignal) => queue.next(sig),
-          error: () => queue.failure,
           unsubscribe: () => queue.finish(),
         };
       },

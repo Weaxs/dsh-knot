@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeConfig } from '../src/config.js';
-import { redact, redactText } from '../src/policy/redact.js';
+import { redact, redactText, toolInputPreview } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
   it('defaults to direct and assigns protocol ports', () => {
@@ -69,6 +69,21 @@ describe('configuration and policy', () => {
     expect((value.nested as { text: string }).text).not.toContain('abcdefghijklmnop');
     expect(value.safe).toBe(42);
     expect(value.self).toBe('[Circular]');
+  });
+
+  it('bounds tool input previews and masks credentials in nested values', () => {
+    const preview = toolInputPreview(
+      { queries: ['architecture', 'private-value'], options: { password: { value: 'sensitive' } } },
+      'private-value',
+    );
+    expect(JSON.parse(preview!)).toEqual({
+      queries: ['architecture', '[REDACTED]'],
+      options: { password: '[REDACTED]' },
+    });
+    expect(toolInputPreview(false)).toBe('false');
+    expect(JSON.parse(toolInputPreview([0, 1, 2, 3, 4, 5, 6, 7, 8])!)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(toolInputPreview({ level1: { level2: { level3: { hidden: 'too deep' } } } })).not.toContain('too deep');
+    expect(toolInputPreview('x'.repeat(600))).toHaveLength(501);
   });
 
   it('rejects wildcard MCP hosts', () => {

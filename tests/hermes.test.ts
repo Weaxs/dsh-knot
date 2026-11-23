@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { HermesAdapter } from '../src/adapters/hermes.js';
 import { readSse } from '../src/adapters/sse.js';
+import { LocalOnlyAbortError } from '../src/config.js';
 import type { HttpRequest, HttpResponse, Transport } from '../src/types.js';
 
 function incoming(text: string): IncomingMessage {
@@ -51,6 +52,24 @@ describe('Hermes API Server adapter', () => {
         response.end(
           '{"object":"list","data":[{"id":"api-chat","source":"api_server","title":"Remote chat","last_active":1767225600.125}]}',
         );
+      } else if (request.url === '/api/sessions/api%20chat/messages?inline_images=false') {
+        response.end(
+          JSON.stringify({
+            data: [
+              { id: 1, role: 'user', content: 'first' },
+              { id: 2, role: 'tool', content: 'private tool output' },
+              { id: 3, role: 'assistant', content: '', reasoning: 'private reasoning' },
+              {
+                role: 'assistant',
+                content: [
+                  { type: 'text', text: 'one ' },
+                  { type: 'image_url', text: 'image metadata' },
+                  { type: 'output_text', text: 'two' },
+                ],
+              },
+            ],
+          }),
+        );
       } else {
         response.writeHead(404).end('{}');
       }
@@ -66,9 +85,39 @@ describe('Hermes API Server adapter', () => {
       await expect(authorized.listSessions()).resolves.toEqual([
         { id: 'api-chat', title: 'Remote chat', updatedAt: 1767225600125 },
       ]);
+      await expect(unauthorized.getSessionMessages('api chat')).rejects.toThrow(/HTTP 401/);
+      await expect(authorized.getSessionMessages('api chat')).resolves.toEqual([
+        { id: 'message:1', role: 'user', text: 'first' },
+        { id: 'row:3', role: 'assistant', text: 'one two' },
+      ]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it('bounds transcripts in chronological order and rejects an invalid envelope', async () => {
+    const config = { id: 'hermes', kind: 'hermes', transport: 'local' } as const;
+    class HistoryTransport extends FakeTransport {
+      override async request(): Promise<HttpResponse> {
+        return {
+          status: 200,
+          headers: {},
+          text: JSON.stringify({
+            data: [
+              ...Array.from({ length: 201 }, (_, id) => ({ id, role: 'user', content: 'message' })),
+              { role: 'tool', content: 'skip' },
+            ],
+          }),
+        };
+      }
+    }
+    const messages = await new HermesAdapter('hermes', config, new HistoryTransport()).getSessionMessages('history');
+    expect(messages).toHaveLength(200);
+    expect(messages[0]?.id).toBe('message:1');
+    expect(messages.at(-1)?.id).toBe('message:200');
+    await expect(
+      new HermesAdapter('hermes', config, new FakeTransport()).getSessionMessages('history'),
+    ).rejects.toThrow('Hermes returned an invalid session transcript');
   });
 
   it('rejects a gateway that lacks Runs support and surfaces missing terminal status', async () => {
@@ -110,6 +159,82 @@ describe('Hermes API Server adapter', () => {
     expect(start.headers!['Idempotency-Key']).toBeTruthy();
   });
 
+  it('normalizes Hermes tool lifecycle by call ID and keeps tool payloads out of assistant text', async () => {
+    class ToolEventsTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        return incoming(
+          'id: 1\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-1","preview":"DSH adapters"}\n\n' +
+            'id: 2\ndata: {"event":"tool.started","tool":"search","tool_call_id":"call-2","preview":"export HERMES_API_KEY=private-value"}\n\n' +
+            'id: 3\ndata: {"event":"tool.progress","delta":"internal tool update"}\n\n' +
+            'id: 4\ndata: {"event":"tool.completed","tool":"search","tool_call_id":"call-2","error":false,"preview":"private result"}\n\n' +
+            'id: 5\ndata: {"event":"tool.completed","tool":"search","tool_call_id":"call-1","error":true}\n\n' +
+            'id: 6\nevent: tool.failed\ndata: {"tool_name":"file"}\n\n' +
+            'id: 7\ndata: {"event":"run.completed","output":"done","completed":true}\n\n',
+        );
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new ToolEventsTransport(),
+    );
+    const events = [];
+    for await (const event of adapter.prompt('session-1', 'Search')) events.push(event);
+    expect(events).toEqual([
+      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-1', inputPreview: 'DSH adapters' },
+      { type: 'tool', phase: 'start', name: 'search', requestId: 'call-2', inputPreview: '[REDACTED]' },
+      { type: 'tool', phase: 'end', name: 'search', requestId: 'call-2' },
+      { type: 'tool', phase: 'end', name: 'search', requestId: 'call-1', failed: true },
+      { type: 'tool', phase: 'end', name: 'file', failed: true },
+      { type: 'final', text: 'done', stopReason: 'run.completed' },
+    ]);
+  });
+
+  it('recovers a finished run when the same submission key replays without an event stream', async () => {
+    class ReplayTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        if (this.requests.filter((request) => request.path === '/v1/runs').length > 1) {
+          throw new Error('HTTP 404: run event stream expired');
+        }
+        return super.stream();
+      }
+    }
+    const transport = new ReplayTransport();
+    const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
+    const options = { idempotencyKey: 'submission-1' };
+    for await (const _ of adapter.prompt('session-1', 'task', undefined, options)) void _;
+    const replay = [];
+    for await (const event of adapter.prompt('session-1', 'task', undefined, options)) replay.push(event);
+    expect(replay).toEqual([{ type: 'final', text: 'done', stopReason: 'completed' }]);
+    expect(transport.requests.filter((request) => request.path === '/v1/runs')).toEqual([
+      expect.objectContaining({ headers: { 'Idempotency-Key': 'submission-1' } }),
+      expect.objectContaining({ headers: { 'Idempotency-Key': 'submission-1' } }),
+    ]);
+  });
+
+  it.each(['running', 'unavailable'])('preserves the stream error if run status is %s', async (status) => {
+    const streamError = new Error('HTTP 404: run event stream expired');
+    class MissingStreamTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        throw streamError;
+      }
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1') {
+          if (status === 'unavailable') throw new Error('HTTP 404: run not found');
+          return { status: 200, headers: {}, text: JSON.stringify({ status }) };
+        }
+        return super.request(request);
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new MissingStreamTransport(),
+    );
+    const events = adapter.prompt('session-1', 'task')[Symbol.asyncIterator]();
+    await expect(events.next()).rejects.toBe(streamError);
+  });
+
   it('supports cancellation and approvals', async () => {
     const transport = new FakeTransport();
     const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
@@ -122,6 +247,69 @@ describe('Hermes API Server adapter', () => {
       ),
     ).toBe(true);
     expect(transport.requests.some((request) => request.path.endsWith('/stop'))).toBe(true);
+  });
+
+  it('stops the newly admitted run after a local-only abort during submission', async () => {
+    let admit!: (response: HttpResponse) => void;
+    const pendingAdmission = new Promise<HttpResponse>((resolve) => {
+      admit = resolve;
+    });
+    const stopping = { status: 200, headers: {}, text: '{"status":"stopping"}' };
+    class DelayedAdmissionTransport extends FakeTransport {
+      stopRequests: string[] = [];
+      statusReads = 0;
+      admissionSignal?: AbortSignal;
+
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs' && (request.body as Record<string, unknown>)?.input === 'second turn') {
+          this.admissionSignal = request.signal;
+          return pendingAdmission;
+        }
+        if (request.path.endsWith('/stop')) {
+          this.stopRequests.push(request.path);
+          return stopping;
+        }
+        if (request.path === '/v1/runs/run_2') {
+          if (++this.statusReads === 1) return stopping;
+          return { status: 200, headers: {}, text: '{"status":"cancelled"}' };
+        }
+        return super.request(request);
+      }
+    }
+    const transport = new DelayedAdmissionTransport();
+    const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
+    for await (const _ of adapter.prompt('session-1', 'first turn')) void _;
+    const controller = new AbortController();
+    const pending = adapter.prompt('session-1', 'second turn', controller.signal)[Symbol.asyncIterator]().next();
+    controller.abort(new LocalOnlyAbortError('local stop'));
+    const cancelled = adapter.cancel('session-1');
+    expect(transport.stopRequests).toEqual([]);
+    expect(transport.admissionSignal?.aborted).toBe(false);
+    admit({ status: 202, headers: {}, text: '{"run_id":"run_2"}' });
+    await expect(pending).rejects.toThrow('local stop');
+    await cancelled;
+    expect(transport.stopRequests).toEqual(['/v1/runs/run_2/stop']);
+    expect(transport.statusReads).toBe(2);
+  });
+
+  it('reports an unconfirmed remote stop when the run has not settled before cancellation expires', async () => {
+    const controller = new AbortController();
+    class UnconfirmedStopTransport extends FakeTransport {
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1') controller.abort(new Error('stop deadline'));
+        if (request.path.startsWith('/v1/runs/run_1')) {
+          return { status: 200, headers: {}, text: '{"status":"stopping"}' };
+        }
+        return super.request(request);
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new UnconfirmedStopTransport(),
+    );
+    for await (const _ of adapter.prompt('session-1', 'task')) void _;
+    await expect(adapter.cancel('session-1', controller.signal)).rejects.toThrow('Hermes remote stop is unconfirmed');
   });
 
   it('ignores approval.responded events and maps run.cancelled to cancelled final', async () => {

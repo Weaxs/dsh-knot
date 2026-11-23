@@ -1,21 +1,35 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
-import type { AgentAdapter, AgentConfig, AgentConnectionState, AgentJob, DoctorStep, PluginConfig } from './types.js';
+import type {
+  AgentAdapter,
+  AgentConfig,
+  AgentConnectionState,
+  AgentEvent,
+  AgentJob,
+  AgentPromptOptions,
+  AgentToolActivity,
+  DoctorStep,
+  PluginConfig,
+} from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 const MAX_JOBS = 200;
+const MAX_JOB_TOOLS = 50;
+const MAX_JOB_APPROVALS = 50;
+const MAX_JOB_THOUGHT_LENGTH = 16_000;
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
   readonly configs: AgentConfig[];
   private readonly factory: AdapterFactory;
   private readonly jobs = new Map<string, AgentJob>();
+  private readonly approvals = new WeakMap<AgentJob, Map<string, NonNullable<AgentJob['pendingApproval']>>>();
   private readonly jobOwners = new Map<
     string,
-    { adapter: AgentAdapter; exclusive: boolean; cancelling?: Promise<void> }
+    { adapter: AgentAdapter; exclusive: boolean; submission?: string; cancelling?: Promise<void> }
   >();
   private readonly configRevisions = new WeakMap<AgentConfig, string>();
   private readonly completions = new Map<string, Promise<AgentJob>>();
@@ -65,6 +79,7 @@ export class AgentManager {
       revision: string;
       hasToken: boolean;
       supportsRespond: boolean;
+      supportsSessionMessages: boolean;
       connection: AgentConnectionState;
     }
   > {
@@ -82,6 +97,7 @@ export class AgentManager {
       revision: this.configRevision(config),
       hasToken: Boolean(secret(config)),
       supportsRespond: typeof this.adapters.get(config.id)?.respond === 'function',
+      supportsSessionMessages: typeof this.adapters.get(config.id)?.getSessionMessages === 'function',
       connection: this.connectionStates.get(config.id) ?? { status: 'unverified' },
     }));
   }
@@ -161,14 +177,28 @@ export class AgentManager {
     sessionId: string | undefined,
     onDone?: (job: AgentJob) => void,
     exclusiveSession = false,
+    clientMessageId?: string,
   ): AgentJob {
     if (this.reconfiguring.has(agentId)) {
       throw new Error(`Agent "${agentId}" is currently being reconfigured or removed`);
     }
     const adapter = this.adapter(agentId);
+    const id = clientMessageId ? `chat-${clientMessageId}` : randomUUID();
+    const submission = clientMessageId
+      ? createHash('sha256')
+          .update(JSON.stringify([agentId, sessionId, text]))
+          .digest('hex')
+      : undefined;
+    const existing = this.jobs.get(id);
+    if (existing) {
+      const owner = this.jobOwners.get(id);
+      if (owner?.adapter === adapter && owner.submission === submission) return existing;
+      throw new Error('This message submission already belongs to a different conversation or gateway');
+    }
     const config = this.configs.find((item) => item.id === agentId)!;
     const remoteSession =
-      sessionId ?? (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config));
+      sessionId ??
+      (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config, clientMessageId));
     if (remoteSession) {
       const exclusive = exclusiveSession || adapter.kind === 'acp';
       const existingJob = [...this.jobs.values()].find((job) => {
@@ -182,6 +212,7 @@ export class AgentManager {
             job.status === 'running' ||
             this.completions.has(job.id) ||
             owner.cancelling !== undefined ||
+            job.remoteStop !== undefined ||
             (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))
         );
       });
@@ -193,7 +224,6 @@ export class AgentManager {
     }
     this.evictFinishedJobs();
     if (this.jobs.size >= MAX_JOBS) throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
-    const id = randomUUID();
     const job: AgentJob = {
       id,
       agentId,
@@ -205,9 +235,10 @@ export class AgentManager {
       text: '',
     };
     this.jobs.set(id, job);
-    this.jobOwners.set(id, { adapter, exclusive: exclusiveSession });
+    this.jobOwners.set(id, { adapter, exclusive: exclusiveSession, submission });
     if (remoteSession) this.latestSessionJob.set(sessionKey(agentId, remoteSession), id);
-    const completion = this.run(job, adapter, text, remoteSession, onDone);
+    const options = clientMessageId ? { idempotencyKey: `dsh-knot:${clientMessageId}` } : undefined;
+    const completion = this.run(job, adapter, text, remoteSession, onDone, options);
     this.completions.set(id, completion);
     completion
       .finally(() => {
@@ -222,6 +253,12 @@ export class AgentManager {
     const job = this.jobs.get(id);
     if (!job) throw new Error(`Unknown job "${id}"`);
     return job;
+  }
+
+  getCurrentJob(agentId: string, id: string): AgentJob | undefined {
+    const job = this.jobs.get(id);
+    const owner = this.jobOwners.get(id);
+    return job?.agentId === agentId && owner && owner.adapter === this.adapters.get(agentId) ? job : undefined;
   }
 
   listJobs({ currentOnly = false } = {}): AgentJob[] {
@@ -252,7 +289,7 @@ export class AgentManager {
 
   async cancel(id: string, signal?: AbortSignal): Promise<AgentJob> {
     const job = this.get(id);
-    if (job.status === 'completed' || job.status === 'failed') return job;
+    if (job.status === 'completed' || (job.status === 'failed' && !job.remoteStop)) return job;
     if (job.status === 'cancelled' && this.remoteCancelled.has(id)) return job;
     const latest = job.sessionId ? this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) : undefined;
     if (latest && latest !== id) {
@@ -265,8 +302,10 @@ export class AgentManager {
     if (owner && currentAdapter !== owner.adapter) {
       throw new Error(`Cannot cancel job ${id}: agent "${job.agentId}" has been reconfigured or removed`);
     }
-    job.status = 'cancelled';
+    signal?.throwIfAborted();
+    if (job.status !== 'failed') job.status = 'cancelled';
     delete job.pendingApproval;
+    this.approvals.delete(job);
     job.updatedAt = Date.now();
     this.controllers
       .get(id)
@@ -277,7 +316,8 @@ export class AgentManager {
 
   async respond(id: string, choice: string, signal?: AbortSignal, expectedRequestId?: string): Promise<AgentJob> {
     const job = this.get(id);
-    const pending = job.pendingApproval;
+    const pending =
+      job.status === 'running' && !this.controllers.get(id)?.signal.aborted ? job.pendingApproval : undefined;
     if (!pending) throw new Error(`Job ${id} has no pending approval`);
     if (expectedRequestId !== undefined && pending.requestId !== expectedRequestId) {
       throw new Error(
@@ -290,11 +330,12 @@ export class AgentManager {
       );
     }
     const adapter = this.adapter(job.agentId);
+    if (this.jobOwners.get(id)?.adapter !== adapter) {
+      throw new Error(`Cannot answer job ${id}: agent "${job.agentId}" has been reconfigured or removed`);
+    }
     if (!adapter.respond) throw new Error(`${job.agentId} does not support approval responses through this adapter`);
     await adapter.respond(job.sessionId!, pending.requestId, choice, signal);
-    if (job.pendingApproval?.requestId === pending.requestId) {
-      delete job.pendingApproval;
-    }
+    this.removeApproval(job, pending.requestId);
     job.updatedAt = Date.now();
     return job;
   }
@@ -305,18 +346,32 @@ export class AgentManager {
     await Promise.allSettled([...this.adapters.values()].map((adapter) => adapter.close()));
   }
 
+  private removeApproval(job: AgentJob, requestId: string): void {
+    const approvals = this.approvals.get(job);
+    approvals?.delete(requestId);
+    if (job.pendingApproval?.requestId === requestId) {
+      job.pendingApproval = approvals && [...approvals.values()].at(-1);
+    }
+  }
+
   private async cancelRemote(job: AgentJob, signal?: AbortSignal): Promise<void> {
     const owner = this.jobOwners.get(job.id);
     if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
     if (owner && job.sessionId) {
       const deadline = AbortSignal.timeout(5_000);
       const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-      stopSignal.throwIfAborted();
-      owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
+      if (owner.exclusive) job.remoteStop = 'pending';
       try {
+        stopSignal.throwIfAborted();
+        owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
         await owner.cancelling;
+        delete job.remoteStop;
+      } catch (error) {
+        if (owner.exclusive) job.remoteStop = 'unconfirmed';
+        throw error;
       } finally {
         delete owner.cancelling;
+        job.updatedAt = Date.now();
       }
     }
     if (this.jobs.has(job.id)) this.remoteCancelled.add(job.id);
@@ -356,12 +411,14 @@ export class AgentManager {
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
-      if (job.agentId !== agentId || job.status === 'completed' || job.status === 'failed') continue;
+      if (job.agentId !== agentId || job.status === 'completed') continue;
       const cancelling = this.jobOwners.get(id)?.cancelling;
-      if (job.status === 'cancelled' && !cancelling) continue;
+      if ((job.status === 'cancelled' || job.status === 'failed') && !cancelling && job.remoteStop === undefined)
+        continue;
       const owned = this.isLatestSessionJob(job);
-      job.status = 'cancelled';
+      if (job.status !== 'failed') job.status = 'cancelled';
       delete job.pendingApproval;
+      this.approvals.delete(job);
       job.updatedAt = Date.now();
       this.controllers.get(id)?.abort(new LocalOnlyAbortError(`agent "${agentId}" reconfigured`));
       if (cancelling || (owned && job.sessionId)) {
@@ -387,9 +444,11 @@ export class AgentManager {
     if (this.jobs.size < MAX_JOBS) return;
     for (const [id, job] of this.jobs) {
       if (this.jobs.size < MAX_JOBS) break;
+      const owner = this.jobOwners.get(id);
       if (
         !this.completions.has(id) &&
-        !this.jobOwners.get(id)?.cancelling &&
+        !owner?.cancelling &&
+        !(job.remoteStop && owner?.adapter === this.adapters.get(job.agentId)) &&
         ['completed', 'failed', 'cancelled'].includes(job.status)
       ) {
         this.jobs.delete(id);
@@ -408,9 +467,11 @@ export class AgentManager {
     text: string,
     sessionId: string | undefined,
     onDone?: (job: AgentJob) => void,
+    options?: AgentPromptOptions,
   ): Promise<AgentJob> {
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
+    let approvalOverflow = false;
     const timer = setTimeout(() => {
       const owned = this.isLatestSessionJob(job);
       const message = `job timed out after ${this.timeoutMs}ms`;
@@ -424,7 +485,7 @@ export class AgentManager {
     job.status = 'running';
     job.updatedAt = Date.now();
     try {
-      for await (const event of adapter.prompt(sessionId, text, controller.signal)) {
+      for await (const event of adapter.prompt(sessionId, text, controller.signal, options)) {
         if (event.sessionId) {
           job.sessionId = event.sessionId;
           const key = sessionKey(job.agentId, event.sessionId);
@@ -433,8 +494,23 @@ export class AgentManager {
           }
         }
         if (event.type === 'text' && event.text) job.text = (job.text + event.text).slice(-2_000_000);
-        else if (event.type === 'approval') {
-          job.pendingApproval = { requestId: event.requestId ?? '', choices: event.choices ?? [], text: event.text };
+        else if (event.type === 'thought' && event.text) {
+          job.thought = ((job.thought ?? '') + event.text).slice(-MAX_JOB_THOUGHT_LENGTH);
+        } else if (event.type === 'tool' && (event.phase || event.requestId)) recordToolActivity(job, event);
+        else if (event.type === 'approval' && job.status === 'running') {
+          const requestId = event.requestId ?? '';
+          if (event.phase === 'end') this.removeApproval(job, requestId);
+          else {
+            const pending = { requestId, choices: event.choices ?? [], text: event.text };
+            const approvals = this.approvals.get(job) ?? new Map();
+            if (!approvals.delete(requestId) && approvals.size >= MAX_JOB_APPROVALS) {
+              approvalOverflow = true;
+              throw new Error(`Remote agent exceeded ${MAX_JOB_APPROVALS} pending approvals`);
+            }
+            approvals.set(requestId, pending);
+            this.approvals.set(job, approvals);
+            job.pendingApproval = pending;
+          }
         } else if (event.type === 'error') throw new Error(event.text ?? 'remote agent failed');
         else if (event.type === 'final') {
           if (event.text) job.text = event.text.slice(-2_000_000);
@@ -455,6 +531,18 @@ export class AgentManager {
       job.error = error instanceof Error ? error.message : String(error);
     } finally {
       clearTimeout(timer);
+      delete job.pendingApproval;
+      this.approvals.delete(job);
+      if (approvalOverflow && job.status === 'failed' && job.sessionId && this.isLatestSessionJob(job)) {
+        void this.cancelRemote(job).catch(() => {
+          /* best-effort remote stop after approval overflow */
+        });
+      }
+      if (job.tools?.some((tool) => tool.status === 'running' || tool.status === 'pending')) {
+        job.tools = job.tools.map((tool) =>
+          tool.status === 'running' || tool.status === 'pending' ? { ...tool, status: 'interrupted' } : tool,
+        );
+      }
       job.updatedAt = Date.now();
       if (onDone) {
         try {
@@ -466,6 +554,33 @@ export class AgentManager {
     }
     return job;
   }
+}
+
+function recordToolActivity(job: AgentJob, event: AgentEvent): void {
+  const tools = job.tools ?? [];
+  const name = event.name?.trim().slice(0, 120);
+  const callId = event.requestId ? createHash('sha256').update(event.requestId).digest('hex') : undefined;
+  const index = callId
+    ? tools.findIndex((tool) => tool.id === callId)
+    : event.phase === 'end'
+      ? tools.findIndex((tool) => tool.status === 'running' && tool.name === (name || 'tool'))
+      : -1;
+  const previous = tools[index];
+  const inputPreview = event.inputPreview ?? previous?.inputPreview;
+  const title = event.title?.trim().slice(0, 120) || previous?.title;
+  let status = previous?.status ?? 'pending';
+  if (event.phase === 'end') status = event.failed ? 'failed' : 'completed';
+  else if (event.phase === 'start' && status === 'pending') status = 'running';
+  const activity: AgentToolActivity = {
+    id: previous?.id ?? callId ?? randomUUID(),
+    name: name || previous?.name || 'tool',
+    status,
+    ...(title ? { title } : {}),
+    ...(inputPreview ? { inputPreview } : {}),
+  };
+  job.tools = previous
+    ? tools.map((tool, i) => (i === index ? activity : tool))
+    : [...tools.slice(-(MAX_JOB_TOOLS - 1)), activity];
 }
 
 function sessionKey(agentId: string, sessionId: string): string {

@@ -184,23 +184,62 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       if (event.type === 'text' && event.text) {
         output += event.text;
         await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+      } else if (event.type === 'thought' && event.text) {
+        await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
       } else if (event.type === 'tool') {
-        const key = event.requestId ?? event.name ?? 'tool';
-        const toolCallId = toolIds.get(key) ?? event.requestId ?? randomUUID();
-        toolIds.set(key, toolCallId);
-        if (event.phase === 'end') {
-          await notify({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' });
+        const key = event.requestId ? `id:${event.requestId}` : `name:${event.name ?? 'tool'}`;
+        const knownId = toolIds.get(key);
+        const toolCallId = knownId ?? event.requestId ?? randomUUID();
+        if (event.phase === 'end') toolIds.delete(key);
+        else if (!knownId) {
+          if (toolIds.size >= 500) throw new Error('Too many concurrent tool calls');
+          toolIds.set(key, toolCallId);
+        }
+        const status =
+          event.phase === 'end'
+            ? event.failed
+              ? 'failed'
+              : 'completed'
+            : event.phase === 'start'
+              ? 'in_progress'
+              : event.phase;
+        if (knownId) {
+          await notify({
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status,
+            name: event.name,
+            title: event.title,
+            rawInput: event.inputPreview,
+          });
         } else {
           await notify({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: event.name ?? 'Tool call',
+            title: event.title ?? event.name ?? 'Tool call',
             name: event.name,
             kind: 'other',
-            status: 'in_progress',
+            status,
+            rawInput: event.inputPreview,
           });
         }
       } else if (event.type === 'approval') {
+        if (!adapter.respond) {
+          if (!event.requestId) continue;
+          await notify(
+            event.phase === 'end'
+              ? { sessionUpdate: 'tool_call_update', toolCallId: event.requestId, status: 'completed' }
+              : {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: event.requestId,
+                  title: 'Approval required on the remote gateway',
+                  status: 'pending',
+                  rawInput: event.text,
+                },
+          );
+          continue;
+        }
+        if (event.phase === 'end') continue;
         const choices = event.choices?.length ? event.choices : ['approve', 'reject'];
         const toolCallId = event.requestId || randomUUID();
         const response = (await client.request(
@@ -227,7 +266,6 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
           stopReason = 'cancelled';
           break;
         }
-        if (!adapter.respond) throw new Error(`${adapter.id} does not support permission responses`);
         await adapter.respond(sessionId, event.requestId ?? '', response.outcome.optionId, signal);
       } else if (event.type === 'error') {
         throw new Error(event.text ?? 'Remote agent failed');

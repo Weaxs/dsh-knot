@@ -119,14 +119,12 @@ export class GatewayWebSocket {
 
   subscribeEvents(): {
     next: (signal?: AbortSignal) => Promise<IteratorResult<Record<string, any>>>;
-    error: () => unknown;
     unsubscribe: () => void;
   } {
     const queue = new AsyncQueue<Record<string, any>>(1_024, 'error');
     this.subscribers.add(queue);
     return {
       next: (signal?: AbortSignal) => queue.next(signal),
-      error: () => queue.failure,
       unsubscribe: () => {
         this.subscribers.delete(queue);
         queue.finish();
