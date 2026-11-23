@@ -27,10 +27,13 @@ class FakeGateway {
     };
   }
   subscribeEvents() {
+    let active = true;
     return {
-      next: () => this.nextEvent(),
+      next: () => (active ? this.nextEvent() : Promise.resolve({ done: true, value: undefined })),
       error: () => undefined,
-      unsubscribe: () => {},
+      unsubscribe: () => {
+        active = false;
+      },
     };
   }
   async request(method: string, params: any) {

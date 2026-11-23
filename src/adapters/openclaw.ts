@@ -86,10 +86,16 @@ export class OpenClawAdapter implements AgentAdapter {
         if (waitAbort.signal.aborted) resolve({ kind: 'aborted' });
         else waitAbort.signal.addEventListener('abort', () => resolve({ kind: 'aborted' }), { once: true });
       });
-      let completed = this.gateway.request('agent.wait', { runId }, 1_800_000, waitAbort.signal);
+      const waitForResult = () =>
+        this.gateway
+          .request('agent.wait', { runId }, 1_800_000, waitAbort.signal)
+          .then((value) => ({ kind: 'done' as const, value }));
+      const readEvent = () => subscription.next(waitAbort.signal).then((value) => ({ kind: 'event' as const, value }));
+      let completed = waitForResult();
       completed.catch(() => {});
-      let next = subscription.next(waitAbort.signal);
+      let next = readEvent();
       next.catch(() => {});
+      let terminal: { value: Record<string, unknown>; rawStatus: string } | undefined;
       while (true) {
         if (signal?.aborted) {
           if (!shouldSkipRemoteCancel(signal)) {
@@ -99,11 +105,7 @@ export class OpenClawAdapter implements AgentAdapter {
           }
           return;
         }
-        const result = await Promise.race([
-          completed.then((value) => ({ kind: 'done' as const, value })),
-          next.then((value) => ({ kind: 'event' as const, value })),
-          aborted,
-        ]);
+        const result = await Promise.race(terminal ? [next, aborted] : [completed, next, aborted]);
         if (result.kind === 'aborted') {
           if (!shouldSkipRemoteCancel(signal)) {
             await this.cancel(sessionKey).catch(() => {
@@ -117,34 +119,21 @@ export class OpenClawAdapter implements AgentAdapter {
           if (streamError) throw streamError;
           const rawStatus = String(result.value.status ?? 'completed').toLowerCase();
           if (rawStatus === 'pending' || rawStatus === 'timeout') {
-            completed = this.gateway.request('agent.wait', { runId }, 1_800_000, waitAbort.signal);
+            completed = waitForResult();
             completed.catch(() => {});
             continue;
           }
-          const textResult = textOf(
-            result.value.output ??
-              result.value.result ??
-              result.value.message ??
-              result.value.terminalReply ??
-              result.value.terminalReceipt ??
-              result.value,
-          );
-          if (rawStatus === 'error' || rawStatus === 'failed' || result.value.error !== undefined) {
-            const errText =
-              textOf(result.value.error) ||
-              (typeof result.value.error === 'string' ? result.value.error : '') ||
-              textResult ||
-              `OpenClaw run ended with status "${rawStatus}"`;
-            yield { type: 'error', text: errText, stopReason: rawStatus };
-            return;
-          }
-          const stopReason = rawStatus === 'aborted' || rawStatus === 'cancelled' ? 'cancelled' : rawStatus;
-          yield { type: 'final', text: textResult || output, stopReason };
-          return;
+          terminal = { value: result.value, rawStatus };
+          // The terminal RPC may resolve before earlier WebSocket events leave the queue.
+          subscription.unsubscribe();
+          continue;
         }
-        next = subscription.next(waitAbort.signal);
+        if (result.value.done) {
+          if (!terminal) throw new Error('OpenClaw event stream ended before the run completed');
+          break;
+        }
+        next = readEvent();
         next.catch(() => {});
-        if (result.value.done) throw new Error('OpenClaw event stream ended before the run completed');
         const frame = result.value.value;
         const payload = frame.payload ?? frame.data ?? frame;
         const eventRun = String(payload.runId ?? payload.run_id ?? '');
@@ -217,6 +206,17 @@ export class OpenClawAdapter implements AgentAdapter {
         }
         if (sessionKey) (payload as Record<string, unknown>).sessionKey ??= sessionKey;
       }
+      const { value, rawStatus } = terminal;
+      const textResult = textOf(
+        value.output ?? value.result ?? value.message ?? value.terminalReply ?? value.terminalReceipt ?? value,
+      );
+      if (rawStatus === 'error' || rawStatus === 'failed' || value.error !== undefined) {
+        const errText = textOf(value.error) || textResult || `OpenClaw run ended with status "${rawStatus}"`;
+        yield { type: 'error', text: errText, stopReason: rawStatus };
+        return;
+      }
+      const stopReason = rawStatus === 'aborted' || rawStatus === 'cancelled' ? 'cancelled' : rawStatus;
+      yield { type: 'final', text: textResult || output, stopReason };
     } finally {
       signal?.removeEventListener('abort', onAbort);
       waitAbort.abort();

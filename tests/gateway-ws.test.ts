@@ -54,6 +54,9 @@ describe('OpenClaw WebSocket wire protocol', () => {
               payload: { runId: 'run-wire', sessionKey: frame.params.sessionKey },
             }),
           );
+        } else if (frame.method === 'agent.wait') {
+          // Deliver the process frames and terminal response in the same socket write.
+          request.socket.cork();
           for (const [runId, itemId, text, delta] of [
             ['other-run', 'item-1', 'bad thought', 'bad thought'],
             ['run-wire', 'item-1', 'Check', 'Check'],
@@ -95,7 +98,6 @@ describe('OpenClaw WebSocket wire protocol', () => {
               }),
             );
           }
-        } else if (frame.method === 'agent.wait') {
           socket.send(
             JSON.stringify({
               type: 'res',
@@ -104,6 +106,7 @@ describe('OpenClaw WebSocket wire protocol', () => {
               payload: { status: 'ok', terminalReply: { text: 'wire result' } },
             }),
           );
+          request.socket.uncork();
         }
       });
     });
