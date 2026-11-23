@@ -10,6 +10,12 @@ interface ReactModule {
   useRef<T>(initial: T): { current: T };
 }
 
+interface ChatPrimitives {
+  Button: unknown;
+  MarkdownText: unknown;
+  UserMessageBubble: unknown;
+}
+
 interface ClientLocale {
   register?(ns: string, dicts: Record<string, Record<string, string>>): () => void;
   bind?(ns: string): (key: string) => string;
@@ -56,11 +62,9 @@ interface AgentSummary {
   model?: string;
   hasToken?: boolean;
   supportsRespond?: boolean;
+  supportsSessionMessages?: boolean;
   connection?: AgentConnectionState;
 }
-
-type AgentSelection = Pick<AgentSummary, 'id' | 'revision'>;
-const NO_AGENT: AgentSelection = { id: '', revision: '' };
 
 interface AgentFormState {
   editing: boolean;
@@ -79,6 +83,8 @@ interface AgentFormState {
   acpArgsText: string;
 }
 
+type ToolStatus = 'running' | 'completed' | 'failed' | 'interrupted';
+
 interface JobSummary {
   id: string;
   agentId: string;
@@ -89,7 +95,9 @@ interface JobSummary {
   updatedAt: number;
   text: string;
   error?: string;
+  remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
+  tools?: Array<{ id: string; name: string; status: ToolStatus }>;
 }
 
 interface LocalSessionSummary {
@@ -122,6 +130,12 @@ interface RemoteSessionItem {
   id: string;
   title?: string;
   updatedAt?: string | number;
+}
+
+interface TranscriptMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
 }
 
 const NS = 'dsh-knot';
@@ -183,32 +197,41 @@ const DICTS: Record<string, Record<string, string>> = {
     savingAgent: '保存中…',
     savedAgentToast: '已保存配置，正在验证连接…',
     deletedAgentToast: '已移除该助手',
-    viewHistory: '看历史',
     chatWithAgent: '对话',
     details: '连接详情',
     retest: '重测',
     hide: '收起',
     historyHeading: '远端历史对话',
-    selectAgentPrompt: '选择一个助手加载其远端历史会话',
     loadingHistory: '正在加载远端会话…',
     historyErrorTitle: '加载远端历史会话失败',
     retry: '重试',
     noHistory: '该助手暂无可列出的历史会话',
+    noHistoryMatch: '没有匹配的会话',
     searchPlaceholder: '搜索标题或会话 ID…',
-    loadMore: '加载更多',
-    resumeInPanel: '继续对话',
     continuePrompt: '复制指令',
     copiedContinue: '已复制，粘贴到 dsh 主对话框即可继续',
-    chatHeading: '直接对话',
-    chatSelectAgent: '选择远端助手开始或继续对话',
+    chatHeading: '对话',
     chatNewSession: '新建对话',
-    chatResuming: '继续会话',
-    chatEmpty: '在这里直接向远端助手发消息，或从下方历史会话点击「继续对话」。',
+    chatEmpty: '发条消息开始对话，或从历史中选择一个会话。',
     chatPlaceholder: '输入消息，按 Enter 发送（Shift+Enter 换行）…',
     chatSend: '发送',
     chatSending: '发送中…',
     chatFailed: '执行失败',
     chatCancelled: '已停止',
+    chatStopping: '正在停止远端任务…',
+    chatStopUnconfirmed: '尚未确认远端任务已停止',
+    chatBack: '助手设置',
+    chatPreparing: '正在生成…',
+    chatToolActivity: '执行过程',
+    chatToolRunning: '执行中',
+    chatToolCompleted: '已完成',
+    chatToolFailed: '失败',
+    chatToolInterrupted: '已中断',
+    chatHistoryError: '无法读取会话消息',
+    chatHistoryLoading: '正在读取会话消息…',
+    chatHistoryUnavailable: '该网关未提供历史消息读取',
+    chatJobError: '无法读取任务进度',
+    chatCopyError: '无法复制续聊指令',
     shareHeading: '共享给远端的本地对话',
     shareSub: '独立只读 MCP 端口 · 默认拒绝 · 自动脱敏',
     mcpDisabled: '只读 MCP 尚未开启（可在插件设置中启用 mcp.enabled）',
@@ -274,32 +297,41 @@ const DICTS: Record<string, Record<string, string>> = {
     savingAgent: 'Saving…',
     savedAgentToast: 'Agent saved — verifying connection…',
     deletedAgentToast: 'Agent removed',
-    viewHistory: 'History',
     chatWithAgent: 'Chat',
     details: 'Details',
     retest: 'Retest',
     hide: 'Hide',
     historyHeading: 'Remote Conversation History',
-    selectAgentPrompt: 'Select an agent to load its remote sessions',
     loadingHistory: 'Loading remote sessions…',
     historyErrorTitle: 'Failed to load remote sessions',
     retry: 'Retry',
     noHistory: 'No remote sessions returned by this agent',
+    noHistoryMatch: 'No matching conversations',
     searchPlaceholder: 'Search title or session ID…',
-    loadMore: 'Load more',
-    resumeInPanel: 'Resume',
     continuePrompt: 'Copy prompt',
     copiedContinue: 'Copied — paste into dsh main chat to continue',
-    chatHeading: 'Direct Chat',
-    chatSelectAgent: 'Select a remote agent to start or resume a conversation',
+    chatHeading: 'Chat',
     chatNewSession: 'New chat',
-    chatResuming: 'Resuming session',
-    chatEmpty: 'Send a message here to start a remote conversation, or click "Resume" on any session below.',
+    chatEmpty: 'Send a message to start a conversation, or select one from history.',
     chatPlaceholder: 'Message remote agent… (Enter to send, Shift+Enter for newline)',
     chatSend: 'Send',
     chatSending: 'Sending…',
     chatFailed: 'Failed',
     chatCancelled: 'Stopped',
+    chatStopping: 'Stopping the remote run…',
+    chatStopUnconfirmed: 'The remote stop has not been confirmed',
+    chatBack: 'Agent settings',
+    chatPreparing: 'Generating…',
+    chatToolActivity: 'Activity',
+    chatToolRunning: 'Running',
+    chatToolCompleted: 'Completed',
+    chatToolFailed: 'Failed',
+    chatToolInterrupted: 'Interrupted',
+    chatHistoryError: 'Could not load conversation messages',
+    chatHistoryLoading: 'Loading conversation messages…',
+    chatHistoryUnavailable: 'This gateway does not support reading past messages',
+    chatJobError: 'Could not load job progress',
+    chatCopyError: 'Could not copy the continuation prompt',
     shareHeading: 'Local Chats Shared with Remote',
     shareSub: 'Separate read-only MCP · Deny-by-default · Auto-redacted',
     mcpDisabled: 'Read-only MCP is disabled (enable mcp.enabled in plugin settings)',
@@ -329,7 +361,6 @@ body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1
 .dk-muted { font-size: 12px; color: var(--dsw-alias-label-secondary, #6b7280); }
 .dk-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .dk-row1 { display: grid; grid-template-columns: 5fr 7fr; gap: 14px; }
-.dk-row3 { display: grid; grid-template-columns: 7fr 5fr; gap: 14px; align-items: start; }
 .dk-kpis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .dk-kpi { text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 14px 10px; }
 .dk-kpi-num { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 4px 0 2px; }
@@ -347,17 +378,40 @@ body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1
 .dk-pre { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
 .dk-input { padding: 5px 10px; border-radius: 8px; font-size: 12px; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); background: var(--dsw-alias-bg-layer-2, #f8f9fb); color: inherit; outline: none; }
 .dk-textarea { width: 100%; box-sizing: border-box; min-height: 64px; max-height: 180px; resize: vertical; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; font-family: inherit; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); background: var(--dsw-alias-bg-layer-2, #f8f9fb); color: inherit; outline: none; }
-.dk-chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 320px; overflow-y: auto; padding: 4px 2px; margin-bottom: 10px; }
-.dk-chat-user { align-self: flex-end; max-width: 85%; background: var(--dsw-alias-label-primary, #111827); color: var(--dsw-alias-bg-layer-1, #ffffff); padding: 7px 11px; border-radius: 10px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
-.dk-chat-bot { align-self: flex-start; max-width: 92%; background: var(--dsw-alias-bg-layer-2, #f8f9fb); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); padding: 8px 11px; border-radius: 10px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
-.dk-list-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 6px; border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.06)); }
-.dk-list-row:last-child { border-bottom: 0; }
+.dk-chat-page { display: grid; grid-template-columns: minmax(150px, 235px) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 12px 20px; overflow: hidden; }
+.dk-chat-header { grid-column: 1 / -1; padding-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.1)); }
+.dk-chat-sessions { min-height: 0; overflow-y: auto; padding-right: 12px; border-right: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.1)); }
+.dk-chat-sessions h2 { font-size: 13px; margin: 4px 0 12px; }
+.dk-chat-sessions input { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+.dk-chat-session { display: block; width: 100%; text-align: left; padding: 8px; margin: 2px 0; border: 0; background: transparent; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dk-chat-session:hover, .dk-chat-session[aria-current] { background: var(--dsw-alias-bg-layer-2, #e8eaf0); }
+.dk-chat-thread { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
+.dk-chat-thread-header { padding-bottom: 8px; }
+.dk-chat-thread-header h2 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.dk-chat-log { min-height: 0; overflow-y: auto; }
+.dk-chat-messages { display: flex; flex-direction: column; gap: 16px; max-width: 760px; margin-inline: auto; padding: 16px 8px 20px; box-sizing: border-box; }
+.dk-chat-user { align-self: flex-end; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dk-chat-turn { display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow-wrap: anywhere; }
+.dk-chat-activity { color: var(--dsw-alias-label-secondary, #6b7280); font-size: 12px; }
+.dk-chat-activity summary { cursor: pointer; }
+.dk-chat-activity ul { list-style: none; margin: 6px 0 0 15px; padding: 0; }
+.dk-chat-activity li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; padding-block: 3px; }
+.dk-chat-activity-name { color: var(--dsw-alias-label-primary, #111827); }
+.dk-chat-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.dk-chat-form { width: min(100%, 760px); box-sizing: border-box; margin-inline: auto; padding-top: 10px; }
+.dk-chat-composer { display: flex; gap: 8px; align-items: end; }
+.dk-chat-composer textarea { flex: 1; min-width: 0; }
+.dk-chat-composer button { flex-shrink: 0; }
 .dk-toast { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 9999; padding: 7px 14px; border-radius: 999px; font-size: 12px; background: var(--dsw-alias-label-primary, #111827); color: var(--dsw-alias-bg-layer-1, #ffffff); box-shadow: 0 4px 16px rgba(0,0,0,0.2); }
 .dk-modal-bg { position: fixed; inset: 0; z-index: 9990; background: rgba(0,0,0,0.38); display: flex; align-items: center; justify-content: center; padding: 16px; }
 .dk-modal { width: 100%; max-width: 540px; max-height: 90vh; overflow-y: auto; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); border-radius: 14px; padding: 18px 20px; box-shadow: 0 12px 36px rgba(0,0,0,0.22); display: flex; flex-direction: column; gap: 12px; }
 .dk-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .dk-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-@media (max-width: 960px) { .dk-row1, .dk-row3, .dk-agents-grid { grid-template-columns: 1fr; } }
+@media (max-width: 960px) { .dk-row1, .dk-agents-grid { grid-template-columns: 1fr; } }
+@media (max-width: 680px) {
+  .dk-chat-page { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); gap: 8px; }
+  .dk-chat-sessions { max-height: 132px; padding-right: 0; border-right: 0; }
+}
 `;
 
 function injectStyles(): () => void {
@@ -384,17 +438,20 @@ async function apiPost<T>(
   path: string,
   body: Record<string, unknown> = {},
   timeoutMs?: number,
+  abortSignal?: AbortSignal,
 ): Promise<T> {
   const conn = getClientService<ClientConnection>(ctx, 'connection');
   const fetcher = typeof conn?.fetch === 'function' ? conn.fetch.bind(conn) : fetch;
   const controller = timeoutMs && typeof AbortController !== 'undefined' ? new AbortController() : undefined;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  const signal =
+    controller && abortSignal ? AbortSignal.any([controller.signal, abortSignal]) : (controller?.signal ?? abortSignal);
   try {
     const response = await fetcher(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      ...(controller ? { signal: controller.signal } : {}),
+      signal,
     });
     const payload = (await response.json()) as { ok?: boolean; value?: T; error?: string };
     if (!response.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${response.status}`);
@@ -422,8 +479,629 @@ function formatDirectEndpoint(agent: AgentSummary): string {
   return `${scheme}://${host}${omitPort ? '' : `:${port}`}${agent.basePath ?? ''}`;
 }
 
-function makeDashboard(React: ReactModule, ctx: ClientContext) {
+type Language = 'zh-CN' | 'en';
+type Translate = (key: string) => string;
+
+const MARKDOWN_LABELS = {
+  'zh-CN': { code: { copyLabel: '复制', copiedLabel: '已复制' }, footnotes: '脚注' },
+  en: { code: { copyLabel: 'Copy', copiedLabel: 'Copied' }, footnotes: 'Footnotes' },
+};
+
+const TOOL_STATUS_LABEL: Record<ToolStatus, string> = {
+  running: 'chatToolRunning',
+  completed: 'chatToolCompleted',
+  failed: 'chatToolFailed',
+  interrupted: 'chatToolInterrupted',
+};
+
+function isRunning(job?: JobSummary): boolean {
+  return job?.status === 'queued' || job?.status === 'running' || job?.remoteStop !== undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+interface ChatProps {
+  agent: AgentSummary;
+  agents: AgentSummary[];
+  jobs: JobSummary[];
+  lang: Language;
+  t: Translate;
+  onAgentChange: (id: string) => void;
+  onClose: () => void;
+  refreshState: () => Promise<void>;
+}
+
+function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
+  const Thread = makeChatThread(React, ctx, primitives);
+  const { Button } = primitives;
+
+  return function RemoteChat({ agent, agents, jobs, lang, t, onAgentChange, onClose, refreshState }: ChatProps) {
+    const [sessions, setSessions] = React.useState<RemoteSessionItem[] | null>(null);
+    const [sessionError, setSessionError] = React.useState('');
+    const [search, setSearch] = React.useState('');
+    const [thread, setThread] = React.useState({ key: 0, id: '' });
+    const [shownSessionId, setShownSessionId] = React.useState('');
+    const [refreshCount, setRefreshCount] = React.useState(0);
+
+    const reloadSessions = React.useCallback(() => setRefreshCount((count) => count + 1), []);
+
+    React.useEffect(() => {
+      const controller = new AbortController();
+      setSessionError('');
+      void apiPost<{ sessions: RemoteSessionItem[] }>(
+        ctx,
+        '/api/dsh-knot/sessions',
+        { agentId: agent.id, revision: agent.revision },
+        20_000,
+        controller.signal,
+      )
+        .then(({ sessions: items }) => {
+          if (!controller.signal.aborted) setSessions(items);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setSessionError(errorMessage(error));
+        });
+      return () => controller.abort();
+    }, [agent.id, agent.revision, refreshCount]);
+
+    const openThread = (id = '') => {
+      setShownSessionId(id);
+      setThread(({ key }) => ({ key: key + 1, id }));
+    };
+    const query = search.trim().toLowerCase();
+    const matches = sessions?.filter(
+      (item) => item.id.toLowerCase().includes(query) || item.title?.toLowerCase().includes(query),
+    );
+    const title = sessions?.find((item) => item.id === shownSessionId)?.title;
+
+    return h(
+      'div',
+      { className: 'dk-root dk-chat-page' },
+      h(
+        'header',
+        { className: 'dk-header dk-chat-header' },
+        h(
+          'div',
+          { className: 'dk-header-left' },
+          h('h1', { className: 'dk-title' }, t('chatHeading')),
+          h(
+            'select',
+            {
+              className: 'dk-input',
+              'aria-label': t('agentsHeading'),
+              value: agent.id,
+              onChange: (event: { target: HTMLSelectElement }) => onAgentChange(event.target.value),
+            },
+            agents.map((item) => h('option', { key: item.id, value: item.id }, item.id)),
+          ),
+        ),
+        h(
+          'div',
+          { className: 'dk-header-right' },
+          h(Button, { variant: 'outline', onClick: onClose }, t('chatBack')),
+          h(Button, { variant: 'primary', onClick: () => openThread() }, t('chatNewSession')),
+        ),
+      ),
+      h(
+        'aside',
+        { className: 'dk-chat-sessions', 'aria-label': t('historyHeading') },
+        h(
+          'div',
+          { className: 'dk-header' },
+          h('h2', null, t('historyHeading')),
+          h(Button, { size: 'sm', onClick: reloadSessions }, t('refresh')),
+        ),
+        h('input', {
+          className: 'dk-input',
+          type: 'search',
+          'aria-label': t('searchPlaceholder'),
+          value: search,
+          placeholder: t('searchPlaceholder'),
+          onInput: (event: { target: HTMLInputElement }) => setSearch(event.target.value),
+        }),
+        sessionError
+          ? h(
+              'div',
+              { className: 'dk-errbox', role: 'alert' },
+              h('span', null, `${t('historyErrorTitle')}: ${sessionError}`),
+              h(Button, { size: 'sm', onClick: reloadSessions }, t('retry')),
+            )
+          : null,
+        matches?.length
+          ? matches.map((item) =>
+              h(
+                'button',
+                {
+                  key: item.id,
+                  type: 'button',
+                  className: 'dk-btn dk-chat-session',
+                  'aria-current': shownSessionId === item.id ? 'true' : undefined,
+                  title: item.title || item.id,
+                  onClick: () => {
+                    if (shownSessionId !== item.id) openThread(item.id);
+                  },
+                },
+                item.title || item.id,
+              ),
+            )
+          : !sessionError
+            ? h(
+                'div',
+                { className: 'dk-muted', role: 'status' },
+                t(!sessions ? 'loadingHistory' : query ? 'noHistoryMatch' : 'noHistory'),
+              )
+            : null,
+      ),
+      h(Thread, {
+        key: thread.key,
+        agent,
+        jobs,
+        session: thread.id,
+        title,
+        lang,
+        t,
+        onSession: setShownSessionId,
+        reloadSessions,
+        refreshState,
+      }),
+    );
+  };
+}
+
+interface ThreadProps {
+  agent: AgentSummary;
+  jobs: JobSummary[];
+  session: string;
+  title?: string;
+  lang: Language;
+  t: Translate;
+  onSession: (sessionId: string) => void;
+  reloadSessions: () => void;
+  refreshState: () => Promise<void>;
+}
+
+function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
+  const h = React.createElement;
+  const { Button, MarkdownText, UserMessageBubble } = primitives;
+
+  return function ChatThread({
+    agent,
+    jobs,
+    session,
+    title,
+    lang,
+    t,
+    onSession,
+    reloadSessions,
+    refreshState,
+  }: ThreadProps) {
+    const [sessionId, setSessionId] = React.useState(session);
+    const [input, setInput] = React.useState('');
+    const [sending, setSending] = React.useState(false);
+    const [acting, setActing] = React.useState(false);
+    const [error, setError] = React.useState('');
+    const [jobError, setJobError] = React.useState('');
+    const [historyError, setHistoryError] = React.useState('');
+    const [history, setHistory] = React.useState<TranscriptMessage[] | null>(null);
+    const [historyAttempts, setHistoryAttempts] = React.useState(0);
+    const [turns, setTurns] = React.useState<JobSummary[]>([]);
+    const belongsToSession = (job: JobSummary) =>
+      Boolean(sessionId && job.sessionId === sessionId && job.agentId === agent.id);
+    const [initialJob] = React.useState(() => jobs.find((job) => belongsToSession(job) && isRunning(job)));
+    const [observedJob, setObservedJob] = React.useState(initialJob);
+    const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
+    const [copyStatus, setCopyStatus] = React.useState('');
+    const alive = React.useRef(false);
+    const sendLock = React.useRef(false);
+    const actionLock = React.useRef(false);
+    const submission = React.useRef<{ message: string; sessionId: string; id: string } | null>(null);
+    const log = React.useRef<HTMLDivElement | null>(null);
+    const followTail = React.useRef(true);
+    const canReadHistory = Boolean(agent.supportsSessionMessages && session);
+    const initialJobRunning = Boolean(initialJob && observedJob?.id === initialJob.id && isRunning(observedJob));
+
+    React.useEffect(() => {
+      alive.current = true;
+      return () => {
+        alive.current = false;
+      };
+    }, []);
+
+    React.useEffect(() => {
+      if (!canReadHistory || initialJobRunning) return;
+      const controller = new AbortController();
+      setHistoryError('');
+      void apiPost<{ messages: TranscriptMessage[] }>(
+        ctx,
+        '/api/dsh-knot/session-messages',
+        { agentId: agent.id, revision: agent.revision, sessionId: session },
+        15_000,
+        controller.signal,
+      )
+        .then(({ messages }) => {
+          if (!controller.signal.aborted) setHistory(messages);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) setHistoryError(errorMessage(error));
+        });
+      return () => controller.abort();
+    }, [agent.id, agent.revision, canReadHistory, historyAttempts, initialJobRunning, session]);
+
+    const ownRunning = turns.find((job) => isRunning(job));
+    const listedRunning = jobs.find(
+      (job) =>
+        belongsToSession(job) &&
+        isRunning(job) &&
+        !turns.some(({ id }) => id === job.id) &&
+        (job.id !== observedJob?.id || isRunning(observedJob)),
+    );
+    const activeJob = ownRunning ?? (isRunning(observedJob) ? observedJob : listedRunning);
+    const activeId = activeJob?.id;
+    const progressId = activeJob?.remoteStop === 'unconfirmed' ? undefined : activeId;
+    const ownActiveId = ownRunning?.id;
+
+    const applyProgress = React.useCallback(
+      (job: JobSummary, own: boolean) => {
+        if (!alive.current) return;
+        const previous = latestProgress.current;
+        if (previous?.id === job.id && (previous.updatedAt > job.updatedAt || (!isRunning(previous) && isRunning(job))))
+          return;
+        latestProgress.current = job;
+        if (own) {
+          setTurns((current) => current.map((item) => (item.id === job.id ? { ...job, prompt: item.prompt } : item)));
+        } else setObservedJob(job);
+        if (job.sessionId) {
+          setSessionId(job.sessionId);
+          onSession(job.sessionId);
+        }
+        if (!isRunning(job)) {
+          reloadSessions();
+          void refreshState();
+        }
+      },
+      [onSession, reloadSessions, refreshState],
+    );
+
+    React.useEffect(() => {
+      if (!progressId) return;
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const poll = async () => {
+        let delay = 400;
+        try {
+          const job = await apiPost<JobSummary>(
+            ctx,
+            '/api/dsh-knot/job',
+            { agentId: agent.id, revision: agent.revision, jobId: progressId },
+            8_000,
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          setJobError('');
+          applyProgress(job, progressId === ownActiveId);
+          if (!isRunning(job) || job.remoteStop === 'unconfirmed') return;
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          setJobError(errorMessage(error));
+          delay = 2_000;
+        }
+        timer = setTimeout(() => void poll(), delay);
+      };
+      void poll();
+      return () => {
+        controller.abort();
+        clearTimeout(timer);
+      };
+    }, [progressId, ownActiveId, agent.id, agent.revision, applyProgress]);
+
+    React.useEffect(() => {
+      if (followTail.current && log.current) log.current.scrollTop = log.current.scrollHeight;
+    }, [history, turns, observedJob]);
+
+    const historyPending = canReadHistory && !history && !historyError;
+    const send = async () => {
+      const message = input.trim();
+      if (!message || activeId || historyPending || sendLock.current || actionLock.current) return;
+      let request = submission.current;
+      if (!request || request.message !== message || request.sessionId !== sessionId) {
+        const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+          byte.toString(16).padStart(2, '0'),
+        ).join('');
+        request = { message, sessionId, id };
+        submission.current = request;
+      }
+      sendLock.current = true;
+      setSending(true);
+      setError('');
+      setJobError('');
+      followTail.current = true;
+      try {
+        const job = await apiPost<JobSummary>(
+          ctx,
+          '/api/dsh-knot/ask',
+          {
+            agentId: agent.id,
+            revision: agent.revision,
+            message: request.message,
+            clientMessageId: request.id,
+            ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+          },
+          15_000,
+        );
+        void refreshState();
+        if (!alive.current) return;
+        submission.current = null;
+        setInput('');
+        setTurns((current) => [
+          ...current.filter(({ id }) => id !== job.id).slice(-19),
+          { ...job, prompt: request.message },
+        ]);
+        applyProgress(job, true);
+      } catch (error) {
+        if (alive.current) setError(errorMessage(error));
+      } finally {
+        sendLock.current = false;
+        if (alive.current) setSending(false);
+      }
+    };
+
+    const actOnJob = async (path: 'cancel' | 'respond', job: JobSummary, fields: Record<string, unknown> = {}) => {
+      if (actionLock.current) return;
+      actionLock.current = true;
+      setActing(true);
+      setError('');
+      try {
+        const updated = await apiPost<JobSummary>(ctx, `/api/dsh-knot/${path}`, { jobId: job.id, ...fields }, 15_000);
+        applyProgress(updated, job.id === ownActiveId);
+      } catch (error) {
+        if (alive.current) setError(errorMessage(error));
+      } finally {
+        actionLock.current = false;
+        if (alive.current) setActing(false);
+      }
+    };
+
+    const copyPrompt = async () => {
+      try {
+        await navigator.clipboard.writeText(
+          `Use agent_continue on agent "${agent.id}" session "${sessionId}" to continue our previous discussion.`,
+        );
+        if (alive.current) setCopyStatus(t('copiedContinue'));
+      } catch {
+        if (alive.current) setCopyStatus(t('chatCopyError'));
+      }
+    };
+
+    const liveJob = (isRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
+    const loadedInitialJob = Boolean(history && liveJob?.id === initialJob?.id);
+    const lastMessage = history?.at(-1);
+    const fallbackJobs =
+      !agent.supportsSessionMessages && sessionId
+        ? jobs.filter(
+            (job) => belongsToSession(job) && !turns.some(({ id }) => id === job.id) && job.id !== liveJob?.id,
+          )
+        : [];
+    const renderJob = (job: JobSummary, showPrompt = true, showText = true) => {
+      const active = isRunning(job);
+      const approval = active ? job.pendingApproval : undefined;
+      const runningTools = job.tools?.filter((tool) => tool.status === 'running') ?? [];
+      const status =
+        job.remoteStop === 'pending'
+          ? 'chatStopping'
+          : job.remoteStop === 'unconfirmed'
+            ? 'chatStopUnconfirmed'
+            : approval
+              ? 'wantsApproval'
+              : 'chatPreparing';
+      return h(
+        'div',
+        { key: job.id, className: 'dk-chat-turn' },
+        showPrompt && job.prompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
+        job.tools?.length
+          ? h(
+              'details',
+              { className: 'dk-chat-activity' },
+              h(
+                'summary',
+                null,
+                t('chatToolActivity'),
+                runningTools.length
+                  ? h(
+                      'span',
+                      { role: 'status' },
+                      ` · ${t('chatToolRunning')} ${runningTools.map(({ name }) => name).join(', ')}`,
+                    )
+                  : null,
+              ),
+              h(
+                'ul',
+                null,
+                job.tools.map((tool) =>
+                  h(
+                    'li',
+                    { key: tool.id },
+                    h('span', { className: 'dk-chat-activity-name' }, tool.name),
+                    h('span', null, t(TOOL_STATUS_LABEL[tool.status])),
+                  ),
+                ),
+              ),
+            )
+          : null,
+        showText && job.text
+          ? h(MarkdownText, { text: job.text, streaming: active, labels: MARKDOWN_LABELS[lang], omitHtml: true })
+          : null,
+        active
+          ? h(
+              'div',
+              { className: 'dk-chat-status' },
+              h('span', { className: 'dk-muted', role: 'status' }, t(status)),
+              h(
+                Button,
+                {
+                  size: 'sm',
+                  variant: 'outline',
+                  disabled: acting || job.remoteStop === 'pending',
+                  onClick: () => void actOnJob('cancel', job),
+                },
+                t('stopTask'),
+              ),
+            )
+          : null,
+        approval
+          ? h(
+              'div',
+              { className: 'dk-warnbox' },
+              h('p', null, approval.text ?? approval.requestId),
+              agent.supportsRespond !== false && approval.choices.length
+                ? approval.choices.map((choice) =>
+                    h(
+                      Button,
+                      {
+                        key: choice,
+                        variant: 'outline',
+                        size: 'sm',
+                        disabled: acting,
+                        onClick: () => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
+                      },
+                      choice,
+                    ),
+                  )
+                : h('div', { className: 'dk-muted' }, t('approveRemotely')),
+            )
+          : null,
+        job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop)
+          ? h(
+              'div',
+              { className: job.status === 'failed' ? 'dk-errbox' : 'dk-muted', role: 'status' },
+              t(job.status === 'failed' ? 'chatFailed' : 'chatCancelled'),
+              job.error ? ` · ${job.error}` : '',
+            )
+          : null,
+      );
+    };
+
+    return h(
+      'section',
+      { className: 'dk-chat-thread', 'aria-label': title || t('chatHeading') },
+      h(
+        'div',
+        { className: 'dk-header dk-chat-thread-header' },
+        h('h2', { title: title || sessionId }, title || sessionId || t('chatNewSession')),
+        sessionId ? h(Button, { size: 'sm', onClick: () => void copyPrompt() }, t('continuePrompt')) : null,
+      ),
+      h(
+        'div',
+        {
+          className: 'dk-chat-log',
+          ref: log,
+          onScroll: ({ currentTarget }: { currentTarget: HTMLDivElement }) => {
+            followTail.current = currentTarget.scrollHeight - currentTarget.scrollTop - currentTarget.clientHeight < 64;
+          },
+        },
+        h(
+          'div',
+          { className: 'dk-chat-messages' },
+          historyPending ? h('div', { className: 'dk-muted', role: 'status' }, t('chatHistoryLoading')) : null,
+          historyError
+            ? h(
+                'div',
+                { className: 'dk-errbox', role: 'alert' },
+                `${t('chatHistoryError')}: ${historyError}`,
+                h(
+                  Button,
+                  {
+                    size: 'sm',
+                    disabled: Boolean(activeId || turns.length || sending),
+                    onClick: () => setHistoryAttempts((attempts) => attempts + 1),
+                  },
+                  t('retry'),
+                ),
+              )
+            : null,
+          session && !agent.supportsSessionMessages
+            ? h('div', { className: 'dk-muted' }, t('chatHistoryUnavailable'))
+            : null,
+          !sessionId && !turns.length ? h('div', { className: 'dk-muted' }, t('chatEmpty')) : null,
+          history?.map((message) =>
+            message.role === 'user'
+              ? h(UserMessageBubble, { key: message.id, className: 'dk-chat-user' }, message.text)
+              : h(MarkdownText, { key: message.id, text: message.text, labels: MARKDOWN_LABELS[lang], omitHtml: true }),
+          ),
+          fallbackJobs
+            .sort((a, b) => a.createdAt - b.createdAt)
+            .slice(-20)
+            .map((job) => renderJob(job)),
+          liveJob && (!loadedInitialJob || liveJob.status !== 'completed')
+            ? renderJob(
+                liveJob,
+                !history || (!loadedInitialJob && !isRunning(liveJob)),
+                !loadedInitialJob || lastMessage?.role !== 'assistant' || lastMessage.text !== liveJob.text,
+              )
+            : null,
+          turns.map((job) => renderJob(job)),
+        ),
+      ),
+      h(
+        'form',
+        {
+          className: 'dk-chat-form',
+          onSubmit: (event: { preventDefault(): void }) => {
+            event.preventDefault();
+            void send();
+          },
+        },
+        copyStatus ? h('div', { className: 'dk-muted', role: 'status' }, copyStatus) : null,
+        error || jobError
+          ? h('div', { className: 'dk-errbox', role: 'alert' }, error || `${t('chatJobError')}: ${jobError}`)
+          : null,
+        h(
+          'div',
+          { className: 'dk-chat-composer' },
+          h('textarea', {
+            className: 'dk-textarea',
+            'aria-label': t('chatPlaceholder'),
+            placeholder: t('chatPlaceholder'),
+            value: input,
+            readOnly: sending,
+            onInput: (event: { target: HTMLTextAreaElement }) => setInput(event.target.value),
+            onKeyDown: (event: {
+              key: string;
+              shiftKey: boolean;
+              nativeEvent: KeyboardEvent;
+              preventDefault(): void;
+            }) => {
+              if (
+                event.key === 'Enter' &&
+                !event.shiftKey &&
+                !event.nativeEvent.isComposing &&
+                event.nativeEvent.keyCode !== 229
+              ) {
+                event.preventDefault();
+                void send();
+              }
+            },
+          }),
+          h(
+            Button,
+            {
+              type: 'submit',
+              variant: 'primary',
+              disabled: Boolean(sending || acting || activeId || historyPending || !input.trim()),
+            },
+            t(sending ? 'chatSending' : 'chatSend'),
+          ),
+        ),
+      ),
+    );
+  };
+}
+
+function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
+  const h = React.createElement;
+  const Chat = makeRemoteChat(React, ctx, primitives);
 
   return function KnotDashboard() {
     const locale = getClientService<ClientLocale>(ctx, 'locale');
@@ -433,28 +1111,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const [error, setError] = React.useState<string | null>(null);
     const [expandedDoctor, setExpandedDoctor] = React.useState<Record<string, boolean>>({});
     const [checkingDoctor, setCheckingDoctor] = React.useState(false);
-    const [history, setHistory] = React.useState(NO_AGENT);
-    const historyAgent = history.id;
-    const [historyItems, setHistoryItems] = React.useState<RemoteSessionItem[]>([]);
-    const [historyLoading, setHistoryLoading] = React.useState(false);
-    const [historyError, setHistoryError] = React.useState<string | null>(null);
-    const [historySearch, setHistorySearch] = React.useState('');
-    const [historyLimit, setHistoryLimit] = React.useState(6);
-    const [chat, setChat] = React.useState(NO_AGENT);
-    const chatAgent = chat.id;
-    const [chatSessionId, setChatSessionId] = React.useState('');
-    const [chatSessionTitle, setChatSessionTitle] = React.useState('');
-    const chatSelection = React.useRef(NO_AGENT);
-    const [chatInput, setChatInput] = React.useState('');
-    const [chatSending, setChatSending] = React.useState(false);
-    const [chatError, setChatError] = React.useState<string | null>(null);
-    const [chatActiveJobId, setChatActiveJobId] = React.useState<string | null>(null);
+    const [chatAgentId, setChatAgentId] = React.useState('');
     const [toast, setToast] = React.useState<string | null>(null);
     const [form, setForm] = React.useState<AgentFormState | null>(null);
     const [saving, setSaving] = React.useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-    const historySelection = React.useRef(NO_AGENT);
     const stateRequest = React.useRef(0);
     const hasRunningRef = React.useRef(false);
 
@@ -530,96 +1192,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
         setCheckingDoctor(false);
       }
     };
-
-    const loadHistory = async ({ id, revision }: AgentSelection = NO_AGENT) => {
-      const selection = { id, revision };
-      historySelection.current = selection;
-      setHistory(selection);
-      setHistoryLimit(6);
-      setHistoryError(null);
-      if (!id) {
-        setHistoryItems([]);
-        setHistoryLoading(false);
-        return;
-      }
-      setHistoryLoading(true);
-      try {
-        const result = await apiPost<{ sessions: RemoteSessionItem[] }>(
-          ctx,
-          '/api/dsh-knot/sessions',
-          { agentId: id, revision },
-          20_000,
-        );
-        if (historySelection.current !== selection) return;
-        setHistoryItems(result.sessions ?? []);
-        setHistoryError(null);
-      } catch (err) {
-        if (historySelection.current !== selection) return;
-        setHistoryItems([]);
-        setHistoryError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (historySelection.current === selection) setHistoryLoading(false);
-      }
-    };
-
-    const sendChatMessage = async () => {
-      const message = chatInput.trim();
-      if (!chatAgent || !message || chatBusy || chatSelection.current !== chat) return;
-      setChatSending(true);
-      setChatError(null);
-      try {
-        const job = await apiPost<JobSummary>(
-          ctx,
-          '/api/dsh-knot/ask',
-          {
-            agentId: chatAgent,
-            revision: chat.revision,
-            message,
-            ...(chatSessionId ? { sessionId: chatSessionId } : {}),
-          },
-          15_000,
-        );
-        hasRunningRef.current = true;
-        if (chat === chatSelection.current) {
-          setChatInput('');
-          setChatActiveJobId(job.id);
-          if (job.sessionId) setChatSessionId(job.sessionId);
-        }
-        await refreshState();
-      } catch (err) {
-        if (chat === chatSelection.current) setChatError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (chat === chatSelection.current) setChatSending(false);
-      }
-    };
-
-    const startChatWith = ({ id, revision }: AgentSelection = NO_AGENT, sessionId = '', title = '') => {
-      const selection = { id, revision };
-      chatSelection.current = selection;
-      setChat(selection);
-      setChatSessionId(sessionId);
-      setChatSessionTitle(title);
-      setChatInput('');
-      setChatSending(false);
-      setChatActiveJobId(null);
-      setChatError(null);
-    };
-
-    React.useEffect(() => {
-      if (!state) return;
-      if (history.id && !state.agents.some((a) => a.id === history.id && a.revision === history.revision)) {
-        if (historySelection.current === history) void loadHistory();
-      }
-      const current = state.agents.find((a) => a.id === chatAgent);
-      if (!current || current.revision !== chat.revision) {
-        const replacement = current ?? state.agents[0];
-        if (chatSelection.current === chat && (replacement || chatAgent)) startChatWith(replacement);
-        return;
-      }
-      if (chatSelection.current !== chat || chatSessionId || !chatActiveJobId) return;
-      const active = state.jobs.find((job) => job.id === chatActiveJobId && job.agentId === chatAgent);
-      if (active?.sessionId) setChatSessionId(active.sessionId);
-    }, [state, history, chat, chatAgent, chatActiveJobId, chatSessionId]);
 
     const respondApproval = async (jobId: string, requestId: string, choice: string) => {
       try {
@@ -710,8 +1282,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
           acpCommand: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpCommand : undefined,
           ...(acpArgs ? { acpArgs } : {}),
         });
-        if (historySelection.current.id === savedId) void loadHistory();
-        if (chatSelection.current.id === savedId) startChatWith(agents.find((agent) => agent.id === savedId));
         setState((prev) =>
           prev ? { ...prev, agents, jobs: prev.jobs.filter((job) => job.agentId !== savedId) } : prev,
         );
@@ -734,8 +1304,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       setConfirmDeleteId(null);
       try {
         const { agents } = await apiPost<{ agents: AgentSummary[] }>(ctx, '/api/dsh-knot/agent-delete', { id });
-        if (historySelection.current.id === id) void loadHistory();
-        if (chatSelection.current.id === id) startChatWith(agents[0]);
         setState((prev) => (prev ? { ...prev, agents, jobs: prev.jobs.filter((job) => job.agentId !== id) } : prev));
         setExpandedDoctor((prev) => {
           const next = { ...prev };
@@ -747,12 +1315,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err));
       }
-    };
-
-    const copyContinue = (agentId: string, sessionId: string) => {
-      const prompt = `Use agent_continue on agent "${agentId}" session "${sessionId}" to continue our previous discussion.`;
-      void navigator.clipboard?.writeText(prompt);
-      showToast(t('copiedContinue'));
     };
 
     const copyYaml = () => {
@@ -767,19 +1329,23 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
     const jobs = state?.jobs ?? [];
     const verifiedCount = agents.filter((a) => a.connection?.status === 'connected').length;
     const pendingApprovals = jobs.filter((j) => j.pendingApproval && j.status === 'running');
-    const runningJobs = jobs.filter((j) => j.status === 'running' || j.status === 'queued');
+    const runningJobs = jobs.filter(isRunning);
     const sharedCount = state?.mcp.allowSessions.length ?? 0;
 
-    const isChatJob = (job: JobSummary) =>
-      job.agentId === chatAgent && (chatSessionId ? job.sessionId === chatSessionId : job.id === chatActiveJobId);
-    const chatBusy = chatSending || runningJobs.some(isChatJob);
-    const chatJobs = jobs.filter(isChatJob).slice(0, 20).reverse();
-
-    const q = historySearch.trim().toLowerCase();
-    const filteredHistory = historyItems.filter(
-      (item) => !q || item.id.toLowerCase().includes(q) || (item.title ?? '').toLowerCase().includes(q),
-    );
-    const visibleHistory = q ? filteredHistory : filteredHistory.slice(0, historyLimit);
+    const chatAgent = agents.find((agent) => agent.id === chatAgentId);
+    if (chatAgent) {
+      return h(Chat, {
+        key: chatAgent.revision,
+        agent: chatAgent,
+        agents,
+        jobs,
+        lang,
+        t,
+        onAgentChange: setChatAgentId,
+        onClose: () => setChatAgentId(''),
+        refreshState,
+      });
+    }
 
     return h(
       'div',
@@ -1030,13 +1596,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                         { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
                         h(
                           'button',
-                          { className: 'dk-btn-link', onClick: () => startChatWith(agent) },
+                          { className: 'dk-btn-link', onClick: () => setChatAgentId(agent.id) },
                           t('chatWithAgent'),
-                        ),
-                        h(
-                          'button',
-                          { className: 'dk-btn-link', onClick: () => void loadHistory(agent) },
-                          t('viewHistory'),
                         ),
                         h('button', { className: 'dk-btn', onClick: () => openEditForm(agent) }, t('editAgent')),
                         h(
@@ -1126,7 +1687,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
                 }),
               ),
         ),
-        // Row 2.5: Direct Chat Panel
         h(
           'div',
           { className: 'dk-card' },
@@ -1135,303 +1695,45 @@ function makeDashboard(React: ReactModule, ctx: ClientContext) {
             { className: 'dk-card-head' },
             h(
               'div',
-              { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
-              h('span', { className: 'dk-card-title' }, t('chatHeading')),
-              h(
-                'select',
-                {
-                  className: 'dk-input',
-                  value: chatAgent,
-                  onChange: (e: { target: { value: string } }) =>
-                    startChatWith(agents.find((agent) => agent.id === e.target.value)),
-                },
-                h('option', { value: '' }, t('chatSelectAgent')),
-                agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
-              ),
-              chatSessionId
-                ? h(
-                    'span',
-                    { className: 'dk-capsule dk-capsule-static' },
-                    `${t('chatResuming')}: ${chatSessionTitle || chatSessionId.slice(0, 20)}`,
-                  )
-                : null,
+              null,
+              h('div', { className: 'dk-card-title' }, t('shareHeading')),
+              h('div', { className: 'dk-muted' }, t('shareSub')),
             ),
-            chatSessionId
-              ? h(
-                  'button',
-                  {
-                    className: 'dk-btn',
-                    onClick: () => startChatWith(chat),
-                  },
-                  t('chatNewSession'),
-                )
-              : null,
+            state?.mcp.enabled ? h('button', { className: 'dk-capsule', onClick: copyYaml }, t('copyYaml')) : null,
           ),
-          !chatAgent
-            ? h('div', { className: 'dk-muted', style: { padding: '12px 0' } }, t('chatSelectAgent'))
-            : h(
-                'div',
-                null,
-                chatJobs.length === 0
-                  ? h('div', { className: 'dk-muted', style: { padding: '10px 0 12px' } }, t('chatEmpty'))
-                  : h(
-                      'div',
-                      { className: 'dk-chat-log' },
-                      chatJobs.map((job) =>
-                        h(
-                          'div',
-                          { key: job.id, style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
-                          job.prompt ? h('div', { className: 'dk-chat-user' }, job.prompt) : null,
-                          h(
-                            'div',
-                            { className: 'dk-chat-bot' },
-                            job.text ? h('div', null, job.text) : null,
-                            job.status === 'running' || job.status === 'queued'
-                              ? h(
-                                  'div',
-                                  {
-                                    style: {
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'space-between',
-                                      gap: '8px',
-                                      marginTop: job.text ? '6px' : 0,
-                                    },
-                                  },
-                                  h('span', { className: 'dk-muted' }, `${job.agentId} · ${t('runningNow')}…`),
-                                  h(
-                                    'button',
-                                    { className: 'dk-btn dk-btn-danger', onClick: () => void cancelJob(job.id) },
-                                    t('stopTask'),
-                                  ),
-                                )
-                              : null,
-                            job.status === 'failed'
-                              ? h(
-                                  'div',
-                                  {
-                                    className: 'dk-mono',
-                                    style: { color: '#dc2626', marginTop: job.text ? '6px' : 0 },
-                                  },
-                                  `${t('chatFailed')}: ${job.error ?? 'Unknown error'}`,
-                                )
-                              : null,
-                            job.status === 'cancelled'
-                              ? h(
-                                  'div',
-                                  { className: 'dk-muted', style: { marginTop: job.text ? '6px' : 0 } },
-                                  t('chatCancelled'),
-                                )
-                              : null,
-                          ),
-                        ),
-                      ),
-                    ),
-                chatError ? h('div', { className: 'dk-errbox', style: { marginBottom: '8px' } }, chatError) : null,
-                h(
+          !state?.mcp.enabled
+            ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('mcpDisabled'))
+            : state.mcp.localSessions.length === 0
+              ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('noLocalSessions'))
+              : h(
                   'div',
-                  { style: { display: 'flex', gap: '8px', alignItems: 'flex-end' } },
-                  h('textarea', {
-                    className: 'dk-textarea',
-                    placeholder: t('chatPlaceholder'),
-                    value: chatInput,
-                    disabled: chatBusy,
-                    onInput: (e: { target: { value: string } }) => setChatInput(e.target.value),
-                    onKeyDown: (e: {
-                      key: string;
-                      shiftKey: boolean;
-                      nativeEvent: { isComposing: boolean; keyCode: number };
-                      preventDefault: () => void;
-                    }) => {
-                      if (
-                        e.key === 'Enter' &&
-                        !e.shiftKey &&
-                        !e.nativeEvent.isComposing &&
-                        e.nativeEvent.keyCode !== 229
-                      ) {
-                        e.preventDefault();
-                        void sendChatMessage();
-                      }
-                    },
-                  }),
-                  h(
-                    'button',
-                    {
-                      className: 'dk-btn dk-btn-primary',
-                      style: { padding: '8px 16px', flexShrink: 0 },
-                      disabled: chatBusy || !chatInput.trim(),
-                      onClick: () => void sendChatMessage(),
-                    },
-                    chatSending ? t('chatSending') : t('chatSend'),
-                  ),
-                ),
-              ),
-        ),
-        // Row 3: Remote History Browser + Local Shared Chats
-        h(
-          'div',
-          { className: 'dk-row3' },
-          h(
-            'div',
-            { className: 'dk-card' },
-            h(
-              'div',
-              { className: 'dk-card-head' },
-              h(
-                'div',
-                { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-                h('span', { className: 'dk-card-title' }, t('historyHeading')),
-                h(
-                  'select',
-                  {
-                    className: 'dk-input',
-                    value: historyAgent,
-                    onChange: (e: { target: { value: string } }) =>
-                      void loadHistory(agents.find((agent) => agent.id === e.target.value)),
-                  },
-                  h('option', { value: '' }, t('selectAgentPrompt')),
-                  agents.map((a) => h('option', { key: a.id, value: a.id }, a.id)),
-                ),
-              ),
-              h('input', {
-                className: 'dk-input',
-                type: 'search',
-                value: historySearch,
-                placeholder: t('searchPlaceholder'),
-                onInput: (e: { target: { value: string } }) => setHistorySearch(e.target.value),
-              }),
-            ),
-            !historyAgent
-              ? h(
-                  'div',
-                  { className: 'dk-muted', style: { padding: '20px 0', textAlign: 'center' } },
-                  t('selectAgentPrompt'),
-                )
-              : historyLoading
-                ? h(
-                    'div',
-                    { className: 'dk-muted', style: { padding: '20px 0', textAlign: 'center' } },
-                    t('loadingHistory'),
-                  )
-                : historyError
-                  ? h(
+                  { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+                  state.mcp.localSessions.map((item) =>
+                    h(
                       'div',
-                      { className: 'dk-errbox' },
-                      h('div', { style: { fontWeight: 600 } }, t('historyErrorTitle')),
+                      {
+                        key: item.sessionId,
+                        className: 'dk-subbox',
+                        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' },
+                      },
                       h(
                         'div',
-                        { className: 'dk-mono', style: { fontSize: '12px', wordBreak: 'break-word' } },
-                        historyError,
+                        { style: { minWidth: 0 } },
+                        h('div', { style: { fontWeight: 500 } }, item.title ?? item.sessionId),
+                        h('div', { className: 'dk-muted dk-mono' }, item.sessionId),
                       ),
                       h(
-                        'div',
-                        null,
-                        h(
-                          'button',
-                          { className: 'dk-btn dk-btn-primary', onClick: () => void loadHistory(history) },
-                          t('retry'),
-                        ),
-                      ),
-                    )
-                  : visibleHistory.length === 0
-                    ? h(
-                        'div',
-                        { className: 'dk-muted', style: { padding: '20px 0', textAlign: 'center' } },
-                        t('noHistory'),
-                      )
-                    : h(
-                        'div',
-                        null,
-                        visibleHistory.map((item) =>
-                          h(
-                            'div',
-                            { key: item.id, className: 'dk-list-row' },
-                            h(
-                              'div',
-                              { style: { minWidth: 0 } },
-                              h('div', { style: { fontWeight: 500 } }, item.title ?? item.id),
-                              h('div', { className: 'dk-muted dk-mono' }, item.id),
-                            ),
-                            h(
-                              'div',
-                              { style: { display: 'flex', gap: '8px', flexShrink: 0 } },
-                              h(
-                                'button',
-                                {
-                                  className: 'dk-btn dk-btn-primary',
-                                  onClick: () => startChatWith(history, item.id, item.title ?? ''),
-                                },
-                                t('resumeInPanel'),
-                              ),
-                              h(
-                                'button',
-                                { className: 'dk-btn-link', onClick: () => copyContinue(historyAgent, item.id) },
-                                t('continuePrompt'),
-                              ),
-                            ),
-                          ),
-                        ),
-                        !q && filteredHistory.length > visibleHistory.length
-                          ? h(
-                              'button',
-                              {
-                                className: 'dk-btn-link',
-                                style: { display: 'block', margin: '10px auto 0' },
-                                onClick: () => setHistoryLimit((n) => n + 6),
-                              },
-                              `${t('loadMore')} (${filteredHistory.length - visibleHistory.length})`,
-                            )
-                          : null,
-                      ),
-          ),
-          h(
-            'div',
-            { className: 'dk-card' },
-            h(
-              'div',
-              { className: 'dk-card-head' },
-              h(
-                'div',
-                null,
-                h('div', { className: 'dk-card-title' }, t('shareHeading')),
-                h('div', { className: 'dk-muted' }, t('shareSub')),
-              ),
-              state?.mcp.enabled ? h('button', { className: 'dk-capsule', onClick: copyYaml }, t('copyYaml')) : null,
-            ),
-            !state?.mcp.enabled
-              ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('mcpDisabled'))
-              : state.mcp.localSessions.length === 0
-                ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('noLocalSessions'))
-                : h(
-                    'div',
-                    { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
-                    state.mcp.localSessions.map((item) =>
-                      h(
-                        'div',
+                        'button',
                         {
-                          key: item.sessionId,
-                          className: 'dk-subbox',
-                          style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' },
+                          className: item.shared ? 'dk-pill-ok' : 'dk-pill-off',
+                          style: { cursor: 'pointer' },
+                          onClick: () => void toggleShare(item.sessionId, !item.shared),
                         },
-                        h(
-                          'div',
-                          { style: { minWidth: 0 } },
-                          h('div', { style: { fontWeight: 500 } }, item.title ?? item.sessionId),
-                          h('div', { className: 'dk-muted dk-mono' }, item.sessionId),
-                        ),
-                        h(
-                          'button',
-                          {
-                            className: item.shared ? 'dk-pill-ok' : 'dk-pill-off',
-                            style: { cursor: 'pointer' },
-                            onClick: () => void toggleShare(item.sessionId, !item.shared),
-                          },
-                          item.shared ? t('sharedOn') : t('sharedOff'),
-                        ),
+                        item.shared ? t('sharedOn') : t('sharedOff'),
                       ),
                     ),
                   ),
-          ),
+                ),
         ),
         form
           ? h(
@@ -1737,7 +2039,8 @@ export function apply(ctx: ClientContext): void {
   ctx.effect?.(() => injectStyles(), 'dsh-knot: styles');
   ctx.effect?.(() => locale?.register?.(NS, DICTS), 'dsh-knot: locale');
   const t = locale?.bind?.(NS) ?? ((key: string) => DICTS['zh-CN']?.[key] ?? key);
-  const Dashboard = makeDashboard(React, ctx);
+  const primitives = require('@deepseek-ai/dsh-client-ui-primitives') as ChatPrimitives;
+  const Dashboard = makeDashboard(React, ctx, primitives);
   const Icon = makeIcon(React);
 
   ctx.effect?.(

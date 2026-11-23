@@ -1,12 +1,23 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
-import type { AgentAdapter, AgentConfig, AgentConnectionState, AgentJob, DoctorStep, PluginConfig } from './types.js';
+import type {
+  AgentAdapter,
+  AgentConfig,
+  AgentConnectionState,
+  AgentEvent,
+  AgentJob,
+  AgentPromptOptions,
+  AgentToolActivity,
+  DoctorStep,
+  PluginConfig,
+} from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 const MAX_JOBS = 200;
+const MAX_JOB_TOOLS = 50;
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -15,7 +26,7 @@ export class AgentManager {
   private readonly jobs = new Map<string, AgentJob>();
   private readonly jobOwners = new Map<
     string,
-    { adapter: AgentAdapter; exclusive: boolean; cancelling?: Promise<void> }
+    { adapter: AgentAdapter; exclusive: boolean; submission?: string; cancelling?: Promise<void> }
   >();
   private readonly configRevisions = new WeakMap<AgentConfig, string>();
   private readonly completions = new Map<string, Promise<AgentJob>>();
@@ -65,6 +76,7 @@ export class AgentManager {
       revision: string;
       hasToken: boolean;
       supportsRespond: boolean;
+      supportsSessionMessages: boolean;
       connection: AgentConnectionState;
     }
   > {
@@ -82,6 +94,7 @@ export class AgentManager {
       revision: this.configRevision(config),
       hasToken: Boolean(secret(config)),
       supportsRespond: typeof this.adapters.get(config.id)?.respond === 'function',
+      supportsSessionMessages: typeof this.adapters.get(config.id)?.getSessionMessages === 'function',
       connection: this.connectionStates.get(config.id) ?? { status: 'unverified' },
     }));
   }
@@ -161,14 +174,28 @@ export class AgentManager {
     sessionId: string | undefined,
     onDone?: (job: AgentJob) => void,
     exclusiveSession = false,
+    clientMessageId?: string,
   ): AgentJob {
     if (this.reconfiguring.has(agentId)) {
       throw new Error(`Agent "${agentId}" is currently being reconfigured or removed`);
     }
     const adapter = this.adapter(agentId);
+    const id = clientMessageId ? `chat-${clientMessageId}` : randomUUID();
+    const submission = clientMessageId
+      ? createHash('sha256')
+          .update(JSON.stringify([agentId, sessionId, text]))
+          .digest('hex')
+      : undefined;
+    const existing = this.jobs.get(id);
+    if (existing) {
+      const owner = this.jobOwners.get(id);
+      if (owner?.adapter === adapter && owner.submission === submission) return existing;
+      throw new Error('This message submission already belongs to a different conversation or gateway');
+    }
     const config = this.configs.find((item) => item.id === agentId)!;
     const remoteSession =
-      sessionId ?? (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config));
+      sessionId ??
+      (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config, clientMessageId));
     if (remoteSession) {
       const exclusive = exclusiveSession || adapter.kind === 'acp';
       const existingJob = [...this.jobs.values()].find((job) => {
@@ -182,6 +209,7 @@ export class AgentManager {
             job.status === 'running' ||
             this.completions.has(job.id) ||
             owner.cancelling !== undefined ||
+            job.remoteStop !== undefined ||
             (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))
         );
       });
@@ -193,7 +221,6 @@ export class AgentManager {
     }
     this.evictFinishedJobs();
     if (this.jobs.size >= MAX_JOBS) throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
-    const id = randomUUID();
     const job: AgentJob = {
       id,
       agentId,
@@ -205,9 +232,10 @@ export class AgentManager {
       text: '',
     };
     this.jobs.set(id, job);
-    this.jobOwners.set(id, { adapter, exclusive: exclusiveSession });
+    this.jobOwners.set(id, { adapter, exclusive: exclusiveSession, submission });
     if (remoteSession) this.latestSessionJob.set(sessionKey(agentId, remoteSession), id);
-    const completion = this.run(job, adapter, text, remoteSession, onDone);
+    const options = clientMessageId ? { idempotencyKey: `dsh-knot:${clientMessageId}` } : undefined;
+    const completion = this.run(job, adapter, text, remoteSession, onDone, options);
     this.completions.set(id, completion);
     completion
       .finally(() => {
@@ -222,6 +250,12 @@ export class AgentManager {
     const job = this.jobs.get(id);
     if (!job) throw new Error(`Unknown job "${id}"`);
     return job;
+  }
+
+  getCurrentJob(agentId: string, id: string): AgentJob | undefined {
+    const job = this.jobs.get(id);
+    const owner = this.jobOwners.get(id);
+    return job?.agentId === agentId && owner && owner.adapter === this.adapters.get(agentId) ? job : undefined;
   }
 
   listJobs({ currentOnly = false } = {}): AgentJob[] {
@@ -290,6 +324,9 @@ export class AgentManager {
       );
     }
     const adapter = this.adapter(job.agentId);
+    if (this.jobOwners.get(id)?.adapter !== adapter) {
+      throw new Error(`Cannot answer job ${id}: agent "${job.agentId}" has been reconfigured or removed`);
+    }
     if (!adapter.respond) throw new Error(`${job.agentId} does not support approval responses through this adapter`);
     await adapter.respond(job.sessionId!, pending.requestId, choice, signal);
     if (job.pendingApproval?.requestId === pending.requestId) {
@@ -312,11 +349,18 @@ export class AgentManager {
       const deadline = AbortSignal.timeout(5_000);
       const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       stopSignal.throwIfAborted();
+      const reportStop = owner.exclusive && owner.adapter.kind === 'hermes';
+      if (reportStop) job.remoteStop = 'pending';
       owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
       try {
         await owner.cancelling;
+        delete job.remoteStop;
+      } catch (error) {
+        if (reportStop) job.remoteStop = 'unconfirmed';
+        throw error;
       } finally {
         delete owner.cancelling;
+        job.updatedAt = Date.now();
       }
     }
     if (this.jobs.has(job.id)) this.remoteCancelled.add(job.id);
@@ -408,6 +452,7 @@ export class AgentManager {
     text: string,
     sessionId: string | undefined,
     onDone?: (job: AgentJob) => void,
+    options?: AgentPromptOptions,
   ): Promise<AgentJob> {
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
@@ -424,7 +469,7 @@ export class AgentManager {
     job.status = 'running';
     job.updatedAt = Date.now();
     try {
-      for await (const event of adapter.prompt(sessionId, text, controller.signal)) {
+      for await (const event of adapter.prompt(sessionId, text, controller.signal, options)) {
         if (event.sessionId) {
           job.sessionId = event.sessionId;
           const key = sessionKey(job.agentId, event.sessionId);
@@ -433,6 +478,7 @@ export class AgentManager {
           }
         }
         if (event.type === 'text' && event.text) job.text = (job.text + event.text).slice(-2_000_000);
+        else if (event.type === 'tool' && event.phase) recordToolActivity(job, event);
         else if (event.type === 'approval') {
           job.pendingApproval = { requestId: event.requestId ?? '', choices: event.choices ?? [], text: event.text };
         } else if (event.type === 'error') throw new Error(event.text ?? 'remote agent failed');
@@ -455,6 +501,9 @@ export class AgentManager {
       job.error = error instanceof Error ? error.message : String(error);
     } finally {
       clearTimeout(timer);
+      if (job.tools?.some((tool) => tool.status === 'running')) {
+        job.tools = job.tools.map((tool) => (tool.status === 'running' ? { ...tool, status: 'interrupted' } : tool));
+      }
       job.updatedAt = Date.now();
       if (onDone) {
         try {
@@ -466,6 +515,27 @@ export class AgentManager {
     }
     return job;
   }
+}
+
+function recordToolActivity(job: AgentJob, event: AgentEvent): void {
+  const tools = job.tools ?? [];
+  const name = event.name?.trim().slice(0, 120);
+  const callId = event.requestId ? createHash('sha256').update(event.requestId).digest('hex') : undefined;
+  const index = callId
+    ? tools.findIndex((tool) => tool.id === callId)
+    : event.phase === 'end'
+      ? tools.findIndex((tool) => tool.status === 'running' && tool.name === (name || 'tool'))
+      : -1;
+  const previous = tools[index];
+  if (previous && event.phase === 'start') return;
+  const activity: AgentToolActivity = {
+    id: previous?.id ?? callId ?? randomUUID(),
+    name: name || previous?.name || 'tool',
+    status: event.phase === 'start' ? 'running' : event.failed ? 'failed' : 'completed',
+  };
+  job.tools = previous
+    ? tools.map((tool, i) => (i === index ? activity : tool))
+    : [...tools.slice(-(MAX_JOB_TOOLS - 1)), activity];
 }
 
 function sessionKey(agentId: string, sessionId: string): string {

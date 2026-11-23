@@ -128,6 +128,7 @@ describe('AgentManager', () => {
     await manager.wait(job.id);
     const retry = manager.cancel(job.id);
     expect(() => manager.start(config.id, 'tool turn', 'shared')).toThrow(/active or cancelling job/);
+    expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBe('pending');
     expect(cancellations).toBe(1);
     const replacing = manager.upsert({ ...config, port: 443 });
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -138,6 +139,32 @@ describe('AgentManager', () => {
       await Promise.all([cancelling, retry, replacing]);
     }
     expect(closed).toBe(true);
+    await manager.close();
+  });
+
+  it('keeps an exclusive Hermes session locked until a remote stop retry succeeds', async () => {
+    class RunningAdapter extends FakeAdapter {
+      override async *prompt(
+        _session: string | undefined,
+        _text?: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'partial reply' };
+        signal?.throwIfAborted();
+        await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+      }
+    }
+    const adapter = new RunningAdapter(config.id);
+    vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('Hermes remote stop is unconfirmed'));
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    const job = manager.start(config.id, 'Hello', 'shared', undefined, true);
+    await vi.waitFor(() => expect(job.text).toBe('partial reply'));
+    await expect(manager.cancel(job.id)).rejects.toThrow('remote stop is unconfirmed');
+    await manager.wait(job.id);
+    expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBe('unconfirmed');
+    expect(() => manager.start(config.id, 'Next turn', 'shared', undefined, true)).toThrow(/active or cancelling job/);
+    expect(await manager.cancel(job.id)).toMatchObject({ status: 'cancelled', text: 'partial reply' });
+    expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBeUndefined();
     await manager.close();
   });
 
@@ -157,6 +184,40 @@ describe('AgentManager', () => {
     await expect(manager.respond(job.id, 'bogus-choice', undefined, 'r1')).rejects.toThrow(/Invalid approval choice/);
     await manager.respond(job.id, 'once', undefined, 'r1');
     expect(manager.get(job.id).pendingApproval).toBeUndefined();
+  });
+
+  it('keeps tool activity for the current turn without exposing tool payloads', async () => {
+    let finish!: () => void;
+    const finishTurn = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    class ToolAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'tool', requestId: 'a', phase: 'start', name: 'read_file', text: 'private tool arguments' };
+        yield { type: 'tool', requestId: 'b', phase: 'start', name: 'read_file' };
+        yield { type: 'tool', requestId: 'c', phase: 'start', name: 'terminal' };
+        await finishTurn;
+        yield { type: 'tool', requestId: 'b', phase: 'end', failed: true };
+        yield { type: 'tool', requestId: 'a', phase: 'end' };
+        yield { type: 'final', text: 'Done' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new ToolAdapter(config.id));
+    const job = manager.start(config.id, 'run', undefined);
+    try {
+      await vi.waitFor(() => expect(manager.getCurrentJob(config.id, job.id)?.tools).toHaveLength(3));
+      expect(job.tools?.map(({ status }) => status)).toEqual(['running', 'running', 'running']);
+    } finally {
+      finish();
+    }
+    const completed = await manager.wait(job.id);
+    expect(completed.tools?.map(({ name, status }) => [name, status])).toEqual([
+      ['read_file', 'completed'],
+      ['read_file', 'failed'],
+      ['terminal', 'interrupted'],
+    ]);
+    expect(JSON.stringify(completed.tools)).not.toContain('private tool arguments');
+    await manager.close();
   });
 
   it('retries remote cancellation after a gateway failure', async () => {

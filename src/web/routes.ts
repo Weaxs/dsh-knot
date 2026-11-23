@@ -24,9 +24,11 @@ export const WEB_ROUTES = {
   state: '/api/dsh-knot/state',
   doctor: '/api/dsh-knot/doctor',
   ask: '/api/dsh-knot/ask',
+  job: '/api/dsh-knot/job',
   respond: '/api/dsh-knot/respond',
   cancel: '/api/dsh-knot/cancel',
   sessions: '/api/dsh-knot/sessions',
+  sessionMessages: '/api/dsh-knot/session-messages',
   mcpShare: '/api/dsh-knot/mcp-share',
   agentSave: '/api/dsh-knot/agent-save',
   agentDelete: '/api/dsh-knot/agent-delete',
@@ -167,8 +169,29 @@ export function registerWebRoutes(
         if (!message) return errorReply('message is required', 400);
         if (typeof body.revision !== 'string') return errorReply('revision is required', 400);
         if (!manager.matchesRevision(agentId, body.revision)) return staleGateway();
-        const job = manager.start(agentId, message, sessionId, undefined, true);
+        const clientMessageId = body.clientMessageId;
+        if (
+          clientMessageId !== undefined &&
+          (typeof clientMessageId !== 'string' || !/^[A-Za-z0-9_-]{16,100}$/.test(clientMessageId))
+        ) {
+          return errorReply('Invalid clientMessageId', 400);
+        }
+        const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
         return jsonReply({ ok: true, value: redact(job) });
+      } catch (error) {
+        return errorReply(error instanceof Error ? error.message : String(error), 400);
+      }
+    });
+
+    register(WEB_ROUTES.job, async (request) => {
+      try {
+        const { agentId, revision, jobId } = await parseBody(request);
+        if (typeof agentId !== 'string' || typeof revision !== 'string' || typeof jobId !== 'string' || !jobId) {
+          return errorReply('agentId, revision, and jobId are required', 400);
+        }
+        if (!manager.matchesRevision(agentId, revision)) return staleGateway();
+        const job = manager.getCurrentJob(agentId, jobId);
+        return job ? jsonReply({ ok: true, value: redact(job) }) : errorReply('Job not found for this gateway', 404);
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -214,6 +237,31 @@ export function registerWebRoutes(
         return jsonReply({ ok: true, value: { agentId, sessions: redact(items.slice(0, 100)) } });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
+      }
+    });
+
+    register(WEB_ROUTES.sessionMessages, async (request) => {
+      try {
+        const { agentId, revision, sessionId } = await parseBody(request);
+        if (
+          typeof agentId !== 'string' ||
+          typeof revision !== 'string' ||
+          typeof sessionId !== 'string' ||
+          !sessionId.trim() ||
+          sessionId.length > 512
+        ) {
+          return errorReply('agentId, revision, and a valid sessionId are required', 400);
+        }
+        if (!manager.matchesRevision(agentId, revision)) return staleGateway();
+        const adapter = manager.adapter(agentId);
+        if (!adapter.getSessionMessages) return errorReply('This gateway does not provide message history', 501);
+        const timeoutMs = manager.getConfig(agentId)?.connectTimeoutMs ?? 15_000;
+        const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
+        const messages = await adapter.getSessionMessages(sessionId, signal);
+        if (!manager.matchesRevision(agentId, revision)) return staleGateway();
+        return jsonReply({ ok: true, value: { messages: redact(messages) } });
+      } catch (error) {
+        return errorReply(redact(error instanceof Error ? error.message : String(error)), 400);
       }
     });
 

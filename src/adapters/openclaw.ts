@@ -148,6 +148,19 @@ export class OpenClawAdapter implements AgentAdapter {
         const eventName = String(payload.event ?? payload.type ?? frame.event ?? '');
         const nested =
           payload.data && typeof payload.data === 'object' ? (payload.data as Record<string, unknown>) : undefined;
+        if (frame.event === 'agent' && payload.stream === 'tool') {
+          if (eventRun === runId && nested && (nested.phase === 'start' || nested.phase === 'result')) {
+            const requestId = nested.toolCallId;
+            yield {
+              type: 'tool',
+              phase: nested.phase === 'result' ? 'end' : 'start',
+              name: typeof nested.name === 'string' && nested.name ? nested.name : 'tool',
+              ...(typeof requestId === 'string' && requestId ? { requestId } : {}),
+              ...(nested.phase === 'result' && nested.isError === true ? { failed: true } : {}),
+            };
+          }
+          continue;
+        }
         const delta = textOf(
           payload.delta ??
             payload.textDelta ??
@@ -256,6 +269,7 @@ export class OpenClawAdapter implements AgentAdapter {
       minProtocol: 4,
       maxProtocol: 4,
       client: { id: 'cli', version: VERSION, platform: process.platform, mode: 'cli' },
+      caps: ['tool-events'],
       role: 'operator',
       scopes: ['operator.admin', 'operator.read', 'operator.write', 'operator.approvals', 'operator.pairing'],
       auth: { token },

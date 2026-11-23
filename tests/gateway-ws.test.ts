@@ -37,6 +37,7 @@ describe('OpenClaw WebSocket wire protocol', () => {
           expect(frame.params.device.nonce).toBe('wire-nonce');
           expect(frame.params.device.signature).not.toBe('');
           expect(frame.params.device.signedAt).toBe(1737264000000);
+          expect(frame.params.caps).toContain('tool-events');
           socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: { type: 'hello-ok' } }));
         } else if (frame.method === 'health') {
           socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: { ok: true } }));
@@ -60,6 +61,19 @@ describe('OpenClaw WebSocket wire protocol', () => {
               payload: { runId: 'run-wire', type: 'message.delta', delta: 'wire ' },
             }),
           );
+          for (const phase of ['start', 'result']) {
+            socket.send(
+              JSON.stringify({
+                type: 'event',
+                event: 'agent',
+                payload: {
+                  runId: 'run-wire',
+                  stream: 'tool',
+                  data: { phase, name: 'search', toolCallId: 'tool-wire', isError: phase === 'result' },
+                },
+              }),
+            );
+          }
         } else if (frame.method === 'agent.wait') {
           socket.send(
             JSON.stringify({
@@ -84,6 +98,10 @@ describe('OpenClaw WebSocket wire protocol', () => {
     expect(await adapter.health()).toEqual({ ok: true });
     const events = [];
     for await (const event of adapter.prompt('agent:main:wire', 'hello')) events.push(event);
+    expect(events.filter((event) => event.type === 'tool')).toEqual([
+      { type: 'tool', phase: 'start', name: 'search', requestId: 'tool-wire' },
+      { type: 'tool', phase: 'end', name: 'search', requestId: 'tool-wire', failed: true },
+    ]);
     expect(events.at(-1)).toMatchObject({ type: 'final', text: 'wire result' });
     expect(received.some((frame) => frame.method === 'agent' && frame.params.idempotencyKey)).toBe(true);
     await adapter.close();

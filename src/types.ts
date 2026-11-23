@@ -62,6 +62,7 @@ export interface AgentEvent {
   text?: string;
   name?: string;
   phase?: 'start' | 'end';
+  failed?: boolean;
   requestId?: string;
   choices?: string[];
   stopReason?: string;
@@ -75,12 +76,28 @@ export interface AgentSession {
   updatedAt?: string | number;
 }
 
+export interface AgentTranscriptMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export interface AgentPromptOptions {
+  idempotencyKey?: string;
+}
+
 export interface AgentAdapter {
   readonly id: string;
   readonly kind: AgentKind;
   health(signal?: AbortSignal): Promise<Record<string, unknown>>;
   listSessions(signal?: AbortSignal): Promise<AgentSession[]>;
-  prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent>;
+  getSessionMessages?(sessionId: string, signal?: AbortSignal): Promise<AgentTranscriptMessage[]>;
+  prompt(
+    sessionId: string | undefined,
+    text: string,
+    signal?: AbortSignal,
+    options?: AgentPromptOptions,
+  ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
@@ -112,6 +129,12 @@ export interface Transport {
 
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
+export interface AgentToolActivity {
+  id: string;
+  name: string;
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
+}
+
 export interface AgentJob {
   id: string;
   agentId: string;
@@ -121,6 +144,8 @@ export interface AgentJob {
   createdAt: number;
   updatedAt: number;
   text: string;
+  tools?: AgentToolActivity[];
   error?: string;
+  remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
 }
