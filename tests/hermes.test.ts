@@ -190,16 +190,49 @@ describe('Hermes API Server adapter', () => {
     ]);
   });
 
-  it('uses the same submission key for an exact retry', async () => {
-    const transport = new FakeTransport();
+  it('recovers a finished run when the same submission key replays without an event stream', async () => {
+    class ReplayTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        if (this.requests.filter((request) => request.path === '/v1/runs').length > 1) {
+          throw new Error('HTTP 404: run event stream expired');
+        }
+        return super.stream();
+      }
+    }
+    const transport = new ReplayTransport();
     const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
     const options = { idempotencyKey: 'submission-1' };
     for await (const _ of adapter.prompt('session-1', 'task', undefined, options)) void _;
-    for await (const _ of adapter.prompt('session-1', 'task', undefined, options)) void _;
+    const replay = [];
+    for await (const event of adapter.prompt('session-1', 'task', undefined, options)) replay.push(event);
+    expect(replay).toEqual([{ type: 'final', text: 'done', stopReason: 'completed' }]);
     expect(transport.requests.filter((request) => request.path === '/v1/runs')).toEqual([
       expect.objectContaining({ headers: { 'Idempotency-Key': 'submission-1' } }),
       expect.objectContaining({ headers: { 'Idempotency-Key': 'submission-1' } }),
     ]);
+  });
+
+  it.each(['running', 'unavailable'])('preserves the stream error if run status is %s', async (status) => {
+    const streamError = new Error('HTTP 404: run event stream expired');
+    class MissingStreamTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        throw streamError;
+      }
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1') {
+          if (status === 'unavailable') throw new Error('HTTP 404: run not found');
+          return { status: 200, headers: {}, text: JSON.stringify({ status }) };
+        }
+        return super.request(request);
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new MissingStreamTransport(),
+    );
+    const events = adapter.prompt('session-1', 'task')[Symbol.asyncIterator]();
+    await expect(events.next()).rejects.toBe(streamError);
   });
 
   it('supports cancellation and approvals', async () => {

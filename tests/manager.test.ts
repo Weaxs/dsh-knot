@@ -4,9 +4,11 @@ import { AgentManager } from '../src/manager.js';
 import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
 
 class FakeAdapter implements AgentAdapter {
-  readonly kind = 'hermes' as const;
   cancelled = false;
-  constructor(readonly id: string) {}
+  constructor(
+    readonly id: string,
+    readonly kind: AgentAdapter['kind'] = 'hermes',
+  ) {}
   async health() {
     return { ok: true };
   }
@@ -29,6 +31,18 @@ class FakeAdapter implements AgentAdapter {
 }
 
 const config: AgentConfig = { id: 'remote', kind: 'hermes', transport: 'local' };
+
+class RunningAdapter extends FakeAdapter {
+  override async *prompt(
+    _session: string | undefined,
+    _text?: string,
+    signal?: AbortSignal,
+  ): AsyncIterable<AgentEvent> {
+    yield { type: 'text', text: 'partial reply' };
+    signal?.throwIfAborted();
+    await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+  }
+}
 
 describe('AgentManager', () => {
   it('does not apply a doctor result from an agent replaced during the check', async () => {
@@ -142,48 +156,119 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
-  it('keeps an exclusive Hermes session locked until a remote stop retry succeeds', async () => {
-    class RunningAdapter extends FakeAdapter {
-      override async *prompt(
-        _session: string | undefined,
-        _text?: string,
-        signal?: AbortSignal,
-      ): AsyncIterable<AgentEvent> {
-        yield { type: 'text', text: 'partial reply' };
-        signal?.throwIfAborted();
-        await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
-      }
-    }
+  it('leaves a running job alone when the Stop request was already aborted', async () => {
     const adapter = new RunningAdapter(config.id);
-    vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('Hermes remote stop is unconfirmed'));
+    const cancel = vi.spyOn(adapter, 'cancel');
     const manager = new AgentManager([config], 10_000, () => adapter);
     const job = manager.start(config.id, 'Hello', 'shared', undefined, true);
-    await vi.waitFor(() => expect(job.text).toBe('partial reply'));
-    await expect(manager.cancel(job.id)).rejects.toThrow('remote stop is unconfirmed');
-    await manager.wait(job.id);
-    expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBe('unconfirmed');
+    const reason = new Error('stop request disconnected');
+    await expect(manager.cancel(job.id, AbortSignal.abort(reason))).rejects.toBe(reason);
+    expect(job.status).toBe('running');
+    expect(job.remoteStop).toBeUndefined();
+    expect(cancel).not.toHaveBeenCalled();
     expect(() => manager.start(config.id, 'Next turn', 'shared', undefined, true)).toThrow(/active or cancelling job/);
-    expect(await manager.cancel(job.id)).toMatchObject({ status: 'cancelled', text: 'partial reply' });
-    expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBeUndefined();
+    await manager.cancel(job.id);
+    expect(cancel).toHaveBeenCalledOnce();
+    await manager.wait(job.id);
+    await manager.close();
+  });
+
+  it.each(['hermes', 'acp', 'openclaw'] as const)(
+    'keeps an exclusive %s session locked until a remote stop retry succeeds',
+    async (kind) => {
+      const adapter = new RunningAdapter(config.id, kind);
+      vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('remote stop failed'));
+      const manager = new AgentManager([{ ...config, kind }], 10_000, () => adapter);
+      const job = manager.start(config.id, 'Hello', 'shared', undefined, true);
+      await vi.waitFor(() => expect(job.text).toBe('partial reply'));
+      await expect(manager.cancel(job.id)).rejects.toThrow('remote stop failed');
+      await manager.wait(job.id);
+      expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBe('unconfirmed');
+      expect(() => manager.start(config.id, 'Next turn', 'shared', undefined, true)).toThrow(
+        /active or cancelling job/,
+      );
+      expect(await manager.cancel(job.id)).toMatchObject({ status: 'cancelled', text: 'partial reply' });
+      expect(manager.getCurrentJob(config.id, job.id)?.remoteStop).toBeUndefined();
+      await manager.close();
+    },
+  );
+
+  it('retains a timed-out job when a synchronous Stop failure leaves the session locked', async () => {
+    class TimedApprovalAdapter extends RunningAdapter {
+      override async *prompt(
+        sessionId: string | undefined,
+        text: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        yield { type: 'approval', requestId: 'waiting', choices: ['once'] };
+        yield* super.prompt(sessionId, text, signal);
+      }
+    }
+    const adapter = new TimedApprovalAdapter(config.id);
+    const cancel = vi.spyOn(adapter, 'cancel').mockImplementationOnce(() => {
+      throw new Error('cannot stop the run');
+    });
+    const respond = vi.spyOn(adapter, 'respond');
+    const other = { ...config, id: 'other' };
+    const manager = new AgentManager([config, other], 20, (entry) =>
+      entry === config ? adapter : new FakeAdapter(entry.id),
+    );
+    const job = manager.start(config.id, 'Timeout', 'shared', undefined, true);
+    await manager.wait(job.id);
+    await vi.waitFor(() => expect(job.remoteStop).toBe('unconfirmed'));
+    expect(job.status).toBe('cancelled');
+    expect(job.pendingApproval).toBeUndefined();
+    await expect(manager.respond(job.id, 'once', undefined, 'waiting')).rejects.toThrow(/no pending approval/);
+    expect(respond).not.toHaveBeenCalled();
+
+    for (let index = 0; index < 200; index++) {
+      await manager.wait(manager.start(other.id, 'Short turn', undefined).id);
+    }
+    expect(manager.listJobs()).toHaveLength(200);
+    expect(manager.getCurrentJob(config.id, job.id)).toBe(job);
+    expect(() => manager.start(config.id, 'Next turn', 'shared', undefined, true)).toThrow(/active or cancelling job/);
+    await manager.cancel(job.id);
+    expect(cancel).toHaveBeenCalledTimes(2);
+    expect(job.remoteStop).toBeUndefined();
+    await manager.wait(manager.start(other.id, 'Free a confirmed job slot', undefined).id);
+    expect(manager.getCurrentJob(config.id, job.id)).toBeUndefined();
     await manager.close();
   });
 
   it('tracks jobs, approvals and completion notifications', async () => {
-    const adapter = new FakeAdapter('remote');
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    class ApprovalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'part ' };
+        yield { type: 'approval', requestId: 'r1', choices: ['once', 'deny'], text: 'Run bash?' };
+        await finished;
+        yield { type: 'final', text: 'part done' };
+      }
+    }
+    const adapter = new ApprovalAdapter(config.id);
     const manager = new AgentManager([config], 10_000, () => adapter);
     let notified = false;
     const job = manager.start('remote', 'work', undefined, () => {
       notified = true;
     });
-    expect(job.sessionId).toMatch(/^dsh_/);
+    try {
+      expect(job.sessionId).toMatch(/^dsh_/);
+      await vi.waitFor(() => expect(job.pendingApproval?.requestId).toBe('r1'));
+      await expect(manager.respond(job.id, 'once', undefined, 'wrong-request')).rejects.toThrow(/no longer pending/);
+      await expect(manager.respond(job.id, 'bogus-choice', undefined, 'r1')).rejects.toThrow(/Invalid approval choice/);
+      await manager.respond(job.id, 'once', undefined, 'r1');
+      expect(job.pendingApproval).toBeUndefined();
+    } finally {
+      finish();
+    }
     const completed = await manager.wait(job.id);
     expect(completed.status).toBe('completed');
     expect(completed.text).toBe('part done');
     expect(notified).toBe(true);
-    await expect(manager.respond(job.id, 'once', undefined, 'wrong-request')).rejects.toThrow(/no longer pending/);
-    await expect(manager.respond(job.id, 'bogus-choice', undefined, 'r1')).rejects.toThrow(/Invalid approval choice/);
-    await manager.respond(job.id, 'once', undefined, 'r1');
-    expect(manager.get(job.id).pendingApproval).toBeUndefined();
+    await manager.close();
   });
 
   it('keeps bounded thoughts and tool activity separate from the reply', async () => {
@@ -203,10 +288,11 @@ describe('AgentManager', () => {
           text: 'private tool arguments',
           inputPreview: 'README.md',
         };
-        yield { type: 'tool', requestId: 'b', phase: 'start', name: 'read_file' };
-        yield { type: 'tool', requestId: 'b', phase: 'start', inputPreview: 'MISSING.md' };
+        yield { type: 'tool', requestId: 'b', phase: 'pending', name: 'read_file' };
+        yield { type: 'tool', requestId: 'b', inputPreview: 'MISSING.md' };
         yield { type: 'tool', requestId: 'c', phase: 'start', name: 'terminal' };
         await finishTurn;
+        yield { type: 'tool', requestId: 'b', phase: 'start' };
         yield { type: 'tool', requestId: 'b', phase: 'end', failed: true };
         yield { type: 'tool', requestId: 'b', phase: 'start', inputPreview: 'MISSING.md' };
         yield { type: 'tool', requestId: 'a', phase: 'end' };
@@ -217,7 +303,7 @@ describe('AgentManager', () => {
     const job = manager.start(config.id, 'run', undefined);
     try {
       await vi.waitFor(() => expect(manager.getCurrentJob(config.id, job.id)?.tools).toHaveLength(3));
-      expect(job.tools?.map(({ status }) => status)).toEqual(['running', 'running', 'running']);
+      expect(job.tools?.map(({ status }) => status)).toEqual(['running', 'pending', 'running']);
       expect(job.tools?.[1]?.inputPreview).toBe('MISSING.md');
       expect(job.thought).toHaveLength(16_000);
       expect(job.thought?.endsWith('Check the README first.')).toBe(true);
@@ -310,6 +396,100 @@ describe('AgentManager', () => {
     await responding;
     expect(manager.get(job.id).pendingApproval?.requestId).toBe('r2');
     await manager.wait(job.id);
+  });
+
+  it('keeps simultaneous approvals reachable one at a time', async () => {
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    class ParallelApprovalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'approval', requestId: 'first', choices: ['once'] };
+        yield { type: 'approval', requestId: 'second', choices: ['once'] };
+        await finished;
+        yield { type: 'final', text: 'done' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new ParallelApprovalAdapter(config.id));
+    const job = manager.start(config.id, 'work', 'session');
+    try {
+      await vi.waitFor(() => expect(job.pendingApproval?.requestId).toBe('second'));
+      await manager.respond(job.id, 'once', undefined, 'second');
+      expect(job.pendingApproval?.requestId).toBe('first');
+      await manager.respond(job.id, 'once', undefined, 'first');
+      expect(job.pendingApproval).toBeUndefined();
+    } finally {
+      finish();
+      await manager.wait(job.id);
+      await manager.close();
+    }
+  });
+
+  it('reveals the next approval after the gateway resolves the current one', async () => {
+    let resolveApproval!: () => void;
+    const resolved = new Promise<void>((resolve) => {
+      resolveApproval = resolve;
+    });
+    class ExternalApprovalAdapter extends RunningAdapter {
+      override async *prompt(
+        sessionId: string | undefined,
+        text: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        yield { type: 'approval', requestId: 'first', choices: ['once'] };
+        yield { type: 'approval', requestId: 'second', choices: ['once'] };
+        await resolved;
+        yield { type: 'approval', requestId: 'second', phase: 'end' };
+        yield* super.prompt(sessionId, text, signal);
+      }
+    }
+    const adapter = new ExternalApprovalAdapter(config.id);
+    const respond = vi.spyOn(adapter, 'respond');
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    const job = manager.start(config.id, 'work', 'session');
+    try {
+      await vi.waitFor(() => expect(job.pendingApproval?.requestId).toBe('second'));
+      resolveApproval();
+      await vi.waitFor(() => expect(job.pendingApproval?.requestId).toBe('first'));
+      await expect(manager.respond(job.id, 'once', undefined, 'second')).rejects.toThrow(/no longer pending/);
+      expect(respond).not.toHaveBeenCalled();
+      await manager.respond(job.id, 'once', undefined, 'first');
+      expect(job.pendingApproval).toBeUndefined();
+    } finally {
+      resolveApproval();
+      await manager.cancel(job.id);
+      await manager.wait(job.id);
+      await manager.close();
+    }
+  });
+
+  it('fails the job and retries an unconfirmed remote stop after approval overflow', async () => {
+    class ManyApprovalsAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'partial reply' };
+        for (let index = 0; index < 51; index++) {
+          yield { type: 'approval', requestId: String(index), choices: ['once'] };
+        }
+      }
+    }
+    const adapter = new ManyApprovalsAdapter(config.id);
+    const cancel = vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('cannot stop the run'));
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const job = manager.start(config.id, 'work', 'session', undefined, true);
+      await manager.wait(job.id);
+      expect(job).toMatchObject({ status: 'failed', text: 'partial reply', error: /exceeded 50 pending approvals/ });
+      expect(job.pendingApproval).toBeUndefined();
+      await vi.waitFor(() => expect(job.remoteStop).toBe('unconfirmed'));
+      expect(() => manager.start(config.id, 'next turn', 'session')).toThrow(/active or cancelling job/);
+      await manager.cancel(job.id);
+      expect(cancel).toHaveBeenCalledTimes(2);
+      expect(job.status).toBe('failed');
+      expect(job.remoteStop).toBeUndefined();
+    } finally {
+      await manager.close();
+    }
   });
 
   it('does not remotely cancel a newer job on the same session when an older job times out', async () => {

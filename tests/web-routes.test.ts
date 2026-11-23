@@ -119,6 +119,35 @@ describe('web UI host routes & schemastery Config', () => {
     expect(initial.value.mcp.localSessions[0].shared).toBe(false);
     expect(JSON.stringify(initial)).not.toContain('secret-tok');
 
+    const olderStop = {
+      id: 'unconfirmed-stop',
+      agentId: config.id,
+      sessionId: 'remote-1',
+      status: 'cancelled' as const,
+      remoteStop: 'unconfirmed' as const,
+      createdAt: 1,
+      updatedAt: 1,
+      text: '',
+    };
+    const jobList = vi.spyOn(manager, 'listJobs').mockReturnValue([
+      ...Array.from({ length: 50 }, (_, index) => ({
+        id: `recent-${index}`,
+        agentId: config.id,
+        status: 'completed' as const,
+        createdAt: 2,
+        updatedAt: 2,
+        text: 'finished',
+      })),
+      olderStop,
+    ]);
+    try {
+      const state = await post(WEB_ROUTES.state);
+      expect(state.value.jobs).toHaveLength(50);
+      expect(state.value.jobs[0]).toEqual(olderStop);
+    } finally {
+      jobList.mockRestore();
+    }
+
     const toggled = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggled.ok).toBe(true);
     expect(toggled.value.allowSessions).toEqual(['local-1']);

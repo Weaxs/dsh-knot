@@ -25,8 +25,13 @@ class FakeNativeAdapter implements AgentAdapter {
     this.prompts.push({ sessionId: sessionId ?? '', text });
     yield { type: 'text', text: 'hello ' };
     yield { type: 'thought', text: 'Checking tool availability' };
+    yield { type: 'tool', phase: 'pending', requestId: 'tool-1', name: 'test-tool' };
     yield { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'test-tool', inputPreview: 'README.md' };
     yield { type: 'tool', phase: 'end', requestId: 'tool-1', name: 'test-tool', failed: true };
+    for (let count = 0; count < 2; count++) {
+      yield { type: 'tool', phase: 'start', name: 'read_file' };
+      yield { type: 'tool', phase: 'end', name: 'read_file' };
+    }
     yield { type: 'approval', requestId: 'permission-1', choices: ['approve', 'reject'], text: 'Allow the test?' };
     while (!this.choice) await new Promise((resolve) => setTimeout(resolve, 1));
     yield { type: 'text', text: 'world' };
@@ -50,6 +55,40 @@ afterEach(async () => {
 });
 
 describe('ACP provider and bridge', () => {
+  it('shows remote-only approval activity without blocking the bridge on local approval', async () => {
+    const native: AgentAdapter = {
+      id: 'remote-only',
+      kind: 'openclaw',
+      async health() {
+        return { ok: true };
+      },
+      async listSessions() {
+        return [];
+      },
+      async *prompt() {
+        yield { type: 'approval', requestId: 'remote-approval', text: 'Read README.md', choices: [] };
+        yield { type: 'approval', phase: 'end', requestId: 'remote-approval' };
+        yield { type: 'final', text: 'done' };
+      },
+      async cancel() {},
+      async close() {},
+    };
+    const bridge = new AcpBridge({ id: native.id, kind: native.kind }, () => native);
+    const { host, port } = await bridge.start({ port: 0, token: 'acp-test-token' });
+    const adapter = new AcpAdapter('bridge', { id: 'bridge', kind: 'acp', host, port, token: 'acp-test-token' });
+    cleanups.push(async () => {
+      await adapter.close();
+      await bridge.close();
+    });
+    const events = [];
+    for await (const event of adapter.prompt(undefined, 'read', AbortSignal.timeout(1_000))) events.push(event);
+    expect(events.filter((event) => event.type === 'tool' || event.type === 'approval')).toMatchObject([
+      { type: 'tool', phase: 'pending', requestId: 'remote-approval', inputPreview: 'Read README.md' },
+      { type: 'tool', phase: 'end', requestId: 'remote-approval' },
+    ]);
+    expect(events.at(-1)).toMatchObject({ type: 'final', text: 'done' });
+  });
+
   it('uses the exact endpoint and waits for one initialization before allowing concurrent requests', async () => {
     let entered!: () => void;
     let release!: () => void;
@@ -119,11 +158,18 @@ describe('ACP provider and bridge', () => {
     const createdSessionId = first.at(-1)?.sessionId;
     expect(createdSessionId).toBeTruthy();
     expect(first.at(-1)).toMatchObject({ type: 'final', text: 'hello world', stopReason: 'end_turn' });
-    expect(first.filter((event) => event.type === 'thought' || event.type === 'tool')).toMatchObject([
+    const thoughtAndNamedTool = (event: AgentEvent) => event.type === 'thought' || event.requestId === 'tool-1';
+    expect(first.filter(thoughtAndNamedTool)).toMatchObject([
       { type: 'thought', text: 'Checking tool availability', sessionId: createdSessionId },
+      { type: 'tool', phase: 'pending', requestId: 'tool-1', name: 'test-tool' },
       { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'test-tool', inputPreview: 'README.md' },
       { type: 'tool', phase: 'end', requestId: 'tool-1', failed: true },
     ]);
+    const anonymousCalls = first.filter((event) => event.type === 'tool' && event.requestId !== 'tool-1');
+    expect(anonymousCalls.map(({ phase }) => phase)).toEqual(['start', 'end', 'start', 'end']);
+    expect(anonymousCalls[0]?.requestId).toBe(anonymousCalls[1]?.requestId);
+    expect(anonymousCalls[2]?.requestId).toBe(anonymousCalls[3]?.requestId);
+    expect(anonymousCalls[0]?.requestId).not.toBe(anonymousCalls[2]?.requestId);
     expect(native.choice).toBe('approve');
 
     native.choice = undefined;
@@ -161,9 +207,7 @@ describe('ACP provider and bridge', () => {
       resumed.push(event);
       if (event.type === 'approval') await freshAdapter.respond(createdSessionId!, event.requestId!, 'approve');
     }
-    expect(resumed).toEqual(
-      expect.arrayContaining(first.filter((event) => event.type === 'thought' || event.type === 'tool')),
-    );
+    expect(resumed).toEqual(expect.arrayContaining(first.filter(thoughtAndNamedTool)));
     expect(resumed.at(-1)).toMatchObject({ type: 'final', text: 'hello world', sessionId: createdSessionId });
     expect(native.prompts.at(-1)?.sessionId).toBe(createdSessionId);
 
@@ -228,13 +272,14 @@ describe('ACP provider and bridge', () => {
     for await (const event of adapter.prompt(undefined, 'hello')) events.push(event);
     expect(events.filter((event) => event.type === 'thought' || event.type === 'tool')).toMatchObject([
       { type: 'thought', text: 'Looking up a file' },
-      { type: 'tool', phase: 'start', requestId: 'stdio-tool', name: 'read_file' },
+      { type: 'tool', phase: 'pending', requestId: 'stdio-tool', name: undefined, title: 'Reading README.md' },
       {
         type: 'tool',
-        phase: 'start',
+        phase: undefined,
         requestId: 'stdio-tool',
         inputPreview: JSON.stringify({ path: 'README.md', password: '[REDACTED]' }, null, 2),
       },
+      { type: 'tool', phase: 'start', requestId: 'stdio-tool' },
       { type: 'tool', phase: 'end', requestId: 'stdio-tool', failed: true },
     ]);
     expect(events.at(-1)).toMatchObject({

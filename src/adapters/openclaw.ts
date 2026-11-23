@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
@@ -54,6 +55,7 @@ export class OpenClawAdapter implements AgentAdapter {
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
     let output = '';
+    let sessionKey: string | undefined;
     let lastThought: { itemId?: string; snapshot?: string } | undefined;
     try {
       if (sessionId) {
@@ -80,69 +82,54 @@ export class OpenClawAdapter implements AgentAdapter {
         signal,
       );
       const runId = String(started.runId ?? started.run_id ?? started.id ?? '');
-      const sessionKey = String(started.sessionKey ?? started.session_key ?? sessionId ?? '');
       if (!runId) throw new Error(`OpenClaw did not return a run id: ${JSON.stringify(started)}`);
-      const aborted = new Promise<{ kind: 'aborted' }>((resolve) => {
-        if (waitAbort.signal.aborted) resolve({ kind: 'aborted' });
-        else waitAbort.signal.addEventListener('abort', () => resolve({ kind: 'aborted' }), { once: true });
-      });
-      const waitForResult = () =>
-        this.gateway
-          .request('agent.wait', { runId }, 1_800_000, waitAbort.signal)
-          .then((value) => ({ kind: 'done' as const, value }));
-      const readEvent = () => subscription.next(waitAbort.signal).then((value) => ({ kind: 'event' as const, value }));
-      let completed = waitForResult();
-      completed.catch(() => {});
-      let next = readEvent();
-      next.catch(() => {});
-      let terminal: { value: Record<string, unknown>; rawStatus: string } | undefined;
-      while (true) {
-        if (signal?.aborted) {
-          if (!shouldSkipRemoteCancel(signal)) {
-            await this.cancel(sessionKey).catch(() => {
-              /* best-effort remote cancel on abort */
-            });
+      sessionKey = String(started.sessionKey ?? started.session_key ?? sessionId ?? '');
+      const completion = (async () => {
+        try {
+          while (true) {
+            const value = await this.gateway.request('agent.wait', { runId }, 1_800_000, waitAbort.signal);
+            const rawStatus = String(value.status ?? 'completed').toLowerCase();
+            const waitExpired = rawStatus === 'timeout' && value.endedAt == null && value.stopReason == null;
+            if (rawStatus !== 'pending' && !waitExpired) return { value, rawStatus };
+            await delay(250, undefined, { signal: waitAbort.signal });
           }
-          return;
-        }
-        const result = await Promise.race(terminal ? [next, aborted] : [completed, next, aborted]);
-        if (result.kind === 'aborted') {
-          if (!shouldSkipRemoteCancel(signal)) {
-            await this.cancel(sessionKey).catch(() => {
-              /* best-effort remote cancel on abort */
-            });
-          }
-          return;
-        }
-        if (result.kind === 'done') {
-          const streamError = subscription.error?.();
-          if (streamError) throw streamError;
-          const rawStatus = String(result.value.status ?? 'completed').toLowerCase();
-          if (rawStatus === 'pending' || rawStatus === 'timeout') {
-            completed = waitForResult();
-            completed.catch(() => {});
-            continue;
-          }
-          terminal = { value: result.value, rawStatus };
-          // The terminal RPC may resolve before earlier WebSocket events leave the queue.
+        } catch (error) {
+          return { error };
+        } finally {
+          // Seal the queue so the consumer drains previously received events before the terminal result.
           subscription.unsubscribe();
+        }
+      })();
+      while (true) {
+        const { done, value: frame } = await subscription.next(waitAbort.signal);
+        waitAbort.signal.throwIfAborted();
+        if (done) break;
+        const payload = frame.payload ?? frame.data ?? frame;
+        if (frame.event === 'exec.approval.requested' || frame.event === 'exec.approval.resolved') {
+          const { id, request } = payload;
+          if (typeof id !== 'string' || !id || !request) continue;
+          const approvalRun = request.runId;
+          if (approvalRun ? approvalRun !== runId : !sessionKey || request.sessionKey !== sessionKey) continue;
+          if (frame.event === 'exec.approval.resolved') yield { type: 'approval', phase: 'end', requestId: id };
+          else {
+            yield {
+              type: 'approval',
+              requestId: id,
+              text:
+                toolInputPreview(request.commandPreview ?? request.command, secret(this.config)) ??
+                'Approval requested',
+              choices: [],
+            };
+          }
           continue;
         }
-        if (result.value.done) {
-          if (!terminal) throw new Error('OpenClaw event stream ended before the run completed');
-          break;
-        }
-        next = readEvent();
-        next.catch(() => {});
-        const frame = result.value.value;
-        const payload = frame.payload ?? frame.data ?? frame;
         const eventRun = String(payload.runId ?? payload.run_id ?? '');
-        if (eventRun && eventRun !== runId) continue;
+        if (eventRun !== runId) continue;
         const eventName = String(payload.event ?? payload.type ?? frame.event ?? '');
         const nested =
           payload.data && typeof payload.data === 'object' ? (payload.data as Record<string, unknown>) : undefined;
         if (frame.event === 'agent' && payload.stream === 'thinking') {
-          if (eventRun === runId && nested) {
+          if (nested) {
             const itemId = typeof nested.itemId === 'string' ? nested.itemId : undefined;
             const snapshot = typeof nested.text === 'string' ? nested.text : undefined;
             let thought = typeof nested.delta === 'string' ? nested.delta : snapshot;
@@ -163,7 +150,7 @@ export class OpenClawAdapter implements AgentAdapter {
           continue;
         }
         if (frame.event === 'agent' && payload.stream === 'tool') {
-          if (eventRun === runId && nested && (nested.phase === 'start' || nested.phase === 'result')) {
+          if (nested && (nested.phase === 'start' || nested.phase === 'result')) {
             const requestId = nested.toolCallId;
             const inputPreview =
               nested.phase === 'start' ? toolInputPreview(nested.args, secret(this.config)) : undefined;
@@ -190,37 +177,45 @@ export class OpenClawAdapter implements AgentAdapter {
           output += delta;
           yield { type: 'text', text: delta };
         }
-        if (/approval|permission/.test(eventName)) {
-          yield {
-            type: 'approval',
-            requestId: String(payload.requestId ?? payload.id ?? ''),
-            text: String(payload.description ?? payload.command ?? 'Approval requested'),
-            choices: [],
-          };
-        } else if (/tool/.test(eventName)) {
+        if (/tool/.test(eventName)) {
           yield {
             type: 'tool',
             phase: /end|complete|finish/.test(eventName) ? 'end' : 'start',
             name: String(payload.name ?? payload.toolName ?? 'tool'),
           };
         }
-        if (sessionKey) (payload as Record<string, unknown>).sessionKey ??= sessionKey;
       }
+      const terminal = await completion;
+      if ('error' in terminal) throw terminal.error;
       const { value, rawStatus } = terminal;
       const textResult = textOf(
         value.output ?? value.result ?? value.message ?? value.terminalReply ?? value.terminalReceipt ?? value,
       );
-      if (rawStatus === 'error' || rawStatus === 'failed' || value.error !== undefined) {
-        const errText = textOf(value.error) || textResult || `OpenClaw run ended with status "${rawStatus}"`;
+      if (rawStatus === 'error' || rawStatus === 'failed' || rawStatus === 'timeout' || value.error !== undefined) {
+        if (rawStatus === 'timeout' && textResult.startsWith(output) && textResult.length > output.length) {
+          yield { type: 'text', text: textResult.slice(output.length) };
+        }
+        const errText =
+          textOf(value.error) ||
+          (rawStatus !== 'timeout' ? textResult : '') ||
+          `OpenClaw run ended with status "${rawStatus}"`;
         yield { type: 'error', text: errText, stopReason: rawStatus };
         return;
       }
       const stopReason = rawStatus === 'aborted' || rawStatus === 'cancelled' ? 'cancelled' : rawStatus;
       yield { type: 'final', text: textResult || output, stopReason };
+      return;
+    } catch (error) {
+      if (!signal?.aborted || sessionKey === undefined) throw error;
     } finally {
       signal?.removeEventListener('abort', onAbort);
       waitAbort.abort();
       subscription.unsubscribe();
+    }
+    if (sessionKey && !shouldSkipRemoteCancel(signal)) {
+      await this.cancel(sessionKey).catch(() => {
+        /* best-effort remote cancel on abort */
+      });
     }
   }
 

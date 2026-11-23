@@ -42,7 +42,8 @@ interface AgentAdapter {
   kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
   health(signal?): Promise<Record<string, unknown>>;
   listSessions(signal?): Promise<AgentSession[]>;
-  prompt(sessionId: string | undefined, text: string, signal?): AsyncIterable<AgentEvent>;
+  getSessionMessages?(sessionId: string, signal?): Promise<AgentTranscriptMessage[]>;
+  prompt(sessionId: string | undefined, text: string, signal?, options?: AgentPromptOptions): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?): Promise<void>;
   respond?(sessionId: string, requestId: string, choice: string, signal?): Promise<void>;
   close(): Promise<void>;

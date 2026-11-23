@@ -13,29 +13,41 @@ const SENSITIVE_KEY =
 const CREDENTIAL_INPUT =
   /(?:(?:\b|[_-])(?:authorization|api[-_]?key|token|password|passwd|secret|cookie)["']?\s*[:=]|--[\w-]*(?:key|token|password|passwd|secret)\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)/i;
 
+const MAX_PREVIEW_LENGTH = 500;
+const MAX_PREVIEW_ITEMS = 8;
+const MAX_PREVIEW_DEPTH = 3;
+
 export function toolInputPreview(value: unknown, token?: string): string | undefined {
   const display = (text: string): string => {
     const masked = token ? text.replaceAll(token, '[REDACTED]') : text;
     return CREDENTIAL_INPUT.test(masked) ? '[REDACTED]' : redactText(masked);
   };
-  let preview: string;
-  if (typeof value === 'string') preview = display(value).trim();
-  else if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const fields = Object.entries(value)
-      .filter(([, field]) => ['string', 'number', 'boolean'].includes(typeof field))
-      .slice(0, 8)
-      .map(([key, field]) => [
-        display(key).slice(0, 120),
-        SENSITIVE_KEY.test(key) || CREDENTIAL_INPUT.test(`${key}=`)
+  const previewValue = (input: unknown, depth: number): unknown => {
+    if (typeof input === 'string') return display(input).slice(0, MAX_PREVIEW_LENGTH);
+    if (typeof input === 'number' || typeof input === 'boolean') return input;
+    if (!input || typeof input !== 'object') return undefined;
+    if (depth >= MAX_PREVIEW_DEPTH) return '…';
+    if (Array.isArray(input)) {
+      return input.slice(0, MAX_PREVIEW_ITEMS).map((item) => previewValue(item, depth + 1));
+    }
+    const fields: Array<[string, unknown]> = [];
+    for (const key in input) {
+      if (!Object.hasOwn(input, key)) continue;
+      const field = (input as Record<string, unknown>)[key];
+      const item =
+        field != null && (SENSITIVE_KEY.test(key) || CREDENTIAL_INPUT.test(`${key}=`))
           ? '[REDACTED]'
-          : typeof field === 'string'
-            ? display(field).slice(0, 500)
-            : field,
-      ]);
-    if (!fields.length) return undefined;
-    preview = JSON.stringify(Object.fromEntries(fields), null, 2);
-  } else return undefined;
-  return preview.length > 500 ? `${preview.slice(0, 500)}…` : preview || undefined;
+          : previewValue(field, depth + 1);
+      if (item === undefined) continue;
+      fields.push([display(key).slice(0, 120), item]);
+      if (fields.length >= MAX_PREVIEW_ITEMS) break;
+    }
+    return fields.length ? Object.fromEntries(fields) : undefined;
+  };
+  const preview = typeof value === 'string' ? display(value).trim() : JSON.stringify(previewValue(value, 0), null, 2);
+  return preview && preview.length > MAX_PREVIEW_LENGTH
+    ? `${preview.slice(0, MAX_PREVIEW_LENGTH)}…`
+    : preview || undefined;
 }
 
 export function redactText(text: string): string {

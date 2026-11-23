@@ -84,7 +84,7 @@ interface AgentFormState {
   acpArgsText: string;
 }
 
-type ToolStatus = 'running' | 'completed' | 'failed' | 'interrupted';
+type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
 
 interface JobSummary {
   id: string;
@@ -99,7 +99,7 @@ interface JobSummary {
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
-  tools?: Array<{ id: string; name: string; status: ToolStatus; inputPreview?: string }>;
+  tools?: Array<{ id: string; name: string; title?: string; status: ToolStatus; inputPreview?: string }>;
 }
 
 interface LocalSessionSummary {
@@ -227,6 +227,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatThought: '思考',
     chatToolActivity: '执行过程',
     chatToolInput: '工具参数',
+    chatToolPending: '等待执行',
     chatToolRunning: '执行中',
     chatToolCompleted: '已完成',
     chatToolFailed: '失败',
@@ -329,6 +330,7 @@ const DICTS: Record<string, Record<string, string>> = {
     chatThought: 'Thinking',
     chatToolActivity: 'Activity',
     chatToolInput: 'Tool input',
+    chatToolPending: 'Pending',
     chatToolRunning: 'Running',
     chatToolCompleted: 'Completed',
     chatToolFailed: 'Failed',
@@ -441,6 +443,15 @@ function getClientService<T>(ctx: ClientContext, key: 'locale' | 'slots' | 'conn
   return ctx[key] as T | undefined;
 }
 
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 async function apiPost<T>(
   ctx: ClientContext,
   path: string,
@@ -461,8 +472,12 @@ async function apiPost<T>(
       body: JSON.stringify(body),
       signal,
     });
-    const payload = (await response.json()) as { ok?: boolean; value?: T; error?: string };
-    if (!response.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${response.status}`);
+    const payload = (await response.json().catch((error) => {
+      if (response.ok) throw error;
+      return {};
+    })) as { ok?: boolean; value?: T; error?: string };
+    if (!response.ok || payload.ok === false)
+      throw new ApiError(response.status, payload.error ?? `HTTP ${response.status}`);
     return payload.value as T;
   } catch (err) {
     if (controller?.signal.aborted) {
@@ -496,6 +511,7 @@ const MARKDOWN_LABELS = {
 };
 
 const TOOL_STATUS_LABEL: Record<ToolStatus, string> = {
+  pending: 'chatToolPending',
   running: 'chatToolRunning',
   completed: 'chatToolCompleted',
   failed: 'chatToolFailed',
@@ -525,12 +541,14 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
   const h = React.createElement;
   const Thread = makeChatThread(React, ctx, primitives);
   const { Button } = primitives;
+  const draftKeys = new Map<string, number>();
+  let nextThreadKey = 0;
 
   return function RemoteChat({ agent, agents, jobs, lang, t, onAgentChange, onClose, refreshState }: ChatProps) {
     const [sessions, setSessions] = React.useState<RemoteSessionItem[] | null>(null);
     const [sessionError, setSessionError] = React.useState('');
     const [search, setSearch] = React.useState('');
-    const [thread, setThread] = React.useState({ key: 0, id: '' });
+    const [thread, setThread] = React.useState(() => ({ key: draftKeys.get(agent.revision) ?? 0, id: '' }));
     const [shownSessionId, setShownSessionId] = React.useState('');
     const [refreshCount, setRefreshCount] = React.useState(0);
 
@@ -556,8 +574,17 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, [agent.id, agent.revision, refreshCount]);
 
     const openThread = (id = '') => {
+      const key = ++nextThreadKey;
+      if (!id) {
+        draftKeys.delete(agent.revision);
+        draftKeys.set(agent.revision, key);
+        if (draftKeys.size > 100) {
+          const oldest = draftKeys.keys().next().value;
+          if (oldest !== undefined) draftKeys.delete(oldest);
+        }
+      }
       setShownSessionId(id);
-      setThread(({ key }) => ({ key: key + 1, id }));
+      setThread({ key, id });
     };
     const query = search.trim().toLowerCase();
     const matches = sessions?.filter(
@@ -648,6 +675,7 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
         agent,
         jobs,
         session: thread.id,
+        draftKey: thread.key,
         title,
         lang,
         t,
@@ -663,6 +691,7 @@ interface ThreadProps {
   agent: AgentSummary;
   jobs: JobSummary[];
   session: string;
+  draftKey: number;
   title?: string;
   lang: Language;
   t: Translate;
@@ -674,11 +703,13 @@ interface ThreadProps {
 function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
   const { Button, CommandText, MarkdownText, UserMessageBubble } = primitives;
+  const submissions = new Map<string, { message: string; sessionId: string; id: string }>();
 
   return function ChatThread({
     agent,
     jobs,
     session,
+    draftKey,
     title,
     lang,
     t,
@@ -687,11 +718,14 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     refreshState,
   }: ThreadProps) {
     const [sessionId, setSessionId] = React.useState(session);
-    const [input, setInput] = React.useState('');
+    const submissionKey = (id: string) => `${agent.revision}\0${id ? `session:${id}` : `draft:${draftKey}`}`;
+    const submission = React.useRef(submissions.get(submissionKey(session)));
+    const [input, setInput] = React.useState(() => submission.current?.message ?? '');
     const [sending, setSending] = React.useState(false);
     const [acting, setActing] = React.useState(false);
     const [error, setError] = React.useState('');
     const [jobError, setJobError] = React.useState('');
+    const [unavailableJobId, setUnavailableJobId] = React.useState<string | undefined>(undefined);
     const [historyError, setHistoryError] = React.useState('');
     const [history, setHistory] = React.useState<TranscriptMessage[] | null>(null);
     const [historyAttempts, setHistoryAttempts] = React.useState(0);
@@ -700,16 +734,19 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       Boolean(sessionId && job.sessionId === sessionId && job.agentId === agent.id);
     const [initialJob] = React.useState(() => jobs.find((job) => belongsToSession(job) && isRunning(job)));
     const [observedJob, setObservedJob] = React.useState(initialJob);
+    const [historyJobId, setHistoryJobId] = React.useState(initialJob?.id);
     const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
     const [copyStatus, setCopyStatus] = React.useState('');
     const alive = React.useRef(false);
     const sendLock = React.useRef(false);
     const actionLock = React.useRef(false);
-    const submission = React.useRef<{ message: string; sessionId: string; id: string } | null>(null);
     const log = React.useRef<HTMLDivElement | null>(null);
     const followTail = React.useRef(true);
     const canReadHistory = Boolean(agent.supportsSessionMessages && session);
-    const initialJobRunning = Boolean(initialJob && observedJob?.id === initialJob.id && isRunning(observedJob));
+    const isAvailableAndRunning = (job?: JobSummary) => job?.id !== unavailableJobId && isRunning(job);
+    const initialJobRunning = Boolean(
+      initialJob && observedJob?.id === initialJob.id && isAvailableAndRunning(observedJob),
+    );
 
     React.useEffect(() => {
       alive.current = true;
@@ -719,7 +756,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, []);
 
     React.useEffect(() => {
-      if (!canReadHistory || initialJobRunning) return;
+      if (!canReadHistory) return;
       const controller = new AbortController();
       setHistoryError('');
       void apiPost<{ messages: TranscriptMessage[] }>(
@@ -738,15 +775,15 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       return () => controller.abort();
     }, [agent.id, agent.revision, canReadHistory, historyAttempts, initialJobRunning, session]);
 
-    const ownRunning = turns.find((job) => isRunning(job));
+    const ownRunning = turns.find(isAvailableAndRunning);
     const listedRunning = jobs.find(
       (job) =>
         belongsToSession(job) &&
-        isRunning(job) &&
+        isAvailableAndRunning(job) &&
         !turns.some(({ id }) => id === job.id) &&
-        (job.id !== observedJob?.id || isRunning(observedJob)),
+        (job.id !== observedJob?.id || isAvailableAndRunning(observedJob)),
     );
-    const activeJob = ownRunning ?? (isRunning(observedJob) ? observedJob : listedRunning);
+    const activeJob = ownRunning ?? (isAvailableAndRunning(observedJob) ? observedJob : listedRunning);
     const activeId = activeJob?.id;
     const progressId = activeJob?.remoteStop === 'unconfirmed' ? undefined : activeId;
     const ownActiveId = ownRunning?.id;
@@ -794,6 +831,11 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         } catch (error) {
           if (controller.signal.aborted) return;
           setJobError(errorMessage(error));
+          if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+            setUnavailableJobId(progressId);
+            void refreshState();
+            return;
+          }
           delay = 2_000;
         }
         timer = setTimeout(() => void poll(), delay);
@@ -803,24 +845,33 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         controller.abort();
         clearTimeout(timer);
       };
-    }, [progressId, ownActiveId, agent.id, agent.revision, applyProgress]);
+    }, [progressId, ownActiveId, agent.id, agent.revision, applyProgress, refreshState]);
 
     React.useEffect(() => {
       if (followTail.current && log.current) log.current.scrollTop = log.current.scrollHeight;
     }, [history, turns, observedJob]);
 
     const historyPending = canReadHistory && !history && !historyError;
+    const lastMessage = history?.at(-1);
+    const lastUserText = history?.findLast(({ role }) => role === 'user')?.text;
     const send = async () => {
       const message = input.trim();
       if (!message || activeId || historyPending || sendLock.current || actionLock.current) return;
-      let request = submission.current;
-      if (!request || request.message !== message || request.sessionId !== sessionId) {
+      const key = submissionKey(sessionId);
+      let request = submissions.get(key) ?? submission.current;
+      const retry = Boolean(request?.message === message && request.sessionId === sessionId);
+      if (!request || !retry) {
         const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
           byte.toString(16).padStart(2, '0'),
         ).join('');
         request = { message, sessionId, id };
-        submission.current = request;
       }
+      submissions.set(key, request);
+      if (submissions.size > 100) {
+        const oldest = submissions.keys().next().value;
+        if (oldest !== undefined) submissions.delete(oldest);
+      }
+      submission.current = request;
       sendLock.current = true;
       setSending(true);
       setError('');
@@ -839,10 +890,23 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           },
           15_000,
         );
+        if (submissions.get(key) === request) submissions.delete(key);
         void refreshState();
         if (!alive.current) return;
-        submission.current = null;
+        submission.current = undefined;
         setInput('');
+        if (
+          job.id === initialJob?.id ||
+          (retry &&
+            job.status === 'completed' &&
+            lastMessage?.role === 'assistant' &&
+            lastMessage.text === job.text &&
+            lastUserText === request.message)
+        ) {
+          setHistoryJobId(job.id);
+          applyProgress(job, false);
+          return;
+        }
         setTurns((current) => [
           ...current.filter(({ id }) => id !== job.id).slice(-19),
           { ...job, prompt: request.message },
@@ -883,9 +947,10 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       }
     };
 
-    const liveJob = (isRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
-    const loadedInitialJob = Boolean(history && liveJob?.id === initialJob?.id);
-    const lastMessage = history?.at(-1);
+    const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
+    const loadedObservedJob = Boolean(history && liveJob?.id === historyJobId);
+    const persistedPrompt = loadedObservedJob && lastUserText === liveJob?.prompt;
+    const persistedReply = loadedObservedJob && lastMessage?.role === 'assistant' && lastMessage.text === liveJob?.text;
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(
@@ -893,7 +958,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           )
         : [];
     const renderJob = (job: JobSummary, showPrompt = true, showText = true) => {
-      const active = isRunning(job);
+      const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
       const runningTools = job.tools?.filter((tool) => tool.status === 'running') ?? [];
       const status =
@@ -935,7 +1000,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
                   ? h(
                       'span',
                       { role: 'status' },
-                      ` · ${t('chatToolRunning')} ${runningTools.map(({ name }) => name).join(', ')}`,
+                      ` · ${t('chatToolRunning')} ${runningTools.map(({ name, title }) => title ?? name).join(', ')}`,
                     )
                   : null,
               ),
@@ -946,7 +1011,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
                   h(
                     'li',
                     { key: tool.id },
-                    h('span', { className: 'dk-chat-activity-name' }, tool.name),
+                    h('span', { className: 'dk-chat-activity-name' }, tool.title ?? tool.name),
                     h('span', null, t(TOOL_STATUS_LABEL[tool.status])),
                     tool.inputPreview
                       ? h(CommandText, {
@@ -1064,12 +1129,15 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             .sort((a, b) => a.createdAt - b.createdAt)
             .slice(-20)
             .map((job) => renderJob(job)),
-          liveJob && (!loadedInitialJob || liveJob.status !== 'completed')
-            ? renderJob(
-                liveJob,
-                !history || (!loadedInitialJob && !isRunning(liveJob)),
-                !loadedInitialJob || lastMessage?.role !== 'assistant' || lastMessage.text !== liveJob.text,
-              )
+          liveJob &&
+            !turns.some(({ id }) => id === liveJob.id) &&
+            (!loadedObservedJob ||
+              liveJob.status !== 'completed' ||
+              liveJob.thought ||
+              liveJob.tools?.length ||
+              (!persistedPrompt && liveJob.prompt) ||
+              (!persistedReply && liveJob.text))
+            ? renderJob(liveJob, !persistedPrompt, !persistedReply)
             : null,
           turns.map((job) => renderJob(job)),
         ),

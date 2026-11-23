@@ -6,7 +6,7 @@ import type { McpServer } from '../mcp/server.js';
 import type { SessionControllerLike } from '../mcp/session-service.js';
 import { redact } from '../policy/redact.js';
 import { updateStoredState } from '../store.js';
-import type { AgentConfig } from '../types.js';
+import type { AgentConfig, AgentJob } from '../types.js';
 import { VERSION } from '../version.js';
 
 interface ConnectionHostFace {
@@ -40,6 +40,10 @@ function jsonReply(value: unknown, status = 200): Response {
 
 function errorReply(message: string, status = 400): Response {
   return jsonReply({ ok: false, error: message }, status);
+}
+
+function jobPriority(job: AgentJob): number {
+  return Number(job.status === 'queued' || job.status === 'running' || job.remoteStop !== undefined);
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -131,7 +135,12 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: redact(manager.listJobs({ currentOnly: true }).slice(0, 50)),
+            jobs: redact(
+              manager
+                .listJobs({ currentOnly: true })
+                .sort((a, b) => jobPriority(b) - jobPriority(a))
+                .slice(0, 50),
+            ),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,

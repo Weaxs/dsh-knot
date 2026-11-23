@@ -105,11 +105,24 @@ export class HermesAdapter implements AgentAdapter {
     signal?.throwIfAborted();
     let terminal = false;
     let output = '';
-    const response = await this.transport.stream({
-      path: `/v1/runs/${encodeURIComponent(runId)}/events`,
-      headers: this.headers(),
-      signal,
-    });
+    let response: Awaited<ReturnType<Transport['stream']>>;
+    try {
+      response = await this.transport.stream({
+        path: `/v1/runs/${encodeURIComponent(runId)}/events`,
+        headers: this.headers(),
+        signal,
+      });
+    } catch (streamError) {
+      signal?.throwIfAborted();
+      // A replayed run can retain its durable result after the SSE buffer expires.
+      const status = await this.status(runId, signal).catch(() => {
+        signal?.throwIfAborted();
+        throw streamError;
+      });
+      if (!TERMINAL_RUN_STATUSES.has(String(status?.status))) throw streamError;
+      yield runStatusEvent(status);
+      return;
+    }
     try {
       for await (const frame of readSse(response)) {
         if (frame.data === '[DONE]') break;
@@ -178,20 +191,7 @@ export class HermesAdapter implements AgentAdapter {
       response.destroy();
     }
     if (!terminal && !signal?.aborted) {
-      const status = await this.status(runId, signal);
-      const state = String(status.status ?? '');
-      const finalText = textOf(status.output_text ?? status.output ?? status.response ?? status.message);
-      if (state === 'completed') yield { type: 'final', text: finalText || output, stopReason: state };
-      else if (state === 'cancelled' || state === 'canceled')
-        yield { type: 'final', text: finalText || output, stopReason: 'cancelled' };
-      else
-        yield {
-          type: 'error',
-          text: String(
-            status.error ?? (state ? `Hermes stream ended while run was ${state}` : 'Hermes returned no run status'),
-          ),
-          stopReason: state,
-        };
+      yield runStatusEvent(await this.status(runId, signal), output);
     }
   }
 
@@ -318,6 +318,20 @@ export class HermesAdapter implements AgentAdapter {
       throw new Error(`Hermes returned non-JSON HTTP ${response.status}`);
     }
   }
+}
+
+function runStatusEvent(status: Record<string, unknown>, output = ''): AgentEvent {
+  const state = String(status.status ?? '');
+  const text = textOf(status.output_text ?? status.output ?? status.response ?? status.message) || output;
+  if (state === 'completed') return { type: 'final', text, stopReason: state };
+  if (state === 'cancelled' || state === 'canceled') return { type: 'final', text, stopReason: 'cancelled' };
+  return {
+    type: 'error',
+    text: String(
+      status.error ?? (state ? `Hermes stream ended while run was ${state}` : 'Hermes returned no run status'),
+    ),
+    stopReason: state,
+  };
 }
 
 function transcriptText(content: unknown): string {

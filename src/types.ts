@@ -61,7 +61,8 @@ export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
   name?: string;
-  phase?: 'start' | 'end';
+  title?: string;
+  phase?: 'pending' | 'start' | 'end';
   failed?: boolean;
   inputPreview?: string;
   requestId?: string;
@@ -133,7 +134,8 @@ export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancell
 export interface AgentToolActivity {
   id: string;
   name: string;
-  status: 'running' | 'completed' | 'failed' | 'interrupted';
+  title?: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
   inputPreview?: string;
 }
 
