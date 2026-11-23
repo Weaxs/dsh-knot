@@ -20,8 +20,13 @@ compose=(docker compose -p "$project" "${files[@]}")
 cleanup() {
   status=$?
   set +e
-  "${compose[@]}" logs --no-color > ".github/e2e/generated/e2e-$mode-$target-$E2E_PROTOCOL.log" 2>&1
-  "${compose[@]}" down -v --remove-orphans >> ".github/e2e/generated/e2e-$mode-$target-$E2E_PROTOCOL.log" 2>&1
+  local log=".github/e2e/generated/e2e-$mode-$target-$E2E_PROTOCOL.log"
+  "${compose[@]}" logs --no-color > "$log" 2>&1
+  if [[ "$mode" == tailscale ]]; then
+    # If logout cannot finish, the ephemeral device ages out after it disconnects.
+    "${compose[@]}" exec -T "${target}-tailscale" timeout 8s tailscale --socket=/tmp/tailscaled.sock logout >> "$log" 2>&1
+  fi
+  "${compose[@]}" down -v --remove-orphans >> "$log" 2>&1
   if [[ "$mode" == headscale && -f "${RUNNER_TEMP:-/tmp}/headscale-e2e.log" ]]; then
     cp "${RUNNER_TEMP:-/tmp}/headscale-e2e.log" .github/e2e/generated/headscale-$target-$E2E_PROTOCOL-daemon.log
   fi

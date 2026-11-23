@@ -77,7 +77,7 @@ jobs:
             if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message Transport integration jobs will be skipped."; fi
           fi
           if [[ "$model" == true && "$tailscale" != true ]]; then
-            message="TAILSCALE_AUTHKEY must be a reusable pre-auth key (tskey-auth-...), not an API or OAuth key; Tailscale jobs will be skipped."
+            message="TAILSCALE_AUTHKEY must be a reusable, ephemeral pre-auth key (tskey-auth-...). Tailscale jobs will be skipped."
             if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" != local && "${{ inputs.transport }}" != headscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
           fi
 

@@ -1,6 +1,6 @@
 x-tailscale-environment: &tailscale-environment
   TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
-  # containerboot uses in-memory state by default to register ephemeral nodes.
+  # Let containerboot use in-memory state for short-lived test nodes.
   TS_USERSPACE: "false"
   TS_ACCEPT_DNS: "false"
 
