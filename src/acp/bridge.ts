@@ -18,7 +18,7 @@ import { createNodeWebSocketUpgradeHandler } from '@agentclientprotocol/sdk/expe
 import { AcpServer } from '@agentclientprotocol/sdk/experimental/server';
 import { WebSocketServer } from 'ws';
 import { createNativeAdapter, createNativeSessionId } from '../adapters/native.js';
-import { stripTrailingText } from '../config.js';
+import { matchStreamedInterim, stripTrailingText } from '../config.js';
 import { verifyBearerToken } from '../policy/auth.js';
 import type { AgentAdapter, AgentConfig } from '../types.js';
 import { VERSION } from '../version.js';
@@ -114,11 +114,13 @@ export class AcpBridge {
 export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): AgentApp {
   const cancelled = new Set<string>();
   const sessionCwds = new Map<string, string>();
+  let supportsInterimRetraction = false;
   const app = agent({ name: 'dsh-knot-acp-bridge' });
   app.onConnect((connection: AgentConnection) => {
     void connection.closed.then(() => adapter.close());
   });
-  app.onRequest(methods.agent.initialize, async ({ signal }) => {
+  app.onRequest(methods.agent.initialize, async ({ params, signal }) => {
+    supportsInterimRetraction = params._meta?.['dsh-knot/interimRetraction'] === true;
     await adapter.health(signal);
     return {
       protocolVersion: PROTOCOL_VERSION,
@@ -177,8 +179,11 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     const text = params.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
     const toolIds = new Map<string, string>();
     const MAX_PENDING_TEXT_CHARS = 2_000_000;
-    const deferTextUntilBoundary = adapter.kind === 'hermes';
+    const deferTextUntilBoundary = adapter.kind === 'hermes' && !supportsInterimRetraction;
     let pendingText = '';
+    // Tracks live-streamed deltas in the current LLM step so paired clients with interim retraction
+    // can retract both full `already_streamed: true` commentary and truncated-prefix `false` resends.
+    let stepStreamed = '';
     let output = '';
     let stopReason: StopReason = 'end_turn';
     const notify = async (update: SessionUpdate) => {
@@ -195,15 +200,18 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       for await (const event of adapter.prompt(sessionId, text, signal)) {
         if (event.type === 'text' && event.text) {
           if (event.interim) {
-            if (event.alreadyStreamed) {
-              if (deferTextUntilBoundary) {
-                pendingText = stripTrailingText(pendingText, event.text);
-                await flushPendingText();
-              } else {
-                output = stripTrailingText(output, event.text);
-              }
-            } else {
+            const buffer = deferTextUntilBoundary ? pendingText : stepStreamed;
+            const retract =
+              event.retractText ??
+              (event.alreadyStreamed
+                ? matchStreamedInterim(buffer, event.text) || event.text
+                : matchStreamedInterim(buffer, event.text));
+            if (deferTextUntilBoundary) {
+              if (retract) pendingText = stripTrailingText(pendingText, retract);
               await flushPendingText();
+            } else {
+              if (retract) output = stripTrailingText(output, retract);
+              stepStreamed = '';
             }
             // Carry mid-turn commentary on agent_thought_chunk with explicit _meta so generic ACP
             // readText() callers keep clean final replies while dsh-knot preserves commentary in UI.
@@ -212,12 +220,14 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
               content: { type: 'text', text: event.text },
               _meta: {
                 'dsh-knot/commentary': true,
-                ...(!deferTextUntilBoundary && event.alreadyStreamed ? { 'dsh-knot/alreadyStreamed': true } : {}),
+                ...(!deferTextUntilBoundary && retract
+                  ? { 'dsh-knot/alreadyStreamed': true, 'dsh-knot/retractText': retract }
+                  : {}),
               },
             });
           } else if (deferTextUntilBoundary) {
-            // Hold Hermes text deltas until the next turn boundary so already_streamed commentary
-            // can be classified before anything is emitted on the standard ACP answer channel.
+            // Hold Hermes text deltas for generic ACP clients until a non-reasoning turn boundary so
+            // commentary is classified before anything is emitted on the standard ACP answer channel.
             if (pendingText.length + event.text.length > MAX_PENDING_TEXT_CHARS) {
               await flushPendingText();
             }
@@ -229,13 +239,16 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
             }
           } else {
             output += event.text;
+            stepStreamed = (stepStreamed + event.text).slice(-MAX_PENDING_TEXT_CHARS);
             await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
           }
         } else if (event.type === 'thought' && event.text) {
-          await flushPendingText();
+          // Hermes can emit reasoning.available between commentary deltas and message.interim;
+          // keep pendingText / stepStreamed unclassified across reasoning updates.
           await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
         } else if (event.type === 'tool') {
           await flushPendingText();
+          stepStreamed = '';
           const key = event.requestId ? `id:${event.requestId}` : `name:${event.name ?? 'tool'}`;
           const knownId = toolIds.get(key);
           const toolCallId = knownId ?? event.requestId ?? randomUUID();
@@ -274,6 +287,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
           }
         } else if (event.type === 'approval') {
           await flushPendingText();
+          stepStreamed = '';
           if (!adapter.respond) {
             if (!event.requestId) continue;
             await notify(

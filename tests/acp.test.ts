@@ -268,16 +268,11 @@ describe('ACP provider and bridge', () => {
     expect(native.cancelled).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: 'final', stopReason: 'cancelled' });
 
-    // Hermes defers text until turn boundaries; cancelling mid-run still propagates and flushes partial text.
-    let hermesStarted!: () => void;
-    const hermesReady = new Promise<void>((resolve) => {
-      hermesStarted = resolve;
-    });
+    // Paired dsh-knot ACP client negotiates interim retraction, so Hermes text streams live before cancel.
     class SlowHermesAdapter extends FakeNativeAdapter {
       override async *prompt(sessionId: string | undefined): AsyncIterable<AgentEvent> {
         void sessionId;
         yield { type: 'text', text: 'partial hermes' };
-        hermesStarted();
         while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
         yield { type: 'final', text: 'partial hermes', stopReason: 'cancelled' };
       }
@@ -301,10 +296,7 @@ describe('ACP provider and bridge', () => {
     const hermesEvents = [];
     for await (const event of hermesClient.prompt(undefined, 'wait')) {
       hermesEvents.push(event);
-      if (event.type === 'text' && !event.text && event.sessionId) {
-        const sid = event.sessionId;
-        void hermesReady.then(() => hermesClient.cancel(sid));
-      }
+      if (event.type === 'text' && event.text) await hermesClient.cancel(event.sessionId!);
     }
     expect(hermesNative.cancelled).toBe(true);
     expect(hermesEvents.at(-1)).toMatchObject({ type: 'final', text: 'partial hermes', stopReason: 'cancelled' });
@@ -544,39 +536,194 @@ describe('ACP provider and bridge', () => {
     expect(settled.text).toBe('turn-2-done');
   });
 
+  it('streams Hermes chunks immediately to AgentManager over ACP WebSocket and preserves partial reply on manager.cancel()', async () => {
+    const http = await import('node:http');
+    const { AgentManager } = await import('../src/manager.js');
+    const { HermesAdapter } = await import('../src/adapters/hermes.js');
+
+    let markStopped!: () => void;
+    const stopDone = new Promise<void>((resolve) => {
+      markStopped = resolve;
+    });
+    let closeSse!: () => void;
+    const capabilities = JSON.stringify({
+      object: 'hermes.api_server.capabilities',
+      features: { run_submission: true, run_status: true, run_events_sse: true, run_stop: true },
+    });
+    const hermesServer = http.createServer((req, res) => {
+      req.resume();
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"status":"ok"}');
+        return;
+      }
+      if (req.url === '/v1/capabilities') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(capabilities);
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/v1/runs') {
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end('{"run_id":"run_live_1"}');
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_1/events') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('id: 1\ndata: {"event":"message.delta","delta":"partial hermes"}\n\n');
+        closeSse = () => {
+          if (!res.writableEnded) res.end();
+        };
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_1') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"status":"cancelled","output":"partial hermes"}');
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/v1/runs/run_live_1/stop') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"status":"cancelled"}', () => {
+          closeSse?.();
+          markStopped();
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => hermesServer.listen(0, '127.0.0.1', resolve));
+    const hermesPort = (hermesServer.address() as { port: number }).port;
+
+    const hermesCfg = {
+      id: 'hermes-live',
+      kind: 'hermes' as const,
+      transport: 'local' as const,
+      host: '127.0.0.1',
+      port: hermesPort,
+    };
+    let resolveCancel!: () => void;
+    const cancelSettled = new Promise<void>((resolve) => {
+      resolveCancel = resolve;
+    });
+    const bridge = new AcpBridge(hermesCfg, (cfg) => {
+      const adapter = new HermesAdapter(cfg.id, cfg);
+      const origCancel = adapter.cancel.bind(adapter);
+      adapter.cancel = async (sessionId, signal) => {
+        await origCancel(sessionId, signal);
+        resolveCancel();
+      };
+      return adapter;
+    });
+    const { host, port } = await bridge.start({ port: 0, token: 'acp-stream-token' });
+    const manager = new AgentManager(
+      [{ id: 'bridged-live', kind: 'acp', transport: 'local', host, port, token: 'acp-stream-token' }],
+      10_000,
+    );
+    cleanups.push(async () => {
+      closeSse?.();
+      await manager.close();
+      await bridge.close();
+      await new Promise<void>((resolve) => hermesServer.close(() => resolve()));
+    });
+
+    const job = manager.start('bridged-live', 'stream and cancel', undefined);
+    // The first chunk must arrive live while the Hermes SSE stream is still held open (not deferred until run.completed).
+    const deadline = Date.now() + 2_000;
+    while (job.status === 'running' && job.text !== 'partial hermes' && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(job.status, job.error).toBe('running');
+    expect(job.text).toBe('partial hermes');
+
+    // Cancelling through AgentManager.cancel() preserves the partial streamed reply and confirms remote stop.
+    const cancelled = await manager.cancel(job.id);
+    const settled = await manager.wait(job.id);
+    await Promise.all([stopDone, cancelSettled]);
+    expect(cancelled.status).toBe('cancelled');
+    expect(settled.status).toBe('cancelled');
+    expect(settled.text).toBe('partial hermes');
+  });
+
   it('keeps Hermes interim commentary out of model-facing job.text and standard ACP SDK readText() over WebSocket', async () => {
     const { AgentManager } = await import('../src/manager.js');
+    const { HermesAdapter } = await import('../src/adapters/hermes.js');
     const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
     const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
     const { default: WebSocket } = await import('ws');
+    const { Readable } = await import('node:stream');
+    type IncomingMessage = import('node:http').IncomingMessage;
 
-    for (const alreadyStreamed of [false, true]) {
-      const native: AgentAdapter = {
-        id: 'hermes-native',
-        kind: 'hermes',
-        async health() {
-          return { ok: true };
-        },
-        async listSessions() {
-          return [];
-        },
-        async *prompt() {
-          if (alreadyStreamed) {
-            yield { type: 'text', text: 'Checking ' };
-            yield { type: 'text', text: 'repo...' };
-            yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
-          } else {
-            yield { type: 'text', text: 'Checking repo...', interim: true };
-          }
-          yield { type: 'tool', phase: 'start', requestId: 'call-1', name: 'terminal', inputPreview: 'git status' };
-          yield { type: 'tool', phase: 'end', requestId: 'call-1', name: 'terminal' };
-          yield { type: 'text', text: 'All clean.' };
-          yield { type: 'final', text: 'All clean.', stopReason: 'run.completed' };
-        },
-        async cancel() {},
-        async close() {},
-      };
-      const bridge = new AcpBridge({ id: 'hermes-native', kind: 'hermes' }, () => native);
+    const sseCases: Array<{ name: string; sse: string; hasThought: boolean }> = [
+      {
+        name: 'unstreamed-false',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+          'id: 2\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 3\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 4\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 5\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'streamed-true',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 2\ndata: {"event":"message.delta","delta":"repo..."}\n\n' +
+          'id: 3\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":true}\n\n' +
+          'id: 4\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 5\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 6\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 7\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'partial-prefix-resend-false',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 2\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+          'id: 3\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 4\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 5\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 6\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'reasoning-between-deltas-and-interim-true',
+        hasThought: true,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 2\ndata: {"event":"message.delta","delta":"repo..."}\n\n' +
+          'id: 3\ndata: {"event":"reasoning.available","text":"Inspect git status"}\n\n' +
+          'id: 4\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":true}\n\n' +
+          'id: 5\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 6\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 7\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 8\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+    ];
+
+    for (const scenario of sseCases) {
+      const capabilities = JSON.stringify({
+        object: 'hermes.api_server.capabilities',
+        features: { run_submission: true, run_status: true, run_events_sse: true, run_stop: true },
+      });
+      const makeHermes = () =>
+        new HermesAdapter(
+          `hermes-${scenario.name}`,
+          { id: `hermes-${scenario.name}`, kind: 'hermes', transport: 'local' },
+          {
+            kind: 'local',
+            async request(req) {
+              if (req.path === '/v1/capabilities') return { status: 200, headers: {}, text: capabilities };
+              if (req.path === '/v1/runs') return { status: 202, headers: {}, text: '{"run_id":"run_1"}' };
+              return { status: 200, headers: {}, text: '{"status":"completed","output":"All clean."}' };
+            },
+            async stream() {
+              return Readable.from([scenario.sse]) as unknown as IncomingMessage;
+            },
+            async close() {},
+          },
+        );
+      const bridge = new AcpBridge({ id: `hermes-${scenario.name}`, kind: 'hermes' }, makeHermes);
       const { host, port } = await bridge.start({ port: 0, token: 'acp-commentary-token' });
 
       // 1. Standard unmodified ACP SDK client (ignores _meta) calling readText()
@@ -598,7 +745,7 @@ describe('ACP provider and bridge', () => {
       const standardText = await activeSession.readText();
       await promptDone;
       activeSession.dispose();
-      expect(standardText).toBe('All clean.');
+      expect(standardText, scenario.name).toBe('All clean.');
 
       // 2. Paired dsh-knot AcpAdapter + AgentManager preserves commentary in UI timeline while keeping job.text clean
       const manager = new AgentManager(
@@ -610,10 +757,11 @@ describe('ACP provider and bridge', () => {
         await bridge.close();
       });
       const done = await manager.wait(manager.start('bridged', 'check repo', undefined).id);
-      expect(done.status).toBe('completed');
-      expect(done.text).toBe('All clean.');
-      expect(done.timeline).toEqual([
+      expect(done.status, scenario.name).toBe('completed');
+      expect(done.text, scenario.name).toBe('All clean.');
+      expect(done.timeline, scenario.name).toEqual([
         { kind: 'commentary', text: 'Checking repo...' },
+        ...(scenario.hasThought ? [{ kind: 'thought' as const, text: 'Inspect git status' }] : []),
         { kind: 'tool', toolId: done.tools![0]!.id },
         { kind: 'text', text: 'All clean.' },
       ]);

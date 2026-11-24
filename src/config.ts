@@ -170,6 +170,18 @@ export function stripTrailingText(source: string, suffix: string): string {
   return source;
 }
 
+export function matchStreamedInterim(streamed: string, interim: string): string {
+  if (!streamed || !interim) return '';
+  const trimmedStreamed = streamed.trim();
+  const trimmedInterim = interim.trim();
+  if (!trimmedStreamed || !trimmedInterim) return '';
+  if (trimmedStreamed === trimmedInterim || interim.trimStart().startsWith(streamed.trimStart())) {
+    return streamed;
+  }
+  const remaining = stripTrailingText(streamed, interim);
+  return remaining !== streamed ? streamed.slice(remaining.length) : '';
+}
+
 export async function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) throw signal.reason ?? new Error('request aborted');

@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { normalizeToolCallId, raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText } from '../config.js';
+import {
+  matchStreamedInterim,
+  normalizeToolCallId,
+  raceAbort,
+  secret,
+  shouldSkipRemoteCancel,
+  stripTrailingText,
+} from '../config.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type {
@@ -126,6 +133,9 @@ export class HermesAdapter implements AgentAdapter {
     signal?.throwIfAborted();
     let terminal = false;
     let output = '';
+    // Tracks message.delta text emitted in the current LLM step so truncated-prefix
+    // `message.interim(..., already_streamed: false)` resends can strip what was streamed.
+    let stepText = '';
     let response: Awaited<ReturnType<Transport['stream']>>;
     try {
       response = await this.transport.stream({
@@ -156,6 +166,7 @@ export class HermesAdapter implements AgentAdapter {
         const type = String(event.event ?? event.type ?? frame.event ?? '');
         const isApproval = /approval|permission/.test(type);
         if (type.startsWith('tool.') && !isApproval) {
+          stepText = '';
           const started = /^tool\.start(?:ed)?$/.test(type);
           const ended = /^tool\.(?:complete(?:d)?|end(?:ed)?|finish(?:ed)?|failed)$/.test(type);
           if (!started && !ended) continue;
@@ -176,6 +187,7 @@ export class HermesAdapter implements AgentAdapter {
           continue;
         }
         if (isApproval) {
+          stepText = '';
           // Hermes session_authority emits `prompt_id` + `execution_generation`; legacy runs emit `request_id`.
           const requestId = firstNonEmptyString(event.prompt_id, event.request_id, event.id, frame.id);
           if (APPROVAL_SETTLED_RE.test(type)) {
@@ -205,20 +217,34 @@ export class HermesAdapter implements AgentAdapter {
         }
         if (type === 'message.interim') {
           // Mid-turn commentary belongs in the UI timeline only; keep `output` aligned with the final reply.
+          // Hermes sends `already_streamed: false` both when nothing was streamed and when only a prefix
+          // was streamed before resending the full commentary, and may emit `reasoning.available` in between.
           const interim = textOf(event.text ?? event.content ?? event.delta);
-          if (event.already_streamed === true) {
-            if (interim) {
-              output = stripTrailingText(output, interim);
-              yield { type: 'text', text: interim, interim: true, alreadyStreamed: true };
+          const matched =
+            event.already_streamed === true
+              ? matchStreamedInterim(stepText, interim) || interim
+              : matchStreamedInterim(stepText, interim);
+          stepText = '';
+          if (interim) {
+            if (matched) {
+              output = stripTrailingText(output, matched);
+              yield {
+                type: 'text',
+                text: interim,
+                interim: true,
+                alreadyStreamed: true,
+                ...(matched !== interim ? { retractText: matched } : {}),
+              };
+            } else {
+              yield { type: 'text', text: interim, interim: true };
             }
-          } else if (interim) {
-            yield { type: 'text', text: interim, interim: true };
           }
           continue;
         }
         const textDelta = textOf(event.delta ?? event.text_delta ?? event.content);
         if (textDelta) {
           output += textDelta;
+          stepText = (stepText + textDelta).slice(-2_000_000);
           yield { type: 'text', text: textDelta };
         }
         if (/^run\.(completed|failed|cancelled|interrupted)$/.test(type)) {

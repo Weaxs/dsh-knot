@@ -201,7 +201,8 @@ export class AcpAdapter implements AgentAdapter {
           if (!event) continue;
           if (event.type === 'text' && event.text) {
             if (event.interim) {
-              if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
+              const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
+              if (retracted) output = stripTrailingText(output, retracted);
             } else {
               output += event.text;
             }
@@ -216,7 +217,8 @@ export class AcpAdapter implements AgentAdapter {
           }
           if (event.type === 'text' && event.text) {
             if (event.interim) {
-              if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
+              const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
+              if (retracted) output = stripTrailingText(output, retracted);
             } else {
               output += event.text;
             }
@@ -439,6 +441,7 @@ export class AcpAdapter implements AgentAdapter {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'dsh-knot', version: VERSION },
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        _meta: { 'dsh-knot/interimRetraction': true },
       }),
       this.config.connectTimeoutMs ?? 30_000,
       'ACP initialize',
@@ -514,11 +517,16 @@ function acpEvent(update: SessionUpdate, token?: string): AgentEvent | undefined
   if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') {
     const meta = update._meta;
     if (meta?.['dsh-knot/commentary'] === true) {
+      const retractText =
+        typeof meta['dsh-knot/retractText'] === 'string' && meta['dsh-knot/retractText']
+          ? meta['dsh-knot/retractText']
+          : undefined;
       return {
         type: 'text',
         text: update.content.text,
         interim: true,
-        ...(meta['dsh-knot/alreadyStreamed'] === true ? { alreadyStreamed: true } : {}),
+        ...(meta['dsh-knot/alreadyStreamed'] === true || retractText ? { alreadyStreamed: true } : {}),
+        ...(retractText ? { retractText } : {}),
       };
     }
     return { type: 'thought', text: update.content.text };

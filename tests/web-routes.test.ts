@@ -640,6 +640,7 @@ describe('web UI host routes & schemastery Config', () => {
       updatedAt: number;
       text: string;
       thought?: string;
+      error?: string;
       tools?: AgentToolActivity[];
       timeline?: AgentTimelineEntry[];
     } = {
@@ -719,6 +720,8 @@ describe('web UI host routes & schemastery Config', () => {
                 { id: 'sess-1', title: 'Live session' },
                 { id: 'sess-2', title: 'Live session 2' },
                 { id: 'sess-3', title: 'Live session 3' },
+                { id: 'sess-4', title: 'Live session 4' },
+                { id: 'sess-5', title: 'Live session 5' },
               ],
             });
           }
@@ -917,20 +920,37 @@ describe('web UI host routes & schemastery Config', () => {
       expect(idxWorking).toBeLessThan(idxCmdB);
       expect(idxCmdB).toBeLessThan(idxFinal);
 
-      // Case D: Fast text-only job settles before the first history fetch returns (aborted before baseline);
-      // the post-completion history fetch returns the new turn and must merge without duplicating bubbles.
-      let releaseFirstFastFetch!: () => void;
-      let fastFetchCount = 0;
+      // Case D1 (Fresh history): Fast text-only job settles before Fetch 1 returns; Fetch 1 is NOT aborted
+      // and delivers the pre-run baseline `[]` while Fetch 2 returns `[f1, f2]` -> merges cleanly without duplicates.
+      const stalledResolvers = new Map<string, () => void>();
+      const sessionFetchCounts = new Map<string, number>();
+      const firstFetchMessages = new Map<string, AgentTranscriptMessage[] | 'fail'>([
+        ['sess-3', []],
+        [
+          'sess-4',
+          [
+            { id: 'old1', role: 'user', text: 'fast prompt' },
+            { id: 'old2', role: 'assistant', text: 'fast reply' },
+          ],
+        ],
+        ['sess-5', 'fail'],
+      ]);
       const origFetch = (root as any).get('connection').fetch;
       (root as any).get('connection').fetch = async (path: string, init?: RequestInit) => {
-        if (path === WEB_ROUTES.sessionMessages && currentJob.sessionId === 'sess-3') {
-          fastFetchCount++;
-          if (fastFetchCount === 1) {
+        if (path === WEB_ROUTES.sessionMessages && firstFetchMessages.has(currentJob.sessionId)) {
+          const sid = currentJob.sessionId;
+          const count = (sessionFetchCounts.get(sid) ?? 0) + 1;
+          sessionFetchCounts.set(sid, count);
+          if (count === 1) {
             await new Promise<void>((resolve) => {
-              releaseFirstFastFetch = resolve;
+              stalledResolvers.set(sid, resolve);
               init?.signal?.addEventListener('abort', () => resolve(), { once: true });
             });
-            return { ok: true, status: 200, json: async () => ({ ok: true, value: { messages: [] } }) };
+            const scripted = firstFetchMessages.get(sid)!;
+            if (scripted === 'fail') {
+              return { ok: false, status: 500, json: async () => ({ ok: false, error: 'temporary history error' }) };
+            }
+            return { ok: true, status: 200, json: async () => ({ ok: true, value: { messages: scripted } }) };
           }
         }
         return origFetch(path, init);
@@ -966,12 +986,91 @@ describe('web UI host routes & schemastery Config', () => {
         timeline: [{ kind: 'text', text: 'fast reply' }],
       };
       await new Promise((r) => setTimeout(r, 450));
-      releaseFirstFastFetch?.();
-      const fastTree = await flush();
-      const fastTexts = collectText(fastTree);
-      expect(fastFetchCount).toBeGreaterThanOrEqual(2);
-      expect(fastTexts.filter((t) => t === 'fast prompt')).toHaveLength(1);
-      expect(fastTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
+      stalledResolvers.get('sess-3')?.();
+      const fastFreshTree = await flush();
+      const fastFreshTexts = collectText(fastFreshTree);
+      expect(sessionFetchCounts.get('sess-3')).toBeGreaterThanOrEqual(2);
+      expect(fastFreshTexts.filter((t) => t === 'fast prompt')).toHaveLength(1);
+      expect(fastFreshTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
+
+      // Case D2 (Stale history): Repeated quick turn settles before Fetch 1 returns, and Fetch 2 STILL
+      // returns the OLD transcript IDs `[old1, old2]` — must NOT fold the new turn into the old one.
+      currentJob = {
+        id: 'job-5',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-4',
+        prompt: 'fast prompt',
+        status: 'running',
+        createdAt: 8000,
+        updatedAt: 8000,
+        text: '',
+        timeline: [],
+      };
+      historyMessages = [
+        { id: 'old1', role: 'user', text: 'fast prompt' },
+        { id: 'old2', role: 'assistant', text: 'fast reply' },
+      ];
+      (findButton(fastFreshTree, '助手设置')!.props.onClick as () => void)();
+      const dash4 = await flush();
+      (findButton(dash4, '对话')!.props.onClick as () => void)();
+      const reopened4 = await flush();
+      (findButton(reopened4, 'Live session 4')!.props.onClick as () => void)();
+      renderNode(renderMain!());
+      while (pendingEffects.length > 0) pendingEffects.shift()!();
+      currentJob = {
+        ...currentJob,
+        status: 'completed',
+        updatedAt: 9000,
+        text: 'fast reply',
+        timeline: [{ kind: 'text', text: 'fast reply' }],
+      };
+      await new Promise((r) => setTimeout(r, 450));
+      stalledResolvers.get('sess-4')?.();
+      const fastStaleTree = await flush();
+      const fastStaleTexts = collectText(fastStaleTree);
+      expect(sessionFetchCounts.get('sess-4')).toBeGreaterThanOrEqual(2);
+      expect(fastStaleTexts.filter((t) => t === 'fast prompt')).toHaveLength(2);
+      expect(fastStaleTexts.filter((t) => t === 'fast reply')).toHaveLength(2);
+
+      // Case D3 (Failed run with same prompt and no reply, unbaselined because Fetch 1 failed):
+      // must NOT attach the previous successful answer `[old1, old2]` to the failed run.
+      currentJob = {
+        id: 'job-6',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-5',
+        prompt: 'fast prompt',
+        status: 'running',
+        createdAt: 10_000,
+        updatedAt: 10_000,
+        text: '',
+        timeline: [],
+      };
+      historyMessages = [
+        { id: 'old1', role: 'user', text: 'fast prompt' },
+        { id: 'old2', role: 'assistant', text: 'fast reply' },
+      ];
+      (findButton(fastStaleTree, '助手设置')!.props.onClick as () => void)();
+      const dash5 = await flush();
+      (findButton(dash5, '对话')!.props.onClick as () => void)();
+      const reopened5 = await flush();
+      (findButton(reopened5, 'Live session 5')!.props.onClick as () => void)();
+      renderNode(renderMain!());
+      while (pendingEffects.length > 0) pendingEffects.shift()!();
+      currentJob = {
+        ...currentJob,
+        status: 'failed',
+        updatedAt: 11_000,
+        text: '',
+        error: 'Gateway error',
+        timeline: [],
+      };
+      await new Promise((r) => setTimeout(r, 450));
+      stalledResolvers.get('sess-5')?.();
+      const failedRunTree = await flush();
+      const failedRunTexts = collectText(failedRunTree);
+      expect(failedRunTexts.filter((t) => t === 'fast prompt')).toHaveLength(2);
+      expect(failedRunTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
+      expect(failedRunTexts.join('\n')).toContain('Gateway error');
 
       for (const cleanup of cleanups) cleanup();
       await fiber.dispose();

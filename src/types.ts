@@ -62,6 +62,7 @@ export interface AgentEvent {
   text?: string;
   interim?: boolean;
   alreadyStreamed?: boolean;
+  retractText?: string;
   name?: string;
   title?: string;
   phase?: 'pending' | 'start' | 'end';
@@ -149,6 +150,12 @@ export type AgentTimelineEntry =
   | { kind: 'text'; text: string }
   | { kind: 'tool'; toolId: string };
 
+export interface SessionHistoryBaseline {
+  length: number;
+  lastId?: string;
+  lastUserId?: string;
+}
+
 export interface AgentJob {
   id: string;
   agentId: string;
@@ -161,6 +168,7 @@ export interface AgentJob {
   thought?: string;
   tools?: AgentToolActivity[];
   timeline?: AgentTimelineEntry[];
+  historyBaseline?: SessionHistoryBaseline;
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };

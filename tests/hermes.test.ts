@@ -504,6 +504,60 @@ describe('Hermes API Server adapter', () => {
       { type: 'text', text: 'All clean.' },
       { type: 'final', text: 'All clean.', stopReason: 'run.completed' },
     ]);
+
+    // Truncated prefix delta followed by message.interim(already_streamed: false) and reasoning.available
+    // in between must retract the streamed prefix in both HermesAdapter output and AgentManager job.text.
+    const { AgentManager } = await import('../src/manager.js');
+    class PartialResendTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        return incoming(
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+            'id: 2\ndata: {"event":"reasoning.available","text":"Inspect git status"}\n\n' +
+            'id: 3\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+            'id: 4\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+            'id: 5\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+            'id: 6\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+            'id: 7\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+        );
+      }
+    }
+    const partialResend = new HermesAdapter(
+      'hermes-partial',
+      { id: 'hermes-partial', kind: 'hermes', transport: 'local' },
+      new PartialResendTransport(),
+    );
+    const partialEvents = [];
+    for await (const event of partialResend.prompt('session-3', 'check repo')) partialEvents.push(event);
+    expect(partialEvents).toEqual([
+      { type: 'text', text: 'Checking ' },
+      { type: 'thought', text: 'Inspect git status' },
+      { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true, retractText: 'Checking ' },
+      { type: 'tool', phase: 'start', name: 'terminal', requestId: 'call-1', inputPreview: 'git status' },
+      { type: 'tool', phase: 'end', name: 'terminal', requestId: 'call-1' },
+      { type: 'text', text: 'All clean.' },
+      { type: 'final', text: 'All clean.', stopReason: 'run.completed' },
+    ]);
+
+    const manager = new AgentManager(
+      [{ id: 'hermes-partial', kind: 'hermes', transport: 'local' }],
+      10_000,
+      () =>
+        new HermesAdapter(
+          'hermes-partial',
+          { id: 'hermes-partial', kind: 'hermes', transport: 'local' },
+          new PartialResendTransport(),
+        ),
+    );
+    const settled = await manager.wait(manager.start('hermes-partial', 'check repo', undefined).id);
+    expect(settled.status).toBe('completed');
+    expect(settled.text).toBe('All clean.');
+    expect(settled.timeline).toEqual([
+      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'thought', text: 'Inspect git status' },
+      { kind: 'tool', toolId: settled.tools![0]!.id },
+      { kind: 'text', text: 'All clean.' },
+    ]);
+    await manager.close();
   });
 });
 

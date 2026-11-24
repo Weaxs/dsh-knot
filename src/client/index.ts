@@ -115,6 +115,7 @@ interface JobSummary {
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
   tools?: ToolActivitySummary[];
   timeline?: TimelineEntry[];
+  historyBaseline?: { length: number; lastId?: string; lastUserId?: string };
 }
 
 interface LocalSessionSummary {
@@ -1362,11 +1363,16 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const historyBaselines = React.useRef<Map<string, { length: number; lastId?: string; lastUserId?: string }>>(
       (() => {
         const seeded = new Map<string, { length: number; lastId?: string; lastUserId?: string }>();
-        const prior = sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined;
+        const prior =
+          initialJob?.historyBaseline ?? (sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined);
         if (initialJob && prior) seeded.set(initialJob.id, prior);
         return seeded;
       })(),
     );
+    const sessionAbortRef = React.useRef<AbortController | null>(null);
+    const historySeqRef = React.useRef(0);
+    const appliedHistorySeqRef = React.useRef(0);
+    const [, setBaselineVersion] = React.useState(0);
     const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
     const [copyStatus, setCopyStatus] = React.useState('');
     const [copiedOk, setCopiedOk] = React.useState(false);
@@ -1397,13 +1403,28 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, [input]);
 
     React.useEffect(() => {
-      if (!canReadHistory) return;
       const controller = new AbortController();
+      sessionAbortRef.current = controller;
+      appliedHistorySeqRef.current = 0;
+      return () => {
+        controller.abort();
+        if (sessionAbortRef.current === controller) sessionAbortRef.current = null;
+      };
+    }, [agent.id, agent.revision, session]);
+
+    React.useEffect(() => {
+      if (!canReadHistory) return;
+      if (!sessionAbortRef.current || sessionAbortRef.current.signal.aborted) {
+        sessionAbortRef.current = new AbortController();
+      }
+      const controller = sessionAbortRef.current;
+      const seq = ++historySeqRef.current;
       const runningJobId = observedJobRunning ? observedJob?.id : undefined;
       const settledJobId =
         !observedJobRunning && observedJob && !isAvailableAndRunning(observedJob) ? observedJob.id : undefined;
-      if (runningJobId && sessionBaselineKey && !historyBaselines.current.has(runningJobId)) {
-        const prior = lastIdleBaselines.get(sessionBaselineKey);
+      if (runningJobId && !historyBaselines.current.has(runningJobId)) {
+        const prior =
+          observedJob?.historyBaseline ?? (sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined);
         if (prior) historyBaselines.current.set(runningJobId, prior);
       }
       setHistoryError('');
@@ -1421,11 +1442,14 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             lastId: messages.at(-1)?.id,
             lastUserId: messages.findLast((item) => item.role === 'user')?.id,
           };
-          if (runningJobId) {
-            if (!historyBaselines.current.has(runningJobId)) {
-              historyBaselines.current.set(runningJobId, snapshot);
-            }
-          } else if (sessionBaselineKey) {
+          if (runningJobId && !historyBaselines.current.has(runningJobId)) {
+            historyBaselines.current.set(runningJobId, snapshot);
+            setBaselineVersion((version) => version + 1);
+          }
+          // Let an in-flight baseline fetch record its pre-run snapshot without overwriting newer post-completion history.
+          if (seq < appliedHistorySeqRef.current) return;
+          appliedHistorySeqRef.current = seq;
+          if (!runningJobId && sessionBaselineKey) {
             lastIdleBaselines.delete(sessionBaselineKey);
             lastIdleBaselines.set(sessionBaselineKey, snapshot);
             if (lastIdleBaselines.size > 200) {
@@ -1438,9 +1462,10 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           setHistory(messages);
         })
         .catch((error: unknown) => {
-          if (!controller.signal.aborted) setHistoryError(errorMessage(error));
+          if (!controller.signal.aborted && seq >= appliedHistorySeqRef.current) {
+            setHistoryError(errorMessage(error));
+          }
         });
-      return () => controller.abort();
     }, [agent.id, agent.revision, canReadHistory, historyAttempts, observedJobRunning, observedJob?.id, session]);
 
     const ownRunning = turns.find(isAvailableAndRunning);
@@ -1729,15 +1754,35 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       }
       const lastUser = lastUserIndex >= 0 ? history[lastUserIndex] : undefined;
       const promptMatches = Boolean(job.prompt) && lastUser?.text === job.prompt;
+      const baseline = historyBaselines.current.get(job.id) ?? job.historyBaseline;
       const activeLive = isAvailableAndRunning(job);
       // While the job is still running, any assistant rows in history belong to an earlier turn;
-      // only suppress the user bubble when the gateway already persisted this prompt as the trailing row.
+      // only suppress the user bubble when the gateway already persisted this prompt as a new trailing row.
       if (activeLive) {
-        if (promptMatches && lastMessage?.role === 'user') {
+        const baselineAlreadyEndedOnSameUser = Boolean(
+          baseline?.lastUserId && baseline.lastId === baseline.lastUserId && lastUser?.id === baseline.lastUserId,
+        );
+        if (promptMatches && lastMessage?.role === 'user' && !baselineAlreadyEndedOnSameUser) {
           return { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true };
         }
         return undefined;
       }
+
+      // Require turn-scoped evidence before folding a settled run into persisted transcript rows:
+      // 1) Explicit idempotent retry already matched on send()
+      const retryProven = retryMatchedJobId === job.id;
+      // 2) History fetched after completion strictly advanced past a pre-run baseline
+      // (provider tool-call IDs can repeat across turns, so they never override an unchanged tail).
+      const postCompleteFetch = !historyMeta.fetchedWhileRunning && historyMeta.settledJobId === job.id;
+      const baselineEndedOnAssistant = Boolean(baseline?.lastId && baseline.lastId !== baseline.lastUserId);
+      const historyAdvanced = Boolean(
+        baseline &&
+          postCompleteFetch &&
+          (history.length > baseline.length || history.at(-1)?.id !== baseline.lastId) &&
+          (!baselineEndedOnAssistant || lastUser?.id !== baseline.lastUserId),
+      );
+      if (!retryProven && !historyAdvanced) return undefined;
+
       const turnStart = Math.max(lastUserIndex, 0);
       const lastTurnAssistant = (lastUserIndex >= 0 ? history.slice(lastUserIndex + 1) : history).filter(
         (item) => item.role === 'assistant',
@@ -1750,31 +1795,16 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         (lastMessage.text === job.text ||
           joinedAssistantText === job.text ||
           (Boolean(lastMessage.text) && job.text.endsWith(lastMessage.text)));
-      const contentMatches = replyMatches || (!job.text && promptMatches && lastTurnAssistant.length > 0);
+      // Never attach a previous/persisted assistant answer to a failed or cancelled run that produced no reply.
+      const contentMatches =
+        (job.status === 'completed' || Boolean(job.text)) &&
+        (replyMatches || (job.status === 'completed' && !job.text && promptMatches && lastTurnAssistant.length > 0));
       if (!contentMatches) {
         if (promptMatches && lastMessage?.role === 'user') {
           return { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true };
         }
         return undefined;
       }
-
-      // Prove that history actually includes THIS settled run rather than an identical previous turn:
-      // 1) Explicit idempotent retry already matched on send()
-      const retryProven = retryMatchedJobId === job.id;
-      // 2) History fetched after completion strictly advanced past the pre-completion baseline
-      // (provider tool-call IDs can repeat across turns, so they must never override an unchanged tail).
-      const baseline = historyBaselines.current.get(job.id);
-      const postCompleteFetch = !historyMeta.fetchedWhileRunning && historyMeta.settledJobId === job.id;
-      const baselineEndedOnAssistant = Boolean(baseline?.lastId && baseline.lastId !== baseline.lastUserId);
-      const historyAdvanced = Boolean(
-        baseline &&
-          postCompleteFetch &&
-          (history.length > baseline.length || history.at(-1)?.id !== baseline.lastId) &&
-          (!baselineEndedOnAssistant || lastUser?.id !== baseline.lastUserId),
-      );
-      // 3) A fast job that settled before any baseline could be captured, matched by a post-completion fetch
-      const postCompleteUnbaselined = !baseline && postCompleteFetch;
-      if (!retryProven && !historyAdvanced && !postCompleteUnbaselined) return undefined;
 
       return { startIndex: turnStart, persistedTurn: history.slice(turnStart) };
     };

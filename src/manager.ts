@@ -11,8 +11,10 @@ import type {
   AgentPromptOptions,
   AgentTimelineEntry,
   AgentToolActivity,
+  AgentTranscriptMessage,
   DoctorStep,
   PluginConfig,
+  SessionHistoryBaseline,
 } from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
@@ -39,6 +41,7 @@ export class AgentManager {
   private readonly controllers = new Map<string, AbortController>();
   private readonly remoteCancelled = new Set<string>();
   private readonly latestSessionJob = new Map<string, string>();
+  private readonly sessionBaselines = new Map<string, SessionHistoryBaseline>();
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
   private readonly connectionStates = new Map<string, AgentConnectionState>();
@@ -168,6 +171,33 @@ export class AgentManager {
     });
   }
 
+  recordSessionBaseline(agentId: string, sessionId: string, messages: AgentTranscriptMessage[]): void {
+    const adapter = this.adapters.get(agentId);
+    if (!adapter) return;
+    // Only record an idle baseline when no job is currently running on this session.
+    for (const job of this.jobs.values()) {
+      if (
+        job.agentId === agentId &&
+        job.sessionId === sessionId &&
+        this.jobOwners.get(job.id)?.adapter === adapter &&
+        (job.status === 'queued' || job.status === 'running')
+      ) {
+        return;
+      }
+    }
+    const key = sessionKey(agentId, sessionId);
+    this.sessionBaselines.delete(key);
+    this.sessionBaselines.set(key, {
+      length: messages.length,
+      lastId: messages.at(-1)?.id,
+      lastUserId: messages.findLast((item) => item.role === 'user')?.id,
+    });
+    if (this.sessionBaselines.size > MAX_JOBS) {
+      const oldest = this.sessionBaselines.keys().next().value;
+      if (oldest !== undefined) this.sessionBaselines.delete(oldest);
+    }
+  }
+
   adapter(id: string): AgentAdapter {
     const adapter = this.adapters.get(id);
     if (adapter) return adapter;
@@ -227,6 +257,7 @@ export class AgentManager {
     }
     this.evictFinishedJobs();
     if (this.jobs.size >= MAX_JOBS) throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
+    const historyBaseline = !sessionId ? { length: 0 } : this.sessionBaselines.get(sessionKey(agentId, sessionId));
     const job: AgentJob = {
       id,
       agentId,
@@ -236,6 +267,7 @@ export class AgentManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       text: '',
+      ...(historyBaseline ? { historyBaseline } : {}),
     };
     this.jobs.set(id, job);
     this.jobOwners.set(id, { adapter, exclusive: exclusiveSession, submission });
@@ -441,6 +473,9 @@ export class AgentManager {
     for (const key of this.latestSessionJob.keys()) {
       if (key.startsWith(prefix)) this.latestSessionJob.delete(key);
     }
+    for (const key of this.sessionBaselines.keys()) {
+      if (key.startsWith(prefix)) this.sessionBaselines.delete(key);
+    }
   }
 
   private evictFinishedJobs(): void {
@@ -498,9 +533,10 @@ export class AgentManager {
         }
         if (event.type === 'text' && event.text) {
           if (event.interim) {
-            if (event.alreadyStreamed) {
-              job.text = stripTrailingText(job.text, event.text);
-              reclassifyStreamedCommentary(job, event.text);
+            const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
+            if (retracted) {
+              job.text = stripTrailingText(job.text, retracted);
+              reclassifyStreamedCommentary(job, event.text, retracted);
             } else {
               appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
             }
@@ -658,12 +694,12 @@ function appendTimelineTool(job: AgentJob, toolId: string): void {
   job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind: 'tool', toolId }];
 }
 
-function reclassifyStreamedCommentary(job: AgentJob, commentary: string): void {
+function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retracted = commentary): void {
   const timeline = job.timeline ?? [];
   for (let i = timeline.length - 1; i >= 0; i--) {
     const entry = timeline[i];
     if (entry?.kind !== 'text') continue;
-    const remaining = stripTrailingText(entry.text, commentary);
+    const remaining = stripTrailingText(entry.text, retracted);
     if (remaining !== entry.text) {
       const next = [...timeline];
       const replacement = remaining
@@ -679,6 +715,7 @@ function reclassifyStreamedCommentary(job: AgentJob, commentary: string): void {
     }
     break;
   }
+  appendTimelineText(job, 'commentary', commentary, MAX_JOB_TEXT_LENGTH);
 }
 
 function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {
