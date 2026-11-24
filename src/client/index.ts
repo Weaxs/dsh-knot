@@ -58,6 +58,7 @@ interface AgentSummary {
   basePath?: string;
   port?: number;
   tls?: boolean;
+  encryptedOverlay?: boolean;
   acpTransport?: 'websocket' | 'stdio';
   acpCommand?: string;
   model?: string;
@@ -77,6 +78,7 @@ interface AgentFormState {
   endpoint: string;
   host: string;
   port: string;
+  encryptedOverlay: boolean;
   token: string;
   model: string;
   acpTransport: 'websocket' | 'stdio';
@@ -212,6 +214,7 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldEndpoint: '网关地址（HTTPS、HTTP 或 WebSocket）',
     fieldHost: '主机地址（IP 或 Tailscale 域名）',
     fieldPort: '本机网关端口（可选）',
+    fieldEncryptedOverlay: '我已确认此地址通过加密私网连接（如 Tailscale、Headscale 或 WireGuard）',
     fieldToken: 'Gateway Token / API Key（独立保存，无需环境变量）',
     fieldTokenKeep: '地址不变时留空可保留令牌',
     fieldClearToken: '清空已保存的 Token',
@@ -324,6 +327,8 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldEndpoint: 'Gateway URL (HTTPS, HTTP, or WebSocket)',
     fieldHost: 'Host (IP or Tailscale hostname)',
     fieldPort: 'Local gateway port (optional)',
+    fieldEncryptedOverlay:
+      'I verified that this endpoint uses an encrypted private network (e.g. Tailscale, Headscale, or WireGuard)',
     fieldToken: 'Gateway Token / API Key (stored per agent, 0600)',
     fieldTokenKeep: 'Leave blank to keep the token for the same endpoint',
     fieldClearToken: 'Clear saved token',
@@ -2223,6 +2228,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
     const [form, setForm] = React.useState<AgentFormState | null>(null);
     const [saving, setSaving] = React.useState(false);
     const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
+    const formAddress = (form?.transport === 'direct' ? form.endpoint : form?.host)?.trim();
+    const showEncryptedOverlay =
+      formAddress &&
+      !/^(?:https|wss):\/\//i.test(formAddress) &&
+      !/^(?:127\.0\.0\.1|localhost|\[?::1\]?)$/i.test(formAddress) &&
+      !(form?.kind === 'acp' && form.acpTransport === 'stdio');
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const stateRequest = React.useRef(0);
     const hasRunningRef = React.useRef(false);
@@ -2338,6 +2349,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
         endpoint: '',
         host: '',
         port: '',
+        encryptedOverlay: false,
         token: '',
         model: '',
         acpTransport: 'websocket',
@@ -2358,6 +2370,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
         endpoint: transport === 'direct' && agent.host ? formatDirectEndpoint(agent) : '',
         host: agent.host ?? '127.0.0.1',
         port: agent.port ? String(agent.port) : '',
+        encryptedOverlay: agent.encryptedOverlay === true,
         token: '',
         model: agent.model ?? '',
         acpTransport: transport === 'local' ? (agent.acpTransport ?? 'websocket') : 'websocket',
@@ -2382,6 +2395,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
           endpoint: form.transport === 'direct' ? form.endpoint.trim() : undefined,
           host: form.transport === 'local' ? form.host.trim() : undefined,
           port: form.transport === 'local' ? form.port.trim() || '' : undefined,
+          encryptedOverlay: form.encryptedOverlay,
           token: form.token,
           clearToken: form.clearToken,
           model: form.model,
@@ -2920,6 +2934,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                                   ...cur,
                                   kind: nextKind,
                                   port: cur.port === defaultPortForKind(cur.kind) ? '' : cur.port,
+                                  encryptedOverlay: false,
                                 }
                               : null,
                           );
@@ -2951,6 +2966,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                                   ...cur,
                                   transport: e.target.value as AgentFormState['transport'],
                                   acpTransport: e.target.value === 'direct' ? 'websocket' : cur.acpTransport,
+                                  encryptedOverlay: false,
                                 }
                               : null,
                           ),
@@ -2970,7 +2986,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           placeholder: defaultPortForKind(form.kind),
                           value: form.port,
                           onInput: (e: { target: { value: string } }) =>
-                            setForm((cur) => (cur ? { ...cur, port: e.target.value } : null)),
+                            setForm((cur) => (cur ? { ...cur, port: e.target.value, encryptedOverlay: false } : null)),
                         }),
                       )
                     : h('div', null),
@@ -2999,7 +3015,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           placeholder: 'https://my-vm.tailnet.ts.net',
                           value: form.endpoint,
                           onInput: (e: { target: { value: string } }) =>
-                            setForm((cur) => (cur ? { ...cur, endpoint: e.target.value } : null)),
+                            setForm((cur) =>
+                              cur ? { ...cur, endpoint: e.target.value, encryptedOverlay: false } : null,
+                            ),
                         }),
                       ),
                     )
@@ -3014,7 +3032,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           placeholder: '127.0.0.1',
                           value: form.host,
                           onInput: (e: { target: { value: string } }) =>
-                            setForm((cur) => (cur ? { ...cur, host: e.target.value } : null)),
+                            setForm((cur) => (cur ? { ...cur, host: e.target.value, encryptedOverlay: false } : null)),
                         }),
                       ),
                 form.kind === 'acp' && form.transport === 'local'
@@ -3035,7 +3053,13 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                               value: form.acpTransport,
                               onChange: (e: { target: { value: string } }) =>
                                 setForm((cur) =>
-                                  cur ? { ...cur, acpTransport: e.target.value as 'websocket' | 'stdio' } : null,
+                                  cur
+                                    ? {
+                                        ...cur,
+                                        acpTransport: e.target.value as 'websocket' | 'stdio',
+                                        encryptedOverlay: false,
+                                      }
+                                    : null,
                                 ),
                             },
                             h('option', { value: 'websocket' }, 'WebSocket'),
@@ -3071,6 +3095,19 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                             }),
                           )
                         : null,
+                    )
+                  : null,
+                showEncryptedOverlay
+                  ? h(
+                      'label',
+                      { style: { display: 'flex', alignItems: 'center', gap: '7px', fontSize: '12px' } },
+                      h('input', {
+                        type: 'checkbox',
+                        checked: form.encryptedOverlay,
+                        onChange: (e: { target: { checked: boolean } }) =>
+                          setForm((cur) => (cur ? { ...cur, encryptedOverlay: e.target.checked } : null)),
+                      }),
+                      h('span', null, t('fieldEncryptedOverlay')),
                     )
                   : null,
                 h(

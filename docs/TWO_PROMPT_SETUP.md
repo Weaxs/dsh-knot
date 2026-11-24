@@ -147,7 +147,7 @@ Task steps:
 
 3. Verify local private-network connectivity (skip if `network` is `same-host`):
    - **Tailscale**: Check if Tailscale is installed and connected to the matching tailnet (`tailnet_or_network_hint`). If missing, install Tailscale for my local OS and start login — pause only for my interactive login or OS permission approval.
-   - **Headscale / WireGuard / Private LAN**: Verify this machine can resolve and reach the handoff `endpoint_url` host over the existing private network without changing my existing VPN/Headscale control server. If unreachable, report the exact failing network hop.
+   - **Headscale / WireGuard / Private LAN**: Verify this machine can resolve and reach the handoff `endpoint_url` host over the existing private network without changing my existing VPN/Headscale control server. For a Headscale or WireGuard endpoint using HTTP or WS, verify that the route actually uses the encrypted overlay. If unreachable, report the exact failing network hop.
 
 4. Add or update the agent connection in **Remote Agents / 远端助手**:
    - Map the handoff fields cleanly:
@@ -155,6 +155,7 @@ Task steps:
      - Protocol (`kind`): `protocol` (`hermes`, `openclaw`, `dsh`, or `acp`)
      - Transport: `direct` for networked URLs (Tailscale/Headscale/WireGuard/LAN), or `local` for same-host loopback / ACP stdio (`acpTransport: stdio`, `acpCommand`, `acpArgs`).
      - Endpoint URL: clean `endpoint_url` with no credentials, query string, or fragment.
+     - For HTTP or WS over a verified, authenticated encrypted private network, select the encrypted private network checkbox or set `encryptedOverlay: true` via `agent-save` or declarative configuration. For an ordinary LAN gateway carrying credentials, use HTTPS or WSS.
    - Credential handling:
      - **Saving via Remote Agents (`/api/dsh-knot/agent-save` or panel UI)**:
        - Note that saving a **new** connection (or changing a gateway endpoint) without an explicit `token` writes `token: ""` and clears `tokenEnv`, which intentionally disables ambient environment-variable fallback.

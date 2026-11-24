@@ -12,6 +12,8 @@ The matrix reports **18 independent transport/target/protocol jobs**. Each trans
 | `tailscale` | Plugin → runner tailnet → sidecar tailnet IP → gateway                | Tailscale runner action and one sidecar per job           |
 | `headscale` | Plugin → self-hosted Headscale tailnet → sidecar tailnet IP → gateway | Headscale control plane and one Tailscale sidecar per job |
 
+The Tailscale and Headscale cases set `encryptedOverlay: true` for the sidecar peer endpoint. Both native and ACP jobs use the authenticated tailnet connection to protect gateway credentials.
+
 Every job tests exactly one target:
 
 1. Check protocol health.

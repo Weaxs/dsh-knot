@@ -317,6 +317,10 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const id = typeof body.id === 'string' ? body.id.trim() : '';
         if (!id) return errorReply('id is required', 400);
+        const encryptedOverlay = body.encryptedOverlay;
+        if (encryptedOverlay !== undefined && typeof encryptedOverlay !== 'boolean') {
+          return errorReply('encryptedOverlay must be a boolean', 400);
+        }
         await withAgentRouteLock(id, async () => {
           const existing = manager.getConfig(id);
           const incomingToken = typeof body.token === 'string' ? body.token.trim() : '';
@@ -372,6 +376,7 @@ export function registerWebRoutes(
             host: hostInput || undefined,
             port: resolvedPort,
             tls: resolvedTls,
+            encryptedOverlay,
             basePath: resolvedBasePath,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
             acpTransport,
@@ -391,6 +396,9 @@ export function registerWebRoutes(
             Boolean(existing.tls) === Boolean(normalized.tls) &&
             existing.basePath === normalized.basePath &&
             (existing.acpTransport ?? 'websocket') === (normalized.acpTransport ?? 'websocket');
+          if (sameGateway && encryptedOverlay === undefined && existing.encryptedOverlay !== undefined) {
+            normalized.encryptedOverlay = existing.encryptedOverlay;
+          }
           if (clearToken || incomingToken || !sameGateway) {
             // An empty token prevents falling back to the previous or ambient gateway credential.
             normalized.token = clearToken ? '' : incomingToken;

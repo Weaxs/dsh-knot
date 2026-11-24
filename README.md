@@ -123,7 +123,7 @@ Join the dsh device and both gateway hosts to the same tailnet, and enable HTTPS
 
 In Remote Agents, choose **Direct / Tailscale**, then paste each host's HTTPS URL and enter its gateway token. For ACP WebSocket endpoints, paste the full WebSocket URL (for example, `wss://agent.example-tailnet.ts.net/acp`). See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
-Tailscale's hosted service coordinates devices, which connect peer to peer when the network permits. Headscale offers self-hosted coordination. For an existing Headscale or WireGuard network, enter the gateway URL reachable over that private network. See [Tailscale connection types](https://tailscale.com/docs/reference/connection-types) and [Headscale setup](https://headscale.net/stable/setup/requirements/).
+Tailscale's hosted service coordinates devices, which connect peer to peer when the network permits. Headscale offers self-hosted coordination. For direct HTTP or WebSocket access over Tailscale, Headscale, or WireGuard, verify that the endpoint is reached through the encrypted private network and select the encrypted private network checkbox in Remote Agents. See [Tailscale connection types](https://tailscale.com/docs/reference/connection-types) and [Headscale setup](https://headscale.net/stable/setup/requirements/).
 
 ### Alternative: Declarative `cordis.patch.yml`
 
@@ -152,8 +152,7 @@ If you prefer declarative configuration, add agents under `knot` in `cordis.patc
       - id: dsh-remote
         kind: dsh
         transport: direct
-        host: dsh-host
-        port: 18790
+        host: https://dsh-host.example-tailnet.ts.net
         tokenEnv: DSH_GATEWAY_TOKEN
 ```
 
@@ -227,6 +226,10 @@ mcp_servers:
 | ------------------ | --------------------------------- | ------------------------------------------------------------ |
 | `direct` (default) | Tailscale, Headscale, private LAN | Provide a full endpoint URL or a `host` and optional `port`. |
 | `local`            | Agents on the same machine        | Defaults to `127.0.0.1` and supports ACP stdio subprocesses. |
+
+Credentialed connections require HTTPS or WSS outside loopback. For a verified encrypted overlay, select the encrypted private network checkbox in Remote Agents or set `encryptedOverlay: true` for the endpoint in `cordis.patch.yml`. If a saved HTTP or WebSocket connection is blocked after upgrading, edit its URL to use HTTPS or WSS, or select the checkbox after verifying the encrypted route. Ordinary private LANs require HTTPS or WSS.
+
+For `dsh-knot-acp`, the same rules apply to its connection to the native gateway. Set `DSH_KNOT_NATIVE_HOST` to an HTTPS or WSS URL, or set `DSH_KNOT_NATIVE_TLS=1` with a hostname. Use `DSH_KNOT_NATIVE_ENCRYPTED_OVERLAY=1` only for a verified encrypted private route to that gateway.
 
 ---
 

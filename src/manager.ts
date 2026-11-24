@@ -87,7 +87,17 @@ export class AgentManager {
   list(): Array<
     Pick<
       AgentConfig,
-      'id' | 'kind' | 'transport' | 'host' | 'port' | 'tls' | 'basePath' | 'acpTransport' | 'acpCommand' | 'model'
+      | 'id'
+      | 'kind'
+      | 'transport'
+      | 'host'
+      | 'port'
+      | 'tls'
+      | 'encryptedOverlay'
+      | 'basePath'
+      | 'acpTransport'
+      | 'acpCommand'
+      | 'model'
     > & {
       revision: string;
       hasToken: boolean;
@@ -103,6 +113,7 @@ export class AgentManager {
       host: config.host,
       port: config.port,
       tls: config.tls,
+      encryptedOverlay: config.encryptedOverlay,
       basePath: config.basePath,
       acpTransport: config.acpTransport,
       acpCommand: config.acpCommand,

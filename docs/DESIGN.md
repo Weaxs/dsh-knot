@@ -105,11 +105,13 @@ Remote deployments should keep the native listener on loopback behind a private 
 
 ### Direct (default)
 
-`direct` uses an explicit gateway URL or a hostname and port, with optional TLS. Use it on Tailscale, Headscale, a LAN, or another trusted network. With Tailscale Serve, keep the gateway on loopback and use its HTTPS endpoint. See the [setup guide](../README.md#quick-start).
+`direct` uses an explicit gateway URL or a hostname and port. With Tailscale Serve, keep the gateway on loopback and use its HTTPS endpoint. See the [setup guide](../README.md#quick-start).
 
 ### Local
 
 `local` uses `127.0.0.1` as the default host and also supports ACP stdio subprocesses.
+
+Both transports check the endpoint before sending gateway credentials. Outside loopback, HTTPS or WSS is required unless `encryptedOverlay: true` declares a verified, authenticated encrypted private route for that endpoint. Existing blocked entries remain editable. The [transport guide](../README.md#transports) covers setup and migration.
 
 ## Jobs and model tools
 

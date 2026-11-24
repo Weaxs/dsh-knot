@@ -40,6 +40,9 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
     throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
   const transport = agent.transport ?? 'direct';
   if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
+  if (agent.encryptedOverlay !== undefined && typeof agent.encryptedOverlay !== 'boolean') {
+    throw new ConfigError(`${agent.id}: encryptedOverlay must be a boolean`);
+  }
   if (agent.acpTransport === 'stdio') {
     if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
     if (transport !== 'local') throw new ConfigError(`${agent.id}: ACP stdio requires local transport`);

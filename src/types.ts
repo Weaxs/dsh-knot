@@ -10,6 +10,7 @@ export interface AgentConfig {
   host?: string;
   port?: number;
   tls?: boolean;
+  encryptedOverlay?: boolean;
   basePath?: string;
   token?: string;
   tokenEnv?: string;

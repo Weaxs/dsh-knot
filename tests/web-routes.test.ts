@@ -81,6 +81,9 @@ describe('web UI host routes & schemastery Config', () => {
     expect(parsed.agents).toEqual([]);
     expect(parsed.jobTimeoutMs).toBe(1_800_000);
     expect(parsed.mcp?.enabled).toBe(false);
+    expect(Config({ agents: [{ id: 'overlay', kind: 'hermes', encryptedOverlay: true }] }).agents?.[0]).toMatchObject({
+      encryptedOverlay: true,
+    });
   });
 
   it('serves state, doctor, sessions, respond, cancel, and live mcp-share toggles', async () => {
@@ -256,6 +259,38 @@ describe('web UI host routes & schemastery Config', () => {
     expect(manager.getConfig('hermes-second')?.token).toBe('per-agent-secret-token');
     expect(manager.getConfig('hermes-second')?.tls).toBe(true);
     expect(manager.getConfig('hermes-second')?.acpArgs).toEqual(['--flag']);
+
+    const overlayId = 'hermes-overlay';
+    const overlaySaved = await post(WEB_ROUTES.agentSave, {
+      id: overlayId,
+      kind: 'hermes',
+      endpoint: 'http://100.64.0.3:8642',
+      token: 'overlay-gateway-token',
+      encryptedOverlay: true,
+    });
+    expect(overlaySaved.value.agents.find((a: { id: string }) => a.id === overlayId)).toMatchObject({
+      hasToken: true,
+      encryptedOverlay: true,
+    });
+    expect(loadStoredState().agents.find((a) => a.id === overlayId)?.encryptedOverlay).toBe(true);
+    expect((await post(WEB_ROUTES.agentSave, { id: overlayId, model: 'deepseek-chat' })).ok).toBe(true);
+    expect(manager.getConfig(overlayId)?.encryptedOverlay).toBe(true);
+    expect((await post(WEB_ROUTES.agentSave, { id: overlayId, encryptedOverlay: 'true' })).ok).toBe(false);
+    expect((await post(WEB_ROUTES.agentSave, { id: overlayId, encryptedOverlay: false })).ok).toBe(true);
+    expect(manager.getConfig(overlayId)).toMatchObject({ encryptedOverlay: false, token: 'overlay-gateway-token' });
+    expect((await post(WEB_ROUTES.agentSave, { id: overlayId, encryptedOverlay: true })).ok).toBe(true);
+    expect(manager.getConfig(overlayId)).toMatchObject({ encryptedOverlay: true, token: 'overlay-gateway-token' });
+    const changedOverlay = await post(WEB_ROUTES.agentSave, {
+      id: overlayId,
+      endpoint: 'http://192.0.2.5:8642',
+      token: 'new-gateway-token',
+    });
+    expect(changedOverlay.ok).toBe(true);
+    expect(manager.getConfig(overlayId)?.encryptedOverlay).toBeUndefined();
+    expect(loadStoredState().agents.find((a) => a.id === overlayId)).toMatchObject({
+      host: '192.0.2.5',
+      token: 'new-gateway-token',
+    });
 
     vi.stubEnv('HERMES_API_KEY', 'ambient-secret');
     // Switching gateways clears the saved token and suppresses the ambient fallback.
@@ -1094,6 +1129,20 @@ describe('web UI host routes & schemastery Config', () => {
       const heading = findNode(dialog, (vnode) => vnode.type === 'h3')!;
       expect(dialog.props['aria-labelledby']).toBe(heading.props.id);
       expect(collectText(heading)).toContain('添加远端助手');
+      const endpoint = findNode(dialog, (vnode) => vnode.props.placeholder === 'https://my-vm.tailnet.ts.net')!;
+      const enterEndpoint = (value: string) =>
+        (endpoint.props.onInput as (e: { target: { value: string } }) => void)({ target: { value } });
+      const overlayInput = (node: unknown) =>
+        findNode(node, (vnode) => vnode.type === 'input' && vnode.props.type === 'checkbox');
+      enterEndpoint('http://100.64.0.3:8642');
+      const overlay = overlayInput(await flush())!;
+      expect(overlay.props.checked).toBe(false);
+      (overlay.props.onChange as (e: { target: { checked: boolean } }) => void)({ target: { checked: true } });
+      expect(overlayInput(await flush())?.props.checked).toBe(true);
+      enterEndpoint('http://192.0.2.5:8642');
+      expect(overlayInput(await flush())?.props.checked).toBe(false);
+      enterEndpoint('https://my-vm.tailnet.ts.net');
+      expect(overlayInput(await flush())).toBeUndefined();
       const close = findNode(dialog, (vnode) => vnode.props['aria-label'] === '关闭')!;
       (close.props.onClick as () => void)();
       dashboard = await flush();

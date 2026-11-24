@@ -1,8 +1,47 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { AcpAdapter } from '../src/adapters/acp.js';
+import { DshAdapter } from '../src/adapters/dsh.js';
+import { HermesAdapter } from '../src/adapters/hermes.js';
+import { OpenClawAdapter } from '../src/adapters/openclaw.js';
 import { normalizeConfig } from '../src/config.js';
+import { requireSecureGateway } from '../src/policy/auth.js';
 import { redact, redactText, redactTextSegments, retainRedactionTail, toolInputPreview } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
+  it.each([
+    ['hermes', HermesAdapter],
+    ['dsh', DshAdapter],
+    ['openclaw', OpenClawAdapter],
+    ['acp', AcpAdapter],
+  ] as const)('refuses a credential from the environment over plain LAN for %s', async (kind, Adapter) => {
+    vi.stubEnv('KNOT_TEST_GATEWAY_TOKEN', 'synthetic-test-credential');
+    const adapter = new Adapter('test', {
+      id: 'test',
+      kind,
+      host: '192.0.2.5',
+      transport: 'local',
+      tokenEnv: 'KNOT_TEST_GATEWAY_TOKEN',
+      connectTimeoutMs: 100,
+    });
+    try {
+      await expect(adapter.health()).rejects.toThrow(/gateway credentials require HTTPS\/WSS/);
+    } finally {
+      vi.unstubAllEnvs();
+      await adapter.close();
+    }
+  });
+
+  it('accepts loopback, TLS, or a verified overlay without granting trust based on the address range', () => {
+    const agent = { id: 'test', kind: 'acp' as const };
+    for (const host of ['localhost', '127.9.8.7', '::1', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1']) {
+      expect(() => requireSecureGateway({ ...agent, host })).not.toThrow();
+    }
+    expect(() => requireSecureGateway({ ...agent, host: '100.64.0.5' })).toThrow(/verified encrypted overlay/);
+    expect(() => requireSecureGateway({ ...agent, host: 'fe80::1%eth0' })).toThrow(/verified encrypted overlay/);
+    expect(() => requireSecureGateway({ ...agent, host: '100.64.0.5', encryptedOverlay: true })).not.toThrow();
+    expect(() => requireSecureGateway({ ...agent, host: 'gateway.test', tls: true })).not.toThrow();
+  });
+
   it('defaults to direct and assigns protocol ports', () => {
     const value = normalizeConfig({
       agents: [

@@ -47,6 +47,9 @@ export async function runDoctor(
 
 function gatewayHint(config: AgentConfig, detail: string): string {
   const value = detail.toLowerCase();
+  if (value.includes('gateway credentials require https/wss')) {
+    return 'Use an HTTPS/WSS endpoint, or enable the encrypted overlay setting after verifying the private network.';
+  }
   if (config.kind === 'openclaw' && /pairing.required|device.approval/.test(value)) {
     return 'Approve this device in OpenClaw, then run the check again.';
   }

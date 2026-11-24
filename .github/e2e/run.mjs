@@ -3,7 +3,9 @@ import { AgentManager } from '../../dist/manager.js';
 
 const mode = process.env.E2E_TRANSPORT ?? 'local';
 const protocol = process.env.E2E_PROTOCOL ?? 'native';
-const label = `${process.env.E2E_MODE_LABEL ?? mode}/${protocol}`;
+const network = process.env.E2E_MODE_LABEL ?? mode;
+const label = `${network}/${protocol}`;
+const encryptedOverlay = mode === 'direct' && (network === 'tailscale' || network === 'headscale');
 const timeoutMs = Number(process.env.E2E_TASK_TIMEOUT_MS ?? 180_000);
 
 if (mode !== 'local' && mode !== 'direct') throw new Error(`Unsupported E2E transport: ${mode}`);
@@ -22,6 +24,7 @@ function agentConfig(kind) {
       kind: 'acp',
       transport,
       host,
+      encryptedOverlay,
       port: 18792,
       token: 'e2e-acp-token',
       dshCwd: '/tmp',
@@ -33,6 +36,7 @@ function agentConfig(kind) {
     kind,
     transport,
     host,
+    encryptedOverlay,
     port: Number(process.env[`${upper}_PORT`] ?? (kind === 'hermes' ? 8642 : kind === 'openclaw' ? 18789 : 18790)),
     token:
       process.env[

@@ -16,6 +16,7 @@ import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
 import { raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText, urlHost } from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
@@ -491,9 +492,10 @@ export class AcpAdapter implements AgentAdapter {
 
   private openWebSocket() {
     const host = urlHost(this.config.host ?? '127.0.0.1');
-    const protocol = this.config.tls ? 'wss' : 'ws';
+    const protocol = this.config.tls === true ? 'wss' : 'ws';
     const path = this.config.basePath ?? '/acp';
     const token = secret(this.config);
+    if (token) requireSecureGateway(this.config);
     return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${path}`, {
       WebSocket: AcpWebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),

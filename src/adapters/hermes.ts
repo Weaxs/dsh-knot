@@ -8,6 +8,7 @@ import {
   shouldSkipRemoteCancel,
   stripTrailingText,
 } from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type {
@@ -410,6 +411,7 @@ export class HermesAdapter implements AgentAdapter {
 
   private headers(): Record<string, string> {
     const token = secret(this.config);
+    if (token) requireSecureGateway(this.config);
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
