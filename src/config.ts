@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { AgentConfig, PluginConfig } from './types.js';
 
@@ -39,6 +40,9 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
     throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
   const transport = agent.transport ?? 'direct';
   if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
+  if (agent.encryptedOverlay !== undefined && typeof agent.encryptedOverlay !== 'boolean') {
+    throw new ConfigError(`${agent.id}: encryptedOverlay must be a boolean`);
+  }
   if (agent.acpTransport === 'stdio') {
     if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
     if (transport !== 'local') throw new ConfigError(`${agent.id}: ACP stdio requires local transport`);
@@ -152,6 +156,31 @@ export class LocalOnlyAbortError extends Error {
 
 export function shouldSkipRemoteCancel(signal?: AbortSignal): boolean {
   return Boolean((signal?.reason as { skipRemoteCancel?: boolean } | undefined)?.skipRemoteCancel);
+}
+
+export function normalizeToolCallId(rawId: string): string {
+  return createHash('sha256').update(rawId).digest('hex');
+}
+
+export function stripTrailingText(source: string, suffix: string): string {
+  if (!suffix) return source;
+  if (source.endsWith(suffix)) return source.slice(0, -suffix.length);
+  const trimmedSource = source.trimEnd();
+  const trimmedSuffix = suffix.trim();
+  if (trimmedSuffix && trimmedSource.endsWith(trimmedSuffix)) {
+    return trimmedSource.slice(0, -trimmedSuffix.length);
+  }
+  return source;
+}
+
+export function matchStreamedInterim(streamed: string, interim: string): string {
+  if (!streamed || !interim) return '';
+  const normalizedStreamed = streamed.trim().replace(/\s+/g, ' ');
+  const normalizedInterim = interim.trim().replace(/\s+/g, ' ');
+  if (!normalizedStreamed || !normalizedInterim) return '';
+  if (normalizedInterim.startsWith(normalizedStreamed)) return streamed;
+  const remaining = stripTrailingText(streamed, interim);
+  return remaining !== streamed ? streamed.slice(remaining.length) : '';
 }
 
 export async function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

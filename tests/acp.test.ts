@@ -223,17 +223,36 @@ describe('ACP provider and bridge', () => {
     expect(missing.at(-1)?.text).toMatch(/not found/);
   });
 
-  it('propagates cancellation through ACP session/cancel', async () => {
-    class SlowAdapter extends FakeNativeAdapter {
-      override async *prompt(sessionId: string | undefined): AsyncIterable<AgentEvent> {
-        void sessionId;
+  it.each(['openclaw', 'hermes'] as const)('propagates %s cancellation through ACP session/cancel', async (kind) => {
+    let releasePrompt!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    class SlowAdapter implements AgentAdapter {
+      readonly id = 'native';
+      readonly kind = kind;
+      cancelled = false;
+      async health() {
+        return { ok: true };
+      }
+      async listSessions() {
+        return [];
+      }
+      async *prompt(): AsyncIterable<AgentEvent> {
         yield { type: 'text', text: 'working' };
-        while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
-        yield { type: 'final', text: 'working', stopReason: 'cancelled' };
+        await stopped;
+        if (this.cancelled) yield { type: 'final', text: 'working', stopReason: 'cancelled' };
+      }
+      async cancel() {
+        this.cancelled = true;
+        releasePrompt();
+      }
+      async close() {
+        releasePrompt();
       }
     }
     const native = new SlowAdapter();
-    const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
+    const bridge = new AcpBridge({ id: native.id, kind }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const adapter = new AcpAdapter('unified', {
       id: 'unified',
@@ -244,17 +263,18 @@ describe('ACP provider and bridge', () => {
       token: 'acp-test-token',
     });
     cleanups.push(async () => {
+      await native.close();
       await adapter.close();
       await bridge.close();
     });
 
     const events = [];
-    for await (const event of adapter.prompt(undefined, 'wait')) {
+    for await (const event of adapter.prompt(undefined, 'wait', AbortSignal.timeout(2_000))) {
       events.push(event);
       if (event.type === 'text' && event.text) await adapter.cancel(event.sessionId!);
     }
     expect(native.cancelled).toBe(true);
-    expect(events.at(-1)).toMatchObject({ type: 'final', stopReason: 'cancelled' });
+    expect(events.at(-1)).toMatchObject({ type: 'final', text: 'working', stopReason: 'cancelled' });
   });
 
   it('connects to a standard ACP stdio agent through ndJsonStream', async () => {
@@ -324,6 +344,90 @@ describe('ACP provider and bridge', () => {
     });
     cleanups.push(() => adapter.close());
     await expect(adapter.health()).rejects.toThrow(error);
+  });
+
+  it('closes a stalled WebSocket handshake on timeout and reconnects', async () => {
+    const { agent, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createNodeWebSocketUpgradeHandler } = await import('@agentclientprotocol/sdk/experimental/node');
+    const { AcpServer } = await import('@agentclientprotocol/sdk/experimental/server');
+    const { WebSocketServer } = await import('ws');
+    const http = await import('node:http');
+    const acpServer = new AcpServer({
+      createAgent: () => {
+        const app = agent({ name: 'retry-agent' });
+        app.onRequest(methods.agent.initialize, () => ({ protocolVersion: PROTOCOL_VERSION }));
+        return app;
+      },
+    });
+    const wss = new WebSocketServer({ noServer: true });
+    const upgrade = createNodeWebSocketUpgradeHandler(acpServer, wss);
+    const server = http.createServer((_request, response) => response.writeHead(404).end());
+    let stalled: import('node:stream').Duplex | undefined;
+    let markClosed = () => {};
+    const firstSocketClosed = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
+    server.on('upgrade', (request, socket, head) => {
+      if (stalled) {
+        upgrade(request, socket, head);
+        return;
+      }
+      stalled = socket;
+      socket.once('end', () => socket.end());
+      socket.once('close', markClosed);
+      socket.resume();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const adapter = new AcpAdapter('retry', {
+      id: 'retry',
+      kind: 'acp',
+      transport: 'local',
+      port,
+      connectTimeoutMs: 200,
+    });
+    cleanups.push(async () => {
+      await adapter.close();
+      stalled?.destroy();
+      for (const socket of wss.clients) socket.terminate();
+      await acpServer.close();
+      wss.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    await expect(adapter.health()).rejects.toThrow(/ACP initialize timed out/);
+    expect(stalled).toBeDefined();
+    await firstSocketClosed;
+    await expect(adapter.health()).resolves.toMatchObject({ ok: true });
+  });
+
+  it('does not start a WebSocket when closed during the same turn as connect', async () => {
+    const { createServer } = await import('node:net');
+    let opened = 0;
+    const server = createServer((socket) => {
+      opened++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const adapter = new AcpAdapter('closing', {
+      id: 'closing',
+      kind: 'acp',
+      transport: 'local',
+      port,
+      connectTimeoutMs: 200,
+    });
+
+    const health = adapter.health();
+    const closed = adapter.close();
+    const startup = await Promise.allSettled([health, closed]);
+    expect(opened).toBe(0);
+    expect(startup).toMatchObject([
+      { status: 'rejected', reason: { message: 'ACP adapter closed' } },
+      { status: 'fulfilled' },
+    ]);
+    await expect(adapter.health()).rejects.toThrow('ACP adapter closed');
   });
 
   it('paginates session/list via nextCursor to recover cwd for sessions on later pages', async () => {
@@ -443,8 +547,15 @@ describe('ACP provider and bridge', () => {
   it('keeps an ACP session busy after cancel() until the remote session/prompt returns its terminal response', async () => {
     const { AgentManager } = await import('../src/manager.js');
     let finishRemotePrompt!: () => void;
-    class DelayedStopAdapter extends FakeNativeAdapter {
-      override async *prompt(_sid: string | undefined, text: string): AsyncIterable<AgentEvent> {
+    const native: AgentAdapter = {
+      kind: 'openclaw',
+      async health() {
+        return { ok: true };
+      },
+      async listSessions() {
+        return [];
+      },
+      async *prompt(_sid: string | undefined, text: string) {
         if (text === 'turn 1') {
           yield { type: 'text', text: 'working' };
           await new Promise<void>((resolve) => {
@@ -454,10 +565,12 @@ describe('ACP provider and bridge', () => {
           return;
         }
         yield { type: 'final', text: 'turn-2-done', stopReason: 'completed' };
-      }
-    }
-    const native = new DelayedStopAdapter();
-    const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
+      },
+      async cancel() {},
+      async close() {},
+      id: 'native',
+    };
+    const bridge = new AcpBridge({ id: 'native', kind: native.kind }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const cfg = {
       id: 'delayed',
@@ -489,5 +602,441 @@ describe('ACP provider and bridge', () => {
     const settled = await manager.wait(second.id);
     expect(settled.status).toBe('completed');
     expect(settled.text).toBe('turn-2-done');
+  });
+
+  it.each([
+    { scenario: 'a genuine partial reply', interim: false, sessionId: undefined },
+    { scenario: 'a fresh interim prefix', interim: true, sessionId: undefined },
+    { scenario: 'resumed interim with a pending approval', interim: true, sessionId: 'existing-session' },
+    { scenario: 'a terminal arriving after the cancel caller aborts', interim: false, callerAborts: true },
+    { scenario: 'a WebSocket disconnect before the original terminal', interim: false, disconnect: true },
+  ])('drains $scenario when AgentManager cancels Hermes over ACP', async (scenario) => {
+    const { interim, sessionId, callerAborts, disconnect } = scenario;
+    const http = await import('node:http');
+    const { AgentManager } = await import('../src/manager.js');
+    const { HermesAdapter } = await import('../src/adapters/hermes.js');
+
+    let markStopped!: () => void;
+    const stopDone = new Promise<void>((resolve) => {
+      markStopped = resolve;
+    });
+    let closeSse!: (cancelled?: boolean) => void;
+    let stopRequests = 0;
+    let runs = 0;
+    let knownSession = 'existing-session';
+    const commentary = 'Checking repository...';
+    const streamed = sessionId ? commentary : interim ? 'Checking ' : 'partial hermes';
+    const partial = interim ? '' : streamed;
+    const capabilities = JSON.stringify({
+      object: 'hermes.api_server.capabilities',
+      features: { run_submission: true, run_status: true, run_events_sse: true, run_stop: true },
+    });
+    const hermesServer = http.createServer((req, res) => {
+      req.resume();
+      if (req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"status":"ok"}');
+        return;
+      }
+      if (req.url === '/v1/capabilities') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(capabilities);
+        return;
+      }
+      if (req.url === '/api/sessions?source=api_server') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sessions: [{ id: knownSession }] }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/v1/runs') {
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ run_id: `run_live_${++runs}` }));
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_2/events') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end('data: {"event":"run.completed","output":"next reply"}\n\n');
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_1/events') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`id: 1\ndata: ${JSON.stringify({ event: 'message.delta', delta: streamed })}\n\n`);
+        if (sessionId) {
+          res.write('id: 2\ndata: {"event":"approval.requested","request_id":"approval-1","choices":["approve"]}\n\n');
+        }
+        closeSse = (cancelled) => {
+          if (res.writableEnded) return;
+          if (cancelled && interim) {
+            res.write(
+              `id: 3\ndata: ${JSON.stringify({
+                event: 'message.interim',
+                text: commentary,
+                already_streamed: Boolean(sessionId),
+              })}\n\n`,
+            );
+          }
+          res.end(cancelled ? 'id: 4\ndata: {"event":"run.cancelled"}\n\n' : '');
+        };
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_1') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: disconnect && stopRequests < 2 ? 'running' : 'cancelled', output: partial }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/v1/runs/run_live_1/stop') {
+        stopRequests++;
+        const stillRunning = disconnect && stopRequests === 1;
+        res.writeHead(stillRunning ? 202 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: stillRunning ? 'running' : 'cancelled' }), markStopped);
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => hermesServer.listen(0, '127.0.0.1', resolve));
+    const hermesPort = (hermesServer.address() as { port: number }).port;
+
+    const hermesCfg = {
+      id: 'hermes-live',
+      kind: 'hermes' as const,
+      transport: 'local' as const,
+      host: '127.0.0.1',
+      port: hermesPort,
+    };
+    let resolveCancel!: () => void;
+    const cancelSettled = new Promise<void>((resolve) => {
+      resolveCancel = resolve;
+    });
+    const bridge = new AcpBridge(hermesCfg, (cfg) => {
+      const adapter = new HermesAdapter(cfg.id, cfg);
+      const origCancel = adapter.cancel.bind(adapter);
+      adapter.cancel = async (sessionId, signal) => {
+        await origCancel(sessionId, signal);
+        resolveCancel();
+      };
+      return adapter;
+    });
+    const { host, port } = await bridge.start({ port: 0, token: 'acp-stream-token' });
+    const manager = new AgentManager(
+      [{ id: 'bridged-live', kind: 'acp', transport: 'local', host, port, token: 'acp-stream-token' }],
+      10_000,
+    );
+    cleanups.push(async () => {
+      closeSse?.();
+      await manager.close();
+      await bridge.close();
+      await new Promise<void>((resolve) => hermesServer.close(() => resolve()));
+    });
+
+    const job = manager.start('bridged-live', 'stream and cancel', sessionId);
+    // The first chunk must arrive live while the Hermes SSE stream is still held open (not deferred until run.completed).
+    const deadline = Date.now() + 2_000;
+    while (
+      job.status === 'running' &&
+      (job.text !== streamed || (sessionId && !job.pendingApproval)) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(job.status, job.error).toBe('running');
+    expect(job.text).toBe(streamed);
+    if (sessionId) expect(job.pendingApproval?.requestId).toBe('approval-1');
+
+    // Cancelling through AgentManager.cancel() preserves the partial streamed reply and confirms remote stop.
+    const caller = new AbortController();
+    const stopping = manager.cancel(job.id, caller.signal);
+    await stopDone;
+    expect(job.remoteStop).toBe('pending');
+    expect(() => manager.start('bridged-live', 'too early', job.sessionId)).toThrow(/active or cancelling job/);
+    if (disconnect) {
+      knownSession = job.sessionId!;
+      const sockets = Reflect.get(bridge, 'webSocketServer') as import('ws').WebSocketServer;
+      expect(sockets.clients.size).toBe(1);
+      for (const socket of sockets.clients) socket.terminate();
+      await expect(stopping).rejects.toThrow(/terminal response/);
+      expect(await manager.wait(job.id)).toMatchObject({ remoteStop: 'unconfirmed', text: partial });
+      expect((await manager.cancel(job.id)).remoteStop).toBeUndefined();
+      expect(stopRequests).toBe(2);
+      const next = manager.start('bridged-live', 'continue after stop', job.sessionId);
+      expect(await manager.wait(next.id)).toMatchObject({ status: 'completed', text: 'next reply' });
+      return;
+    }
+    const retry = new AbortController();
+    const retryResult = manager.cancel(job.id, retry.signal);
+    const retryError = new Error('cancel caller disconnected');
+    retry.abort(retryError);
+    await expect(retryResult).rejects.toBe(retryError);
+    if (callerAborts) {
+      caller.abort(retryError);
+      await expect(stopping).rejects.toBe(retryError);
+      expect(await manager.wait(job.id)).toMatchObject({
+        status: 'cancelled',
+        remoteStop: 'unconfirmed',
+        text: partial,
+      });
+    }
+    closeSse(true);
+    const adapter = manager.adapter('bridged-live');
+    const remoteDeadline = Date.now() + 2_000;
+    while (callerAborts && adapter.isSessionBusy?.(job.sessionId!) && Date.now() < remoteDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    if (callerAborts) expect(adapter.isSessionBusy?.(job.sessionId!)).toBe(false);
+    const cancelled = callerAborts ? await manager.cancel(job.id) : await stopping;
+    const settled = await manager.wait(job.id);
+    await cancelSettled;
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.remoteStop).toBeUndefined();
+    expect(settled.status).toBe('cancelled');
+    expect(settled.text).toBe(partial);
+    expect(stopRequests).toBe(1);
+    if (interim) expect(settled.timeline).toEqual([{ kind: 'commentary', text: commentary }]);
+  });
+
+  it.each([
+    { deltaLengths: [2_000_001], failInitialStop: false },
+    { deltaLengths: [1_000_001, 1_000_000], failInitialStop: true },
+  ])('rejects oversized unclassified Hermes text on standard ACP', async ({ deltaLengths, failInitialStop }) => {
+    const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
+    const { default: WebSocket } = await import('ws');
+    let allowOverflow = () => {};
+    let finishStop = () => {};
+    let finishRetry = () => {};
+    let markAdmitted = () => {};
+    let markStopping = () => {};
+    let markRetrying = () => {};
+    const overflowGate = new Promise<void>((resolve) => {
+      allowOverflow = resolve;
+    });
+    const stopGate = new Promise<void>((resolve) => {
+      finishStop = resolve;
+    });
+    const retryGate = new Promise<void>((resolve) => {
+      finishRetry = resolve;
+    });
+    const admitted = new Promise<void>((resolve) => {
+      markAdmitted = resolve;
+    });
+    const stopping = new Promise<void>((resolve) => {
+      markStopping = resolve;
+    });
+    const retrying = new Promise<void>((resolve) => {
+      markRetrying = resolve;
+    });
+    class OversizedAdapter extends FakeNativeAdapter {
+      readonly stopTargets: Array<string | undefined> = [];
+
+      override async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
+        this.prompts.push({ sessionId: sessionId ?? '', text });
+        if (text !== 'oversized') {
+          yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
+          return;
+        }
+        markAdmitted();
+        await overflowGate;
+        for (const length of deltaLengths) yield { type: 'text', text: 'x'.repeat(length) };
+        yield { type: 'text', text: 'x'.repeat(2_000_001), interim: true, alreadyStreamed: true };
+        yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
+      }
+
+      override async cancel(): Promise<void> {
+        this.stopTargets.push(this.prompts.at(-1)?.text);
+        if (this.stopTargets.length > 1) {
+          markRetrying();
+          await retryGate;
+          return;
+        }
+        markStopping();
+        await stopGate;
+        if (failInitialStop) throw new Error('Stop failed');
+      }
+    }
+    const native = new OversizedAdapter();
+    const bridge = new AcpBridge({ id: native.id, kind: 'hermes' }, () => native);
+    const { host, port } = await bridge.start({ port: 0, token: 'acp-test-token' });
+    const connection = client().connect(
+      createWebSocketStream(`ws://${host}:${port}/acp`, {
+        WebSocket,
+        headers: { Authorization: 'Bearer acp-test-token' },
+      }),
+    );
+    cleanups.push(async () => {
+      allowOverflow();
+      finishStop();
+      finishRetry();
+      connection.close();
+      await bridge.close();
+    });
+    await connection.agent.request(methods.agent.initialize, {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    const session = await connection.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
+    const prompt = session.prompt('oversized');
+    const outcomes = Promise.allSettled([prompt, session.nextUpdate()]);
+    // A raw request bypasses the SDK's ActiveSession guard and exercises the bridge's ownership check.
+    const sendPrompt = (text: string) =>
+      connection.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text }],
+      });
+    await admitted;
+    await expect(sendPrompt('before overflow')).rejects.toThrow(/active prompt/i);
+    allowOverflow();
+    await stopping;
+    await expect(sendPrompt('during overflow cleanup')).rejects.toThrow(/active prompt/i);
+    finishStop();
+
+    const overflowFailure = {
+      status: 'rejected',
+      reason: {
+        message: expect.stringMatching(
+          failInitialStop
+            ? /unclassified text.*buffer limit.*stop is unconfirmed/i
+            : /unclassified text.*buffer limit/i,
+        ),
+      },
+    };
+    expect(await outcomes).toMatchObject([overflowFailure, overflowFailure]);
+    expect(native.stopTargets).toEqual(['oversized']);
+    if (failInitialStop) {
+      await expect(sendPrompt('before retry')).rejects.toThrow(/stop is unconfirmed/i);
+      await connection.agent.notify(methods.agent.session.cancel, { sessionId: session.sessionId });
+      await retrying;
+      expect(native.stopTargets).toEqual(['oversized', 'oversized']);
+      await expect(sendPrompt('before confirmed stop')).rejects.toThrow(/stop is unconfirmed/i);
+      finishRetry();
+    }
+    await expect(sendPrompt('after overflow')).resolves.toMatchObject({ stopReason: 'end_turn' });
+    expect(native.prompts.map(({ text }) => text)).toEqual(['oversized', 'after overflow']);
+  });
+
+  it('keeps Hermes interim commentary out of model-facing job.text and standard ACP SDK readText() over WebSocket', async () => {
+    const { AgentManager } = await import('../src/manager.js');
+    const { HermesAdapter } = await import('../src/adapters/hermes.js');
+    const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
+    const { default: WebSocket } = await import('ws');
+    const { Readable } = await import('node:stream');
+    type IncomingMessage = import('node:http').IncomingMessage;
+
+    const sseCases: Array<{ name: string; sse: string; hasThought: boolean }> = [
+      {
+        name: 'unstreamed-false',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+          'id: 2\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 3\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 4\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 5\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'streamed-true',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 2\ndata: {"event":"message.delta","delta":"repo..."}\n\n' +
+          'id: 3\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":true}\n\n' +
+          'id: 4\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 5\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 6\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 7\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'partial-prefix-resend-false',
+        hasThought: false,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking\\nrepo"}\n\n' +
+          'id: 2\ndata: {"event":"message.interim","text":"Checking repo now...","already_streamed":false}\n\n' +
+          'id: 3\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 4\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 5\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 6\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+      {
+        name: 'reasoning-between-deltas-and-interim-true',
+        hasThought: true,
+        sse:
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 2\ndata: {"event":"message.delta","delta":"repo..."}\n\n' +
+          'id: 3\ndata: {"event":"reasoning.available","text":"Inspect git status"}\n\n' +
+          'id: 4\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":true}\n\n' +
+          'id: 5\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+          'id: 6\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+          'id: 7\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+          'id: 8\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+      },
+    ];
+
+    for (const scenario of sseCases) {
+      const capabilities = JSON.stringify({
+        object: 'hermes.api_server.capabilities',
+        features: { run_submission: true, run_status: true, run_events_sse: true, run_stop: true },
+      });
+      const makeHermes = () =>
+        new HermesAdapter(
+          `hermes-${scenario.name}`,
+          { id: `hermes-${scenario.name}`, kind: 'hermes', transport: 'local' },
+          {
+            kind: 'local',
+            async request(req) {
+              if (req.path === '/v1/capabilities') return { status: 200, headers: {}, text: capabilities };
+              if (req.path === '/v1/runs') return { status: 202, headers: {}, text: '{"run_id":"run_1"}' };
+              return { status: 200, headers: {}, text: '{"status":"completed","output":"All clean."}' };
+            },
+            async stream() {
+              return Readable.from([scenario.sse]) as unknown as IncomingMessage;
+            },
+            async close() {},
+          },
+        );
+      const bridge = new AcpBridge({ id: `hermes-${scenario.name}`, kind: 'hermes' }, makeHermes);
+      const { host, port } = await bridge.start({ port: 0, token: 'acp-commentary-token' });
+
+      // 1. Standard unmodified ACP SDK client (ignores _meta) calling readText()
+      const sdkStream = createWebSocketStream(`ws://${host}:${port}/acp`, {
+        WebSocket,
+        headers: { Authorization: 'Bearer acp-commentary-token' },
+      });
+      const sdkConn = client().connect(sdkStream);
+      cleanups.push(async () => {
+        sdkConn.close();
+      });
+      await sdkConn.agent.request(methods.agent.initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: { name: 'standard-acp-test', version: '1.0.0' },
+        clientCapabilities: {},
+      });
+      const activeSession = await sdkConn.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
+      const promptDone = activeSession.prompt('check repo');
+      const standardText = await activeSession.readText();
+      await promptDone;
+      activeSession.dispose();
+      expect(standardText, scenario.name).toBe('All clean.');
+
+      // 2. Paired dsh-knot AcpAdapter + AgentManager preserves commentary in UI timeline while keeping job.text clean
+      const manager = new AgentManager(
+        [{ id: 'bridged', kind: 'acp', transport: 'local', host, port, token: 'acp-commentary-token' }],
+        10_000,
+      );
+      cleanups.push(async () => {
+        await manager.close();
+        await bridge.close();
+      });
+      const done = await manager.wait(manager.start('bridged', 'check repo', undefined).id);
+      expect(done.status, scenario.name).toBe('completed');
+      expect(done.text, scenario.name).toBe('All clean.');
+      expect(done.timeline, scenario.name).toEqual([
+        {
+          kind: 'commentary',
+          text: scenario.name === 'partial-prefix-resend-false' ? 'Checking repo now...' : 'Checking repo...',
+        },
+        ...(scenario.hasThought ? [{ kind: 'thought' as const, text: 'Inspect git status' }] : []),
+        { kind: 'tool', toolId: done.tools![0]!.id },
+        { kind: 'text', text: 'All clean.' },
+      ]);
+    }
   });
 });

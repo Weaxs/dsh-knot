@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
@@ -256,6 +257,7 @@ export class OpenClawAdapter implements AgentAdapter {
       throw new Error(
         `${this.id}: configure the agent token in DSH Knot UI (or tokenEnv / OPENCLAW_GATEWAY_TOKEN) for the OpenClaw gateway`,
       );
+    requireSecureGateway(this.config);
     const host = urlHost(this.config.host ?? '127.0.0.1');
     const port = this.config.port ?? 18_789;
     const tls = this.config.tls === true;

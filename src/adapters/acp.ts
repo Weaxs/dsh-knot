@@ -1,10 +1,12 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import {
   type ActiveSession,
   type ActiveSessionMessage,
   type AgentCapabilities,
   type ClientConnection,
+  type ContentBlock,
   client,
   methods,
   ndJsonStream,
@@ -14,8 +16,15 @@ import {
 } from '@agentclientprotocol/sdk';
 import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
 import WebSocket from 'ws';
+import {
+  STOP_RECOVERY_CAPABILITY,
+  STOP_RECOVERY_REQUEST,
+  STOP_RECOVERY_TURN_ID,
+  type StopRecoveryResponse,
+} from '../acp/stop-recovery.js';
 import { AsyncQueue } from '../async-queue.js';
-import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText, urlHost } from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
@@ -28,10 +37,24 @@ interface PendingPermission {
 
 type PromptMessage = { kind: 'acp'; value: ActiveSessionMessage } | { kind: 'native'; value: AgentEvent };
 
+class AcpWebSocket extends WebSocket {
+  constructor(url: string, protocols?: string | string[], options?: WebSocket.ClientOptions) {
+    super(url, protocols, options);
+    // The ACP SDK detaches its listeners when closing the stream, before ws can emit its asynchronous close error.
+    const ignoreCloseError = () => {};
+    this.on('error', ignoreCloseError);
+    this.once('close', () => this.off('error', ignoreCloseError));
+  }
+}
+
 export class AcpAdapter implements AgentAdapter {
   readonly kind = 'acp' as const;
   private readonly transport: Transport;
+  private readonly closing = new AbortController();
   private readonly queues = new Map<string, AsyncQueue<PromptMessage>>();
+  private readonly cancelledQueues = new WeakSet<AsyncQueue<PromptMessage>>();
+  private readonly promptTerminals = new WeakMap<AsyncQueue<PromptMessage>, Promise<unknown>>();
+  private readonly stopRecoveries = new WeakMap<AsyncQueue<PromptMessage>, (signal: AbortSignal) => Promise<void>>();
   private readonly inFlightPrompts = new Map<string, Promise<void>>();
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly loadedSessions = new Set<string>();
@@ -43,6 +66,8 @@ export class AcpAdapter implements AgentAdapter {
   private child?: ChildProcess;
   private connecting?: Promise<void>;
   private capabilities?: AgentCapabilities;
+  private supportsInterimRetraction = false;
+  private supportsStopRecovery = false;
 
   constructor(
     readonly id: string,
@@ -101,6 +126,33 @@ export class AcpAdapter implements AgentAdapter {
     return this.queues.has(actualId) || this.inFlightPrompts.has(actualId);
   }
 
+  promptTerminalForCancel(sessionId: string): Promise<unknown> | undefined {
+    const actualId = this.sessionIds.get(sessionId) ?? sessionId;
+    const queue = this.queues.get(actualId);
+    return queue && this.promptTerminals.get(queue);
+  }
+
+  recoverPromptStopForCancel(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined {
+    const queue = this.queues.get(this.sessionIds.get(sessionId) ?? sessionId);
+    return queue && this.stopRecoveries.get(queue);
+  }
+
+  private promptContent(sessionId: string, text: string, queue: AsyncQueue<PromptMessage>): ContentBlock[] {
+    if (!this.supportsStopRecovery) return [{ type: 'text' as const, text }];
+    const turnId = randomUUID();
+    this.stopRecoveries.set(queue, async (signal) => {
+      await this.connect(signal);
+      if (!this.supportsStopRecovery) throw new Error('ACP gateway no longer supports stop recovery');
+      const response = await this.connection!.agent.request<StopRecoveryResponse>(
+        STOP_RECOVERY_REQUEST,
+        { sessionId, turnId },
+        { cancellationSignal: signal, stopWaitingOnCancel: true },
+      );
+      if (response?.stopped !== true) throw new Error('ACP gateway did not confirm the remote stop');
+    });
+    return [{ type: 'text' as const, text, _meta: { [STOP_RECOVERY_TURN_ID]: turnId } }];
+  }
+
   async *prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent> {
     let actualId = sessionId ?? '';
     let output = '';
@@ -142,18 +194,18 @@ export class AcpAdapter implements AgentAdapter {
         if (this.queues.has(actualId) || this.inFlightPrompts.has(actualId)) {
           throw new Error(`ACP session "${actualId}" already has an active prompt in progress`);
         }
+        signal?.throwIfAborted();
         this.queues.set(actualId, queue);
-        yield { type: 'text', text: '', sessionId: actualId };
         const remotePrompt = this.connection!.agent.request(methods.agent.session.prompt, {
           sessionId: actualId,
-          prompt: [{ type: 'text', text }],
+          prompt: this.promptContent(actualId, text, queue),
         });
         this.trackInFlight(actualId, remotePrompt);
         remotePrompt.then(
           (response) => {
             queue.push({
               kind: 'native',
-              value: { type: 'final', text: output, stopReason: response.stopReason, sessionId: actualId },
+              value: { type: 'final', stopReason: response.stopReason, sessionId: actualId },
             });
           },
           (error) => {
@@ -177,9 +229,9 @@ export class AcpAdapter implements AgentAdapter {
         if (this.queues.has(actualId) || this.inFlightPrompts.has(actualId)) {
           throw new Error(`ACP session "${actualId}" already has an active prompt in progress`);
         }
+        signal?.throwIfAborted();
         this.queues.set(actualId, queue);
-        yield { type: 'text', text: '', sessionId: actualId };
-        const completion = active.prompt(text);
+        const completion = active.prompt(this.promptContent(actualId, text, queue));
         this.trackInFlight(actualId, completion);
         completion.catch((error) => {
           queue.push({
@@ -189,6 +241,7 @@ export class AcpAdapter implements AgentAdapter {
         });
         this.pumpUpdates(actualId, active);
       }
+      yield { type: 'text', text: '', sessionId: actualId };
       while (true) {
         const next = await queue.next(signal);
         if (next.done) throw new Error('ACP event stream ended before the prompt completed');
@@ -199,16 +252,30 @@ export class AcpAdapter implements AgentAdapter {
           }
           const event = acpEvent(next.value.value.update, secret(this.config));
           if (!event) continue;
-          if (event.type === 'text' && event.text) output += event.text;
+          if (event.type === 'text' && event.text) {
+            if (event.interim) {
+              const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
+              if (retracted) output = stripTrailingText(output, retracted);
+            } else {
+              output += event.text;
+            }
+          }
           yield { ...event, sessionId: actualId };
         } else {
           const event = next.value.value;
           if (event.type === 'error') throw new Error(event.text ?? 'ACP agent failed');
           if (event.type === 'final') {
-            yield { ...event, text: output || event.text || '', sessionId: actualId };
+            yield { ...event, text: output, sessionId: actualId };
             return;
           }
-          if (event.type === 'text' && event.text) output += event.text;
+          if (event.type === 'text' && event.text) {
+            if (event.interim) {
+              const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
+              if (retracted) output = stripTrailingText(output, retracted);
+            } else {
+              output += event.text;
+            }
+          }
           yield { ...event, sessionId: actualId };
         }
       }
@@ -241,7 +308,15 @@ export class AcpAdapter implements AgentAdapter {
   async cancel(sessionId: string, signal?: AbortSignal): Promise<void> {
     await this.connect(signal);
     const actualId = this.sessionIds.get(sessionId) ?? sessionId;
-    await this.connection!.agent.notify(methods.agent.session.cancel, { sessionId: actualId });
+    const queue = this.queues.get(actualId);
+    const rejectPermissions = queue && this.supportsInterimRetraction && !this.cancelledQueues.has(queue);
+    if (rejectPermissions) this.cancelledQueues.add(queue);
+    try {
+      await this.connection!.agent.notify(methods.agent.session.cancel, { sessionId: actualId });
+    } catch (error) {
+      if (rejectPermissions) this.cancelledQueues.delete(queue);
+      throw error;
+    }
     this.cancelPermissions(actualId);
   }
 
@@ -255,13 +330,13 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
+    this.closing.abort(new Error('ACP adapter closed'));
     this.cancelPermissions();
     for (const queue of this.queues.values()) queue.finish();
     this.queues.clear();
     this.clearSessions();
     this.connection?.close();
     this.connection = undefined;
-    this.connecting = undefined;
     await this.closeProcess();
     await this.transport.close();
   }
@@ -275,6 +350,8 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private trackInFlight(sessionId: string, promise: Promise<unknown>): void {
+    const queue = this.queues.get(sessionId);
+    if (this.supportsInterimRetraction && queue) this.promptTerminals.set(queue, promise);
     const settled = promise.then(
       () => {},
       () => {},
@@ -360,6 +437,7 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async connect(signal?: AbortSignal): Promise<void> {
+    this.closing.signal.throwIfAborted();
     if (signal?.aborted) throw signal.reason ?? new Error('request aborted');
     if (!this.connecting) {
       if (this.connection && !this.connection.signal.aborted) return;
@@ -381,8 +459,11 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async open(): Promise<void> {
+    this.supportsInterimRetraction = false;
+    this.supportsStopRecovery = false;
     this.clearSessions();
     await this.closeProcess();
+    this.closing.signal.throwIfAborted();
     const stream = this.config.acpTransport === 'stdio' ? this.openStdio() : this.openWebSocket();
     const app = client({ name: 'dsh-knot' });
     app.onNotification(methods.client.session.update, ({ params }) => {
@@ -392,7 +473,7 @@ export class AcpAdapter implements AgentAdapter {
     });
     app.onRequest(methods.client.session.requestPermission, ({ params }) => {
       const queue = this.queues.get(params.sessionId);
-      if (!queue || queue.failure) return { outcome: { outcome: 'cancelled' } };
+      if (!queue || queue.failure || this.cancelledQueues.has(queue)) return { outcome: { outcome: 'cancelled' } };
       const requestId = params.toolCall.toolCallId;
       const key = permissionKey(params.sessionId, requestId);
       const previous = this.permissions.get(key);
@@ -427,23 +508,30 @@ export class AcpAdapter implements AgentAdapter {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'dsh-knot', version: VERSION },
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+        _meta: { 'dsh-knot/interimRetraction': true, [STOP_RECOVERY_CAPABILITY]: true },
       }),
       this.config.connectTimeoutMs ?? 30_000,
       'ACP initialize',
+      this.closing.signal,
     );
+    this.closing.signal.throwIfAborted();
     if (initialized.protocolVersion !== PROTOCOL_VERSION) {
       throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}`);
     }
     this.capabilities = initialized.agentCapabilities;
+    this.supportsInterimRetraction = initialized._meta?.['dsh-knot/interimRetraction'] === true;
+    this.supportsStopRecovery =
+      this.config.acpTransport !== 'stdio' && initialized._meta?.[STOP_RECOVERY_CAPABILITY] === true;
   }
 
   private openWebSocket() {
     const host = urlHost(this.config.host ?? '127.0.0.1');
-    const protocol = this.config.tls ? 'wss' : 'ws';
+    const protocol = this.config.tls === true ? 'wss' : 'ws';
     const path = this.config.basePath ?? '/acp';
     const token = secret(this.config);
+    if (token) requireSecureGateway(this.config);
     return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${path}`, {
-      WebSocket,
+      WebSocket: AcpWebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
     });
   }
@@ -500,6 +588,20 @@ function acpEvent(update: SessionUpdate, token?: string): AgentEvent | undefined
     return { type: 'text', text: update.content.text };
   }
   if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') {
+    const meta = update._meta;
+    if (meta?.['dsh-knot/commentary'] === true) {
+      const retractText =
+        typeof meta['dsh-knot/retractText'] === 'string' && meta['dsh-knot/retractText']
+          ? meta['dsh-knot/retractText']
+          : undefined;
+      return {
+        type: 'text',
+        text: update.content.text,
+        interim: true,
+        ...(meta['dsh-knot/alreadyStreamed'] === true || retractText ? { alreadyStreamed: true } : {}),
+        ...(retractText ? { retractText } : {}),
+      };
+    }
     return { type: 'thought', text: update.content.text };
   }
   if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {

@@ -21,6 +21,9 @@ export const Config = Schema.object({
       host: Schema.string().description('Target hostname or full HTTP(S)/WS(S) gateway endpoint URL.'),
       port: Schema.number().description('Target TCP port (defaults per protocol, or 443 for HTTPS).'),
       tls: Schema.boolean().description('Use HTTPS/WSS for direct transport.'),
+      encryptedOverlay: Schema.boolean().description(
+        'Enable only if the gateway path uses an encrypted private network.',
+      ),
       basePath: Schema.string().description('HTTP path prefix or exact Gateway WebSocket path.'),
       token: Schema.string().role('secret').description('Gateway bearer or launch token for this agent.'),
       tokenEnv: Schema.string().description('Optional environment variable fallback holding the token.'),

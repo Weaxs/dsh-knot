@@ -4,7 +4,7 @@ import { runDoctor } from '../doctor.js';
 import type { AgentManager } from '../manager.js';
 import type { McpServer } from '../mcp/server.js';
 import type { SessionControllerLike } from '../mcp/session-service.js';
-import { redact } from '../policy/redact.js';
+import { redact, redactTextSegments } from '../policy/redact.js';
 import { updateStoredState } from '../store.js';
 import type { AgentConfig, AgentJob } from '../types.js';
 import { VERSION } from '../version.js';
@@ -43,7 +43,37 @@ function errorReply(message: string, status = 400): Response {
 }
 
 function jobPriority(job: AgentJob): number {
-  return Number(job.status === 'queued' || job.status === 'running' || job.remoteStop !== undefined);
+  return Number(
+    job.status === 'queued' ||
+      job.status === 'running' ||
+      job.remoteStop === 'pending' ||
+      job.remoteStop === 'unconfirmed',
+  );
+}
+
+function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
+  const { text, thought, timeline: originalTimeline, ...fields } = job;
+  const result: AgentJob = { ...redact(fields), text: '' };
+  const timeline = originalTimeline?.map((entry) => ({ ...entry }));
+  const textEntries = timeline?.filter((entry) => entry.kind !== 'tool') ?? [];
+  for (const [kind, fullText] of [
+    ['text', text],
+    ['thought', thought],
+    ['commentary', undefined],
+  ] as const) {
+    const context = manager.getOutputRedactionContext(job.id, kind);
+    if (kind !== 'commentary' && fullText !== undefined) {
+      result[kind] = redactTextSegments([fullText], undefined, context)[0]!;
+    }
+    const entries = textEntries.filter((entry) => entry.kind === kind);
+    const segments = entries.map((entry) => entry.text);
+    const texts = redactTextSegments(segments, fullText, context);
+    entries.forEach((entry, index) => {
+      entry.text = texts[index]!;
+    });
+  }
+  if (timeline) result.timeline = redact(timeline);
+  return result;
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -135,12 +165,11 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: redact(
-              manager
-                .listJobs({ currentOnly: true })
-                .sort((a, b) => jobPriority(b) - jobPriority(a))
-                .slice(0, 50),
-            ),
+            jobs: manager
+              .listJobs({ currentOnly: true })
+              .sort((a, b) => jobPriority(b) - jobPriority(a))
+              .slice(0, 50)
+              .map((job) => redactJob(manager, job)),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -186,7 +215,7 @@ export function registerWebRoutes(
           return errorReply('Invalid clientMessageId', 400);
         }
         const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
-        return jsonReply({ ok: true, value: redact(job) });
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -200,7 +229,9 @@ export function registerWebRoutes(
         }
         if (!manager.matchesRevision(agentId, revision)) return staleGateway();
         const job = manager.getCurrentJob(agentId, jobId);
-        return job ? jsonReply({ ok: true, value: redact(job) }) : errorReply('Job not found for this gateway', 404);
+        return job
+          ? jsonReply({ ok: true, value: redactJob(manager, job) })
+          : errorReply('Job not found for this gateway', 404);
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -214,7 +245,7 @@ export function registerWebRoutes(
         const choice = typeof body.choice === 'string' ? body.choice : '';
         if (!jobId || !requestId || !choice) return errorReply('jobId, requestId, and choice are required', 400);
         const job = await manager.respond(jobId, choice, request.signal, requestId);
-        return jsonReply({ ok: true, value: redact(job) });
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -225,8 +256,13 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const jobId = typeof body.jobId === 'string' ? body.jobId : '';
         if (!jobId) return errorReply('jobId is required', 400);
-        const job = await manager.cancel(jobId, request.signal);
-        return jsonReply({ ok: true, value: redact(job) });
+        if (body.releaseUnconfirmed !== undefined && typeof body.releaseUnconfirmed !== 'boolean') {
+          return errorReply('releaseUnconfirmed must be a boolean', 400);
+        }
+        const job = body.releaseUnconfirmed
+          ? manager.releaseUnconfirmedStop(jobId, request.signal)
+          : await manager.cancel(jobId, request.signal);
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -295,6 +331,10 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const id = typeof body.id === 'string' ? body.id.trim() : '';
         if (!id) return errorReply('id is required', 400);
+        const encryptedOverlay = body.encryptedOverlay;
+        if (encryptedOverlay !== undefined && typeof encryptedOverlay !== 'boolean') {
+          return errorReply('encryptedOverlay must be a boolean', 400);
+        }
         await withAgentRouteLock(id, async () => {
           const existing = manager.getConfig(id);
           const incomingToken = typeof body.token === 'string' ? body.token.trim() : '';
@@ -350,6 +390,7 @@ export function registerWebRoutes(
             host: hostInput || undefined,
             port: resolvedPort,
             tls: resolvedTls,
+            encryptedOverlay,
             basePath: resolvedBasePath,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
             acpTransport,
@@ -369,6 +410,9 @@ export function registerWebRoutes(
             Boolean(existing.tls) === Boolean(normalized.tls) &&
             existing.basePath === normalized.basePath &&
             (existing.acpTransport ?? 'websocket') === (normalized.acpTransport ?? 'websocket');
+          if (sameGateway && encryptedOverlay === undefined && existing.encryptedOverlay !== undefined) {
+            normalized.encryptedOverlay = existing.encryptedOverlay;
+          }
           if (clearToken || incomingToken || !sameGateway) {
             // An empty token prevents falling back to the previous or ambient gateway credential.
             normalized.token = clearToken ? '' : incomingToken;

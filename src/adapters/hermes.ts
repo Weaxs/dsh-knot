@@ -1,6 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import {
+  matchStreamedInterim,
+  normalizeToolCallId,
+  raceAbort,
+  secret,
+  shouldSkipRemoteCancel,
+  stripTrailingText,
+} from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type {
@@ -9,15 +17,25 @@ import type {
   AgentEvent,
   AgentPromptOptions,
   AgentSession,
+  AgentToolActivity,
   AgentTranscriptMessage,
   Transport,
 } from '../types.js';
 import { readSse } from './sse.js';
 
 const MAX_TRANSCRIPT_MESSAGES = 200;
+const MAX_TRANSCRIPT_THOUGHT_LENGTH = 16_000;
+const MAX_TRANSCRIPT_TOOLS = 50;
 const MAX_TRACKED_RUNS = 500;
 const STOP_TIMEOUT_MS = 4_000;
 const TERMINAL_RUN_STATUSES = new Set(['cancelled', 'canceled', 'completed', 'failed', 'interrupted']);
+const APPROVAL_SETTLED_RE = /responded|resolved|settled|completed|approved|denied|rejected|cancelled/;
+const REASONING_EVENT_RE = /^(?:reasoning|thinking|thought)(?:\.|$)/;
+
+interface HermesApprovalContext {
+  runId: string;
+  executionGeneration?: number;
+}
 
 export class HermesAdapter implements AgentAdapter {
   readonly kind = 'hermes' as const;
@@ -25,6 +43,7 @@ export class HermesAdapter implements AgentAdapter {
   private readonly closing = new AbortController();
   private readonly admissions = new Map<string, Promise<string>>();
   private readonly runs = new Map<string, string>();
+  private readonly approvalContexts = new Map<string, HermesApprovalContext>();
 
   constructor(
     readonly id: string,
@@ -58,9 +77,10 @@ export class HermesAdapter implements AgentAdapter {
       .map((row: Record<string, unknown>) => {
         const updatedAt =
           typeof row.last_active === 'number' ? row.last_active * 1_000 : (row.last_active ?? row.updated_at);
+        const title = firstNonEmptyString(row.title, row.preview);
         return {
           id: String(row.session_id ?? row.id ?? ''),
-          ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
+          ...(title ? { title } : {}),
           ...(typeof updatedAt === 'number' || typeof updatedAt === 'string' ? { updatedAt } : {}),
         };
       })
@@ -76,12 +96,18 @@ export class HermesAdapter implements AgentAdapter {
 
     const messages: AgentTranscriptMessage[] = [];
     const ids = new Set<string>();
+    const token = secret(this.config);
     // shortcut: keep a recent message window until the chat supports loading older pages.
     for (let index = rows.length - 1; index >= 0 && messages.length < MAX_TRANSCRIPT_MESSAGES; index--) {
       const row = rows[index];
       if (row?.role !== 'user' && row?.role !== 'assistant') continue;
       const text = transcriptText(row.content);
-      if (!text.trim()) continue;
+      const thought =
+        row.role === 'assistant'
+          ? (transcriptThought(row.reasoning_content) ?? transcriptThought(row.reasoning))
+          : undefined;
+      const tools = row.role === 'assistant' ? transcriptTools(row.tool_calls, index, token) : undefined;
+      if (!text.trim() && !thought && !tools?.length) continue;
       const remoteId = row.id;
       const candidate =
         (typeof remoteId === 'string' && remoteId.length > 0) || Number.isSafeInteger(remoteId)
@@ -89,7 +115,13 @@ export class HermesAdapter implements AgentAdapter {
           : '';
       const id = candidate && !ids.has(candidate) ? candidate : `row:${index}`;
       ids.add(id);
-      messages.push({ id, role: row.role, text });
+      messages.push({
+        id,
+        role: row.role,
+        text,
+        ...(thought ? { thought } : {}),
+        ...(tools?.length ? { tools } : {}),
+      });
     }
     return messages.reverse();
   }
@@ -99,12 +131,16 @@ export class HermesAdapter implements AgentAdapter {
     text: string,
     signal?: AbortSignal,
     options?: AgentPromptOptions,
+    onRunAdmitted?: (runId: string) => void,
   ): AsyncIterable<AgentEvent> {
     const id = sessionId ?? `dsh_${randomUUID()}`;
     const runId = await this.admitRun(id, text, signal, options);
+    onRunAdmitted?.(runId);
     signal?.throwIfAborted();
     let terminal = false;
     let output = '';
+    // Keep the current step's original prefix available for `message.interim` resends.
+    let stepStart = 0;
     let response: Awaited<ReturnType<Transport['stream']>>;
     try {
       response = await this.transport.stream({
@@ -138,8 +174,9 @@ export class HermesAdapter implements AgentAdapter {
           const started = /^tool\.start(?:ed)?$/.test(type);
           const ended = /^tool\.(?:complete(?:d)?|end(?:ed)?|finish(?:ed)?|failed)$/.test(type);
           if (!started && !ended) continue;
+          stepStart = output.length;
           const name = event.tool ?? event.name ?? event.tool_name;
-          const requestId = event.tool_call_id;
+          const requestId = firstNonEmptyString(event.tool_call_id);
           const inputPreview =
             started && typeof event.preview === 'string'
               ? toolInputPreview(event.preview, secret(this.config))
@@ -149,24 +186,75 @@ export class HermesAdapter implements AgentAdapter {
             phase: ended ? 'end' : 'start',
             name: typeof name === 'string' && name ? name : 'tool',
             ...(inputPreview ? { inputPreview } : {}),
-            ...(typeof requestId === 'string' && requestId ? { requestId } : {}),
+            ...(requestId ? { requestId } : {}),
             ...(ended && (type === 'tool.failed' || event.error === true) ? { failed: true } : {}),
           };
+          continue;
+        }
+        if (isApproval) {
+          stepStart = output.length;
+          // Hermes session_authority emits `prompt_id` + `execution_generation`; legacy runs emit `request_id`.
+          const requestId = firstNonEmptyString(event.prompt_id, event.request_id, event.id, frame.id);
+          const executionGeneration =
+            typeof event.execution_generation === 'number' && Number.isInteger(event.execution_generation)
+              ? event.execution_generation
+              : undefined;
+          if (APPROVAL_SETTLED_RE.test(type)) {
+            if (requestId) {
+              const key = approvalKey(id, requestId);
+              const context = this.approvalContexts.get(key);
+              if (
+                context?.runId === runId &&
+                (executionGeneration === undefined || context.executionGeneration === executionGeneration)
+              ) {
+                this.approvalContexts.delete(key);
+              }
+              yield { type: 'approval', phase: 'end', requestId };
+            }
+          } else {
+            if (requestId) this.rememberApproval(id, requestId, runId, executionGeneration);
+            yield {
+              type: 'approval',
+              requestId,
+              text: formatApprovalText(event.description, event.command),
+              choices: stringChoices(event.choices),
+            };
+          }
+          continue;
+        }
+        if (REASONING_EVENT_RE.test(type)) {
+          const thought = textOf(event.delta ?? event.text_delta ?? event.text ?? event.content);
+          if (thought) yield { type: 'thought', text: thought };
+          continue;
+        }
+        if (type === 'message.interim') {
+          // Mid-turn commentary belongs in the UI timeline only; keep `output` aligned with the final reply.
+          // Hermes sends `already_streamed: false` both when nothing was streamed and when only a prefix
+          // was streamed before resending the full commentary, and may emit `reasoning.available` in between.
+          const interim = textOf(event.text ?? event.content ?? event.delta);
+          const matched =
+            matchStreamedInterim(output.slice(stepStart), interim) || (event.already_streamed === true ? interim : '');
+          if (matched) output = stripTrailingText(output, matched);
+          stepStart = output.length;
+          if (interim) {
+            if (matched) {
+              yield {
+                type: 'text',
+                text: interim,
+                interim: true,
+                alreadyStreamed: true,
+                ...(matched !== interim ? { retractText: matched } : {}),
+              };
+            } else {
+              yield { type: 'text', text: interim, interim: true };
+            }
+          }
           continue;
         }
         const textDelta = textOf(event.delta ?? event.text_delta ?? event.content);
         if (textDelta) {
           output += textDelta;
           yield { type: 'text', text: textDelta };
-        }
-        if (isApproval && !/responded|resolved|completed|approved|denied|rejected|cancelled/.test(type)) {
-          const requestId = String(event.request_id ?? event.id ?? frame.id ?? '');
-          yield {
-            type: 'approval',
-            requestId,
-            text: String(event.description ?? event.command ?? 'Approval requested'),
-            choices: stringChoices(event.choices),
-          };
         }
         if (/^run\.(completed|failed|cancelled|interrupted)$/.test(type)) {
           terminal = true;
@@ -187,15 +275,40 @@ export class HermesAdapter implements AgentAdapter {
           break;
         }
       }
+      if (!terminal && !signal?.aborted) {
+        yield runStatusEvent(await this.status(runId, signal), output);
+      }
     } finally {
       response.destroy();
-    }
-    if (!terminal && !signal?.aborted) {
-      yield runStatusEvent(await this.status(runId, signal), output);
+      this.clearRunApprovals(id, runId);
     }
   }
 
   async cancel(sessionId: string, signal?: AbortSignal): Promise<void> {
+    await this.withStopDeadline(signal, async (stopSignal) => {
+      const admission = this.admissions.get(sessionId);
+      const runId = admission ? await raceAbort(admission, stopSignal) : this.runs.get(sessionId);
+      if (!runId) throw new Error('The run ID is unavailable');
+      await this.stopRun(runId, stopSignal);
+    });
+  }
+
+  async cancelRun(runId: string, signal?: AbortSignal): Promise<void> {
+    await this.withStopDeadline(signal, async (stopSignal) => {
+      try {
+        await this.stopRun(runId, stopSignal);
+      } catch (error) {
+        stopSignal.throwIfAborted();
+        const state = await this.status(runId, stopSignal).catch(() => undefined);
+        if (!TERMINAL_RUN_STATUSES.has(String(state?.status))) throw error;
+      }
+    });
+  }
+
+  private async withStopDeadline(
+    signal: AbortSignal | undefined,
+    stop: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
     const stopSignal = AbortSignal.any([
       this.closing.signal,
       AbortSignal.timeout(STOP_TIMEOUT_MS),
@@ -203,38 +316,47 @@ export class HermesAdapter implements AgentAdapter {
     ]);
     try {
       stopSignal.throwIfAborted();
-      const admission = this.admissions.get(sessionId);
-      const runId = admission ? await raceAbort(admission, stopSignal) : this.runs.get(sessionId);
-      if (!runId) throw new Error('The run ID is unavailable');
-      const acknowledgement = await this.json(`/v1/runs/${encodeURIComponent(runId)}/stop`, {
-        method: 'POST',
-        body: {},
-        signal: stopSignal,
-      });
-      if (TERMINAL_RUN_STATUSES.has(acknowledgement.status)) return;
-      while (true) {
-        const state = await this.status(runId, stopSignal);
-        if (TERMINAL_RUN_STATUSES.has(String(state.status))) return;
-        await delay(250, undefined, { signal: stopSignal });
-      }
+      await stop(stopSignal);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Hermes remote stop is unconfirmed: ${detail}`, { cause: error });
     }
   }
 
-  async respond(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
-    const runId = this.runs.get(sessionId);
-    if (!runId) throw new Error(`No active Hermes run is recorded for session ${sessionId}`);
-    await this.json(`/v1/runs/${encodeURIComponent(runId)}/approval`, {
+  private async stopRun(runId: string, signal: AbortSignal): Promise<void> {
+    const acknowledgement = await this.json(`/v1/runs/${encodeURIComponent(runId)}/stop`, {
       method: 'POST',
-      body: { request_id: requestId, choice },
+      body: {},
       signal,
     });
+    if (TERMINAL_RUN_STATUSES.has(acknowledgement.status)) return;
+    while (true) {
+      const state = await this.status(runId, signal);
+      if (TERMINAL_RUN_STATUSES.has(String(state.status))) return;
+      await delay(250, undefined, { signal });
+    }
+  }
+
+  async respond(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
+    const key = approvalKey(sessionId, requestId);
+    const context = this.approvalContexts.get(key);
+    if (!context) throw new Error(`No pending Hermes approval request ${requestId} for session ${sessionId}`);
+    // Hermes session_authority strictly requires the exact 3-key set including `execution_generation`.
+    const body =
+      context.executionGeneration !== undefined
+        ? { request_id: requestId, execution_generation: context.executionGeneration, choice }
+        : { request_id: requestId, choice };
+    await this.json(`/v1/runs/${encodeURIComponent(context.runId)}/approval`, {
+      method: 'POST',
+      body,
+      signal,
+    });
+    if (this.approvalContexts.get(key) === context) this.approvalContexts.delete(key);
   }
 
   async close(): Promise<void> {
     this.closing.abort(new Error('Hermes adapter closed'));
+    this.approvalContexts.clear();
     await this.transport.close();
   }
 
@@ -292,12 +414,31 @@ export class HermesAdapter implements AgentAdapter {
     }
   }
 
+  private rememberApproval(sessionId: string, requestId: string, runId: string, executionGeneration?: number): void {
+    const key = approvalKey(sessionId, requestId);
+    this.approvalContexts.delete(key);
+    this.approvalContexts.set(key, { runId, executionGeneration });
+    while (this.approvalContexts.size > MAX_TRACKED_RUNS) {
+      const oldest = this.approvalContexts.keys().next().value;
+      if (oldest === undefined) break;
+      this.approvalContexts.delete(oldest);
+    }
+  }
+
+  private clearRunApprovals(sessionId: string, runId: string): void {
+    const prefix = `${sessionId}\0`;
+    for (const [key, context] of this.approvalContexts) {
+      if (context.runId === runId && key.startsWith(prefix)) this.approvalContexts.delete(key);
+    }
+  }
+
   private async status(runId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.json(`/v1/runs/${encodeURIComponent(runId)}`, { signal });
   }
 
   private headers(): Record<string, string> {
     const token = secret(this.config);
+    if (token) requireSecureGateway(this.config);
     return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
@@ -355,6 +496,66 @@ function textOf(value: unknown): string {
     return textOf(row.text ?? row.content ?? row.output_text ?? row.output ?? row.message);
   }
   return '';
+}
+
+function approvalKey(sessionId: string, requestId: string): string {
+  return `${sessionId}\0${requestId}`;
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return '';
+}
+
+function formatApprovalText(description: unknown, command: unknown): string {
+  const desc = typeof description === 'string' ? description.trim() : '';
+  const cmd = typeof command === 'string' ? command.trim() : '';
+  if (desc && cmd && desc !== cmd && !desc.includes(cmd)) return `${desc}\n${cmd}`;
+  return desc || cmd || 'Approval requested';
+}
+
+function transcriptThought(value: unknown): string | undefined {
+  const thought = textOf(value).trim();
+  return thought ? thought.slice(-MAX_TRANSCRIPT_THOUGHT_LENGTH) : undefined;
+}
+
+function transcriptTools(rawToolCalls: unknown, rowIndex: number, token?: string): AgentToolActivity[] | undefined {
+  if (!Array.isArray(rawToolCalls) || rawToolCalls.length === 0) return undefined;
+  const tools: AgentToolActivity[] = [];
+  for (let i = 0; i < rawToolCalls.length && tools.length < MAX_TRANSCRIPT_TOOLS; i++) {
+    const item = rawToolCalls[i] as Record<string, unknown> | null | undefined;
+    if (!item || typeof item !== 'object') continue;
+    const fn = item.function as Record<string, unknown> | null | undefined;
+    const rawName = fn?.name ?? item.name ?? item.tool ?? item.tool_name;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim().slice(0, 120) : 'tool';
+    const rawArgs = fn?.arguments ?? item.arguments ?? item.input;
+    const parsedArgs = parseToolArguments(rawArgs);
+    const inputPreview = toolInputPreview(parsedArgs, token);
+    const rawCallId = firstNonEmptyString(item.id, item.tool_call_id);
+    // Match AgentManager's SHA-256 live tool call ID normalization so history and live calls deduplicate by identity.
+    const callId = rawCallId ? normalizeToolCallId(rawCallId) : `row:${rowIndex}:tool:${i}`;
+    tools.push({
+      id: callId,
+      name,
+      status: 'completed',
+      ...(inputPreview ? { inputPreview } : {}),
+    });
+  }
+  return tools.length > 0 ? tools : undefined;
+}
+
+function parseToolArguments(raw: unknown): unknown {
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
 }
 
 function stringChoices(value: unknown): string[] {

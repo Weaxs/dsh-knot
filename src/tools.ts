@@ -90,10 +90,23 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
     defineTool({
       name: 'agent_cancel',
       description: 'Cancel a running task on a remote Hermes, OpenClaw, or DSH agent.',
-      parameters: { job: { type: 'string', required: true } },
+      parameters: {
+        job: { type: 'string', required: true },
+        releaseUnconfirmed: {
+          type: 'boolean',
+          description:
+            'Release only the local session after an unconfirmed stop. Requires user confirmation because the remote task may still be running.',
+        },
+      },
       output,
       async execute(args, exec) {
-        return plain(modelJob(await manager.cancel(args.job, exec.signal)));
+        return plain(
+          modelJob(
+            args.releaseUnconfirmed === true
+              ? manager.releaseUnconfirmedStop(args.job, exec.signal)
+              : await manager.cancel(args.job, exec.signal),
+          ),
+        );
       },
     }),
   );
@@ -121,11 +134,22 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
 
   if (typeof (ctx as unknown as { on?: (...args: unknown[]) => unknown }).on === 'function') {
     ctx.on('tools/pre-execute', async (exec, next) => {
-      if (exec.name !== 'agent_respond') return next();
+      const args = exec.arguments as Record<string, unknown> | undefined;
+      const release = exec.name === 'agent_cancel' && args?.releaseUnconfirmed === true;
+      if (exec.name !== 'agent_respond' && !release) return next();
       const decision = await next();
       if (decision.kind === 'deny' || decision.kind === 'cancel') return decision;
-      const args = exec.arguments as Record<string, unknown> | undefined;
       const jobId = typeof args?.job === 'string' ? args.job : '';
+      if (release) {
+        return {
+          kind: 'ask',
+          reason: `Releasing the local session for job ${jobId} requires explicit user confirmation. The remote task may still be running.`,
+          displayReason: {
+            en: `Release the local session for job ${jobId}? The remote task may still be running.`,
+            'zh-CN': `释放任务 ${jobId} 的本地会话？远端任务可能仍在运行。`,
+          },
+        };
+      }
       const requestId = typeof args?.request_id === 'string' ? args.request_id : '';
       const choice = typeof args?.choice === 'string' ? args.choice : '';
       let promptDetail = '';
@@ -165,7 +189,13 @@ function plain(value: unknown): any {
   return JSON.parse(JSON.stringify(value));
 }
 
-function modelJob({ thought: _thought, tools, ...job }: AgentJob): AgentJob {
+function modelJob({
+  thought: _thought,
+  timeline: _timeline,
+  historyBaseline: _historyBaseline,
+  tools,
+  ...job
+}: AgentJob): AgentJob {
   return { ...job, ...(tools ? { tools: tools.map(({ id, name, status }) => ({ id, name, status })) } : {}) };
 }
 

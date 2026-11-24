@@ -10,6 +10,7 @@ export interface AgentConfig {
   host?: string;
   port?: number;
   tls?: boolean;
+  encryptedOverlay?: boolean;
   basePath?: string;
   token?: string;
   tokenEnv?: string;
@@ -60,6 +61,9 @@ export interface PluginConfig {
 export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
+  interim?: boolean;
+  alreadyStreamed?: boolean;
+  retractText?: string;
   name?: string;
   title?: string;
   phase?: 'pending' | 'start' | 'end';
@@ -82,6 +86,8 @@ export interface AgentTranscriptMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  thought?: string;
+  tools?: AgentToolActivity[];
 }
 
 export interface AgentPromptOptions {
@@ -101,6 +107,8 @@ export interface AgentAdapter {
     options?: AgentPromptOptions,
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
+  promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
+  recoverPromptStopForCancel?(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;
@@ -139,18 +147,32 @@ export interface AgentToolActivity {
   inputPreview?: string;
 }
 
+export type AgentTimelineEntry =
+  | { kind: 'thought'; text: string }
+  | { kind: 'commentary'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; toolId: string };
+
+export interface SessionHistoryBaseline {
+  length: number;
+  lastId?: string;
+}
+
 export interface AgentJob {
   id: string;
   agentId: string;
   sessionId?: string;
   prompt?: string;
   status: JobStatus;
+  sequence?: number;
   createdAt: number;
   updatedAt: number;
   text: string;
   thought?: string;
   tools?: AgentToolActivity[];
+  timeline?: AgentTimelineEntry[];
+  historyBaseline?: SessionHistoryBaseline;
   error?: string;
-  remoteStop?: 'pending' | 'unconfirmed';
+  remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
 }

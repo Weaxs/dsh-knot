@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,6 +22,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Version sync
+        run: node scripts/sync-version.mjs --check "v$(node -p 'require("./package.json").version')"
       - name: Biome
         run: npm run lint
       - name: TypeScript

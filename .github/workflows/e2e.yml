@@ -28,6 +28,19 @@ on:
       - ".github/e2e/**"
       - ".github/workflows/e2e.yml"
       - ".github/actions/prepare-e2e/**"
+      - "scripts/**"
+      - "tsconfig*.json"
+      - "package.json"
+      - "package-lock.json"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - ".github/e2e/**"
+      - ".github/workflows/e2e.yml"
+      - ".github/actions/prepare-e2e/**"
+      - "scripts/**"
+      - "tsconfig*.json"
       - "package.json"
       - "package-lock.json"
   schedule:

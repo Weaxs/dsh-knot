@@ -173,6 +173,117 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
+  it('keeps a disconnected ACP stop unconfirmed until explicitly releasing the local session', async () => {
+    let disconnect!: () => void;
+    let rejectTerminal!: (error: Error) => void;
+    const terminal = new Promise<unknown>((_, reject) => {
+      rejectTerminal = reject;
+    });
+    class DisconnectedAdapter extends FakeAdapter {
+      promptTerminalForCancel(): Promise<unknown> | undefined {
+        return this.cancelled ? undefined : terminal;
+      }
+
+      override async *prompt(_sessionId: string | undefined, text?: string): AsyncIterable<AgentEvent> {
+        if (text !== 'Hello') {
+          yield { type: 'final', text: 'next reply' };
+          return;
+        }
+        yield { type: 'text', text: 'partial reply' };
+        await new Promise<void>((resolve) => {
+          disconnect = resolve;
+        });
+        yield { type: 'error', text: 'ACP connection closed' };
+      }
+
+      override async cancel() {
+        this.cancelled = true;
+        disconnect();
+        rejectTerminal(new Error('ACP connection closed'));
+      }
+    }
+
+    const adapter = new DisconnectedAdapter(config.id, 'acp');
+    const cancel = vi.spyOn(adapter, 'cancel');
+    const manager = new AgentManager([{ ...config, kind: 'acp' }], 10_000, () => adapter);
+    try {
+      const job = manager.start(config.id, 'Hello', 'shared');
+      await vi.waitFor(() => expect(disconnect).toBeTypeOf('function'));
+      const stopping = manager.cancel(job.id);
+      expect(() => manager.releaseUnconfirmedStop(job.id)).toThrow(/unconfirmed ACP stop/);
+      await expect(stopping).rejects.toThrow(/terminal response/);
+      expect(await manager.wait(job.id)).toMatchObject({
+        status: 'cancelled',
+        text: 'partial reply',
+        error: 'ACP connection closed',
+        remoteStop: 'unconfirmed',
+      });
+      await expect(manager.cancel(job.id)).rejects.toThrow(/terminal response/);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(job.remoteStop).toBe('unconfirmed');
+      expect(() => manager.start(config.id, 'next prompt', 'shared')).toThrow(/active or cancelling/);
+      expect(manager.releaseUnconfirmedStop(job.id).remoteStop).toBe('unconfirmed-released');
+      const next = manager.start(config.id, 'next prompt', 'shared');
+      await manager.cancel(job.id);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect((await manager.wait(next.id)).text).toBe('next reply');
+      await Promise.all(
+        Array.from({ length: 198 }, () => manager.wait(manager.start(config.id, 'other prompt', undefined).id)),
+      );
+      await manager.wait(manager.start(config.id, 'fill a reclaimed slot', undefined).id);
+      expect(() => manager.get(job.id)).toThrow(/unknown job/i);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('retains exact ACP stop recovery when a job times out before the terminal response', async () => {
+    let rejectTerminal!: (error: Error) => void;
+    const terminal = new Promise<unknown>((_, reject) => {
+      rejectTerminal = reject;
+    });
+    const recover = vi.fn(async () => {});
+    class TimedOutAdapter extends RunningAdapter {
+      private started = false;
+
+      override async *prompt(
+        session: string | undefined,
+        text?: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        this.started = true;
+        yield* super.prompt(session, text, signal);
+      }
+
+      isSessionBusy() {
+        return this.started && !this.cancelled;
+      }
+      promptTerminalForCancel() {
+        return terminal;
+      }
+      recoverPromptStopForCancel() {
+        return recover;
+      }
+      override async cancel() {
+        this.cancelled = true;
+        rejectTerminal(new Error('ACP connection closed'));
+      }
+    }
+    const adapter = new TimedOutAdapter(config.id, 'acp');
+    const manager = new AgentManager([{ ...config, kind: 'acp' }], 20, () => adapter);
+    try {
+      const job = manager.start(config.id, 'Hello', 'shared');
+      await manager.wait(job.id);
+      await vi.waitFor(() => expect(job.remoteStop).toBe('unconfirmed'));
+      expect(recover).not.toHaveBeenCalled();
+      await manager.cancel(job.id);
+      expect(recover).toHaveBeenCalledOnce();
+      expect(job.remoteStop).toBeUndefined();
+    } finally {
+      await manager.close();
+    }
+  });
+
   it.each(['hermes', 'acp', 'openclaw'] as const)(
     'keeps an exclusive %s session locked until a remote stop retry succeeds',
     async (kind) => {
@@ -233,6 +344,22 @@ describe('AgentManager', () => {
     await manager.wait(manager.start(other.id, 'Free a confirmed job slot', undefined).id);
     expect(manager.getCurrentJob(config.id, job.id)).toBeUndefined();
     await manager.close();
+  });
+
+  it('assigns consecutive job order when creation timestamps tie', async () => {
+    const manager = new AgentManager([config], 10_000, () => new FakeAdapter(config.id));
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    try {
+      const first = manager.start(config.id, 'first', 'session');
+      await manager.wait(first.id);
+      const second = manager.start(config.id, 'second', 'session');
+      await manager.wait(second.id);
+      expect(first.createdAt).toBe(second.createdAt);
+      expect([first.sequence, second.sequence]).toEqual([1, 2]);
+    } finally {
+      now.mockRestore();
+      await manager.close();
+    }
   });
 
   it('tracks jobs, approvals and completion notifications', async () => {
@@ -780,5 +907,212 @@ describe('AgentManager', () => {
     await removing;
     await rmManager.wait(rmJob.id);
     await dshManager.close();
+  });
+
+  it('preserves chronological timeline interleaving across thoughts, tools, and text', async () => {
+    class InterleavedAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'thought', text: 'Step 1 ' };
+        yield { type: 'thought', text: 'plan.' };
+        yield { type: 'text', text: 'Checking ' };
+        yield { type: 'text', text: 'repo...' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal', inputPreview: 'git status' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'thought', text: 'Step 2 plan.' };
+        yield { type: 'tool', requestId: 't2', phase: 'start', name: 'memory' };
+        yield { type: 'tool', requestId: 't2', phase: 'end' };
+        yield { type: 'text', text: 'All done.' };
+        yield { type: 'final', text: 'Checking repo...All done.' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new InterleavedAdapter(config.id));
+    const job = manager.start(config.id, 'sync', undefined);
+    const done = await manager.wait(job.id);
+    expect(done.tools).toHaveLength(2);
+    expect(done.timeline).toEqual([
+      { kind: 'thought', text: 'Step 1 plan.' },
+      { kind: 'text', text: 'Checking repo...' },
+      { kind: 'tool', toolId: done.tools![0]!.id },
+      { kind: 'thought', text: 'Step 2 plan.' },
+      { kind: 'tool', toolId: done.tools![1]!.id },
+      { kind: 'text', text: 'All done.' },
+    ]);
+    await manager.close();
+
+    // Non-streamed final reply still lands after earlier tools in the timeline
+    class FinalAfterToolAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'Final summary' };
+      }
+    }
+    const finalManager = new AgentManager([config], 10_000, () => new FinalAfterToolAdapter(config.id));
+    const finalDone = await finalManager.wait(finalManager.start(config.id, 'run', undefined).id);
+    expect(finalDone.timeline).toEqual([
+      { kind: 'tool', toolId: finalDone.tools![0]!.id },
+      { kind: 'text', text: 'Final summary' },
+    ]);
+    await finalManager.close();
+  });
+
+  it('retracts the retained reply when streamed commentary exceeds the text budget', async () => {
+    const tail = 'x'.repeat(2_000_000);
+    const commentary = `Checking ${tail}`;
+    class OversizedInterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: `Checking ${tail.slice(0, 200)}` };
+        for (let i = 0; i < 120; i++) {
+          yield { type: 'tool', requestId: `t${i}`, phase: 'start', name: 'terminal' };
+        }
+        yield { type: 'text', text: tail.slice(200) };
+        yield { type: 'text', text: commentary, interim: true, alreadyStreamed: true };
+        yield { type: 'final', text: '', stopReason: 'cancelled' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new OversizedInterimAdapter(config.id));
+    try {
+      const job = await manager.wait(manager.start(config.id, 'check', undefined).id);
+      expect(job.text).toHaveLength(0);
+      expect(job.timeline?.filter((entry) => entry.kind !== 'tool')).toEqual([{ kind: 'commentary', text: tail }]);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('reconciles aggregate and divergent finals, keeps interim commentary out of job.text, and bounds timeline budgets', async () => {
+    // 1. Aggregate final after tool appends only the missing suffix (text('A') -> tool -> final('AB'))
+    class AggregateFinalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'A' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'AB' };
+      }
+    }
+    const aggManager = new AgentManager([config], 10_000, () => new AggregateFinalAdapter(config.id));
+    const aggDone = await aggManager.wait(aggManager.start(config.id, 'agg', undefined).id);
+    expect(aggDone.text).toBe('AB');
+    expect(aggDone.timeline).toEqual([
+      { kind: 'text', text: 'A' },
+      { kind: 'tool', toolId: aggDone.tools![0]!.id },
+      { kind: 'text', text: 'B' },
+    ]);
+    await aggManager.close();
+
+    // 2. Divergent authoritative final drops stale draft text while keeping thought, commentary, and tools
+    class DivergentFinalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'thought', text: 'Plan check' };
+        yield { type: 'text', text: 'Checking repo...', interim: true };
+        yield { type: 'text', text: 'stale draft' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'Authoritative reply' };
+      }
+    }
+    const divManager = new AgentManager([config], 10_000, () => new DivergentFinalAdapter(config.id));
+    const divDone = await divManager.wait(divManager.start(config.id, 'div', undefined).id);
+    expect(divDone.text).toBe('Authoritative reply');
+    expect(divDone.timeline).toEqual([
+      { kind: 'thought', text: 'Plan check' },
+      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'tool', toolId: divDone.tools![0]!.id },
+      { kind: 'text', text: 'Authoritative reply' },
+    ]);
+    await divManager.close();
+
+    // 2b. Final matching only the last segment prefix still drops stale earlier draft text
+    class PartialPrefixDivergentAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Draft A' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'text', text: 'Starting B' };
+        yield { type: 'final', text: 'Starting B with corrections' };
+      }
+    }
+    const prefixManager = new AgentManager([config], 10_000, () => new PartialPrefixDivergentAdapter(config.id));
+    const prefixDone = await prefixManager.wait(prefixManager.start(config.id, 'fix', undefined).id);
+    expect(prefixDone.text).toBe('Starting B with corrections');
+    expect(prefixDone.timeline).toEqual([
+      { kind: 'tool', toolId: prefixDone.tools![0]!.id },
+      { kind: 'text', text: 'Starting B with corrections' },
+    ]);
+    await prefixManager.close();
+
+    // 2c. Retraction can span text blocks split by a thought event.
+    class AlreadyStreamedInterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Keep this. Checking ' };
+        yield { type: 'thought', text: 'Inspect the repository.' };
+        yield { type: 'text', text: 'repo...' };
+        yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
+        yield { type: 'final', text: '', stopReason: 'cancelled' };
+      }
+    }
+    const streamedInterimManager = new AgentManager(
+      [config],
+      10_000,
+      () => new AlreadyStreamedInterimAdapter(config.id),
+    );
+    const streamedInterimDone = await streamedInterimManager.wait(
+      streamedInterimManager.start(config.id, 'check', undefined).id,
+    );
+    expect(streamedInterimDone.status).toBe('cancelled');
+    expect(streamedInterimDone.text).toBe('Keep this. ');
+    expect(streamedInterimDone.timeline).toEqual([
+      { kind: 'text', text: 'Keep this. ' },
+      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'thought', text: 'Inspect the repository.' },
+    ]);
+    await streamedInterimManager.close();
+
+    // 3. Interim commentary stays in UI timeline without polluting model-facing job.text
+    class InterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Working on it...', interim: true };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'text', text: 'All clean.' };
+        yield { type: 'final', text: 'All clean.' };
+      }
+    }
+    const interimManager = new AgentManager([config], 10_000, () => new InterimAdapter(config.id));
+    const interimDone = await interimManager.wait(interimManager.start(config.id, 'check', undefined).id);
+    expect(interimDone.text).toBe('All clean.');
+    expect(interimDone.timeline).toEqual([
+      { kind: 'commentary', text: 'Working on it...' },
+      { kind: 'tool', toolId: interimDone.tools![0]!.id },
+      { kind: 'text', text: 'All clean.' },
+    ]);
+    await interimManager.close();
+
+    // 4. Aggregate per-job text and thought budgets cap total timeline size across alternating segments
+    class HugeTimelineAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        for (let i = 0; i < 30; i++) {
+          yield { type: 'text', text: String(i % 10).repeat(200_000) };
+          yield { type: 'thought', text: String((i + 1) % 10).repeat(1_000) };
+        }
+        yield { type: 'final', text: '' };
+      }
+    }
+    const hugeManager = new AgentManager([config], 10_000, () => new HugeTimelineAdapter(config.id));
+    const hugeDone = await hugeManager.wait(hugeManager.start(config.id, 'huge', undefined).id);
+    const totalTextChars = (hugeDone.timeline ?? [])
+      .filter(
+        (entry): entry is { kind: 'text' | 'commentary'; text: string } =>
+          entry.kind === 'text' || entry.kind === 'commentary',
+      )
+      .reduce((sum, entry) => sum + entry.text.length, 0);
+    const totalThoughtChars = (hugeDone.timeline ?? [])
+      .filter((entry): entry is { kind: 'thought'; text: string } => entry.kind === 'thought')
+      .reduce((sum, entry) => sum + entry.text.length, 0);
+    expect(hugeDone.text.length).toBe(2_000_000);
+    expect(totalTextChars).toBe(2_000_000);
+    expect(hugeDone.thought?.length).toBe(16_000);
+    expect(totalThoughtChars).toBe(16_000);
+    await hugeManager.close();
   });
 });

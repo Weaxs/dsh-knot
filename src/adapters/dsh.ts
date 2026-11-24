@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { requireSecureGateway } from '../policy/auth.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, HttpResponse, Transport } from '../types.js';
 
@@ -200,6 +201,7 @@ export class DshAdapter implements AgentAdapter {
       this.connecting = (async () => {
         const token = secret(this.config);
         if (!token) throw new Error(`${this.id}: a dsh web launch token is required (token or tokenEnv)`);
+        requireSecureGateway(this.config);
         const response = await this.transport.request({
           path: `/connect?token=${encodeURIComponent(token)}&interactions=none`,
         });
@@ -226,6 +228,7 @@ export class DshAdapter implements AgentAdapter {
     retried = false,
   ): Promise<any> {
     await this.connect(signal);
+    requireSecureGateway(this.config);
     let response: HttpResponse;
     try {
       response = await this.transport.request({

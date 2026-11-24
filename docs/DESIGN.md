@@ -58,6 +58,10 @@ The `acp` kind is the single provider for ACP-compatible endpoints. The official
 
 The optional `dsh-knot-acp` bridge exposes `initialize`, `session/new`, `session/list`, `session/prompt`, `session/cancel`, `session/update`, and `session/request_permission` over WebSocket or `DSH_KNOT_ACP_STDIO=1` stdio mode. Each bridge connection constructs a native adapter for Hermes, OpenClaw, or remote DSH and translates only that adapter's normalized events. A native ACP endpoint bypasses the bridge entirely. Non-loopback bridge listeners require `DSH_KNOT_ACP_TOKEN`; native gateway credentials and ACP bearer tokens remain separate.
 
+For Hermes, dsh-knot peers negotiate interim retraction so they can stream text immediately and correct it when a commentary marker arrives. Other ACP clients receive text at classification boundaries to keep commentary out of the answer channel. If unclassified text exceeds 2,000,000 characters, the bridge discards that buffer, attempts to stop the run, and reports the limit error. If the stop is unconfirmed, the same connection must retry `session/cancel` successfully before sending another prompt to that session.
+
+The Hermes WebSocket bridge also negotiates stop recovery. It associates an opaque prompt ID with the exact native run ID in a bounded registry shared across its connections. On retry after the original request is gone, the bridge acknowledges a stop only after that run reaches a terminal state. Older peers, missing runs, and bridge restarts can leave the stop unconfirmed. Once the local prompt and stop request have ended, an explicit local release can unlock and reclaim the job while preserving the unconfirmed remote status.
+
 ACP v2, A2A, and additional UI transports are intentionally outside the current scope.
 
 ### Hermes
@@ -103,11 +107,13 @@ Remote deployments should keep the native listener on loopback behind a private 
 
 ### Direct (default)
 
-`direct` uses an explicit gateway URL or a hostname and port, with optional TLS. Use it on Tailscale, Headscale, a LAN, or another trusted network. With Tailscale Serve, keep the gateway on loopback and use its HTTPS endpoint. See the [setup guide](../README.md#quick-start).
+`direct` uses an explicit gateway URL or a hostname and port. With Tailscale Serve, keep the gateway on loopback and use its HTTPS endpoint. See the [setup guide](../README.md#quick-start).
 
 ### Local
 
 `local` uses `127.0.0.1` as the default host and also supports ACP stdio subprocesses.
+
+Both transports check the endpoint before sending gateway credentials. Outside loopback, HTTPS or WSS is required unless `encryptedOverlay: true` declares a verified, authenticated encrypted private route for that endpoint. Existing blocked entries remain editable. The [transport guide](../README.md#transports) covers setup and migration.
 
 ## Jobs and model tools
 
@@ -121,6 +127,8 @@ Remote deployments should keep the native listener on loopback behind a private 
 - optionally calls `Agent.followup()` on completion.
 
 The originating Agent's `followup` receives a marked `source.kind: knot` message. Missing follow-up support does not fail the remote job.
+
+Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately.
 
 ## Reverse MCP endpoint
 
