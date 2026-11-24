@@ -168,10 +168,10 @@ export class HermesAdapter implements AgentAdapter {
         const type = String(event.event ?? event.type ?? frame.event ?? '');
         const isApproval = /approval|permission/.test(type);
         if (type.startsWith('tool.') && !isApproval) {
-          stepStart = output.length;
           const started = /^tool\.start(?:ed)?$/.test(type);
           const ended = /^tool\.(?:complete(?:d)?|end(?:ed)?|finish(?:ed)?|failed)$/.test(type);
           if (!started && !ended) continue;
+          stepStart = output.length;
           const name = event.tool ?? event.name ?? event.tool_name;
           const requestId = firstNonEmptyString(event.tool_call_id);
           const inputPreview =

@@ -106,6 +106,7 @@ interface JobSummary {
   sessionId?: string;
   prompt?: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  sequence?: number;
   createdAt: number;
   updatedAt: number;
   text: string;
@@ -1087,6 +1088,10 @@ function isRunning(job?: JobSummary): boolean {
   return job?.status === 'queued' || job?.status === 'running' || job?.remoteStop !== undefined;
 }
 
+function compareJobOrder(a: JobSummary, b: JobSummary): number {
+  return a.createdAt - b.createdAt || (a.sequence ?? 0) - (b.sequence ?? 0);
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -1995,18 +2000,18 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
 
     const renderConversation = () => {
       const displayJobs = [
-        ...fallbackJobs.sort((a, b) => a.createdAt - b.createdAt).slice(-20),
+        ...fallbackJobs.sort(compareJobOrder).slice(-20),
         ...turns,
         ...(liveJob && !liveIsOwnTurn ? [liveJob] : []),
-      ].sort((a, b) => a.createdAt - b.createdAt);
+      ].sort(compareJobOrder);
       if (!history?.length) return displayJobs.map((job) => renderJob(job));
       const boundaryJobs = [...displayJobs, ...jobs.filter(belongsToSession)]
         .filter((job) => job.historyBaseline?.lastId)
-        .sort((a, b) => a.createdAt - b.createdAt);
+        .sort(compareJobOrder);
       const matches = displayJobs.map((job) =>
         matchTurnInHistory(
           job,
-          boundaryJobs.find((next) => next.createdAt > job.createdAt),
+          boundaryJobs.find((next) => compareJobOrder(next, job) > 0),
         ),
       );
       const matchedJobIndexes = new Map<number, number>();

@@ -346,6 +346,90 @@ describe('ACP provider and bridge', () => {
     await expect(adapter.health()).rejects.toThrow(error);
   });
 
+  it('closes a stalled WebSocket handshake on timeout and reconnects', async () => {
+    const { agent, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createNodeWebSocketUpgradeHandler } = await import('@agentclientprotocol/sdk/experimental/node');
+    const { AcpServer } = await import('@agentclientprotocol/sdk/experimental/server');
+    const { WebSocketServer } = await import('ws');
+    const http = await import('node:http');
+    const acpServer = new AcpServer({
+      createAgent: () => {
+        const app = agent({ name: 'retry-agent' });
+        app.onRequest(methods.agent.initialize, () => ({ protocolVersion: PROTOCOL_VERSION }));
+        return app;
+      },
+    });
+    const wss = new WebSocketServer({ noServer: true });
+    const upgrade = createNodeWebSocketUpgradeHandler(acpServer, wss);
+    const server = http.createServer((_request, response) => response.writeHead(404).end());
+    let stalled: import('node:stream').Duplex | undefined;
+    let markClosed = () => {};
+    const firstSocketClosed = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
+    server.on('upgrade', (request, socket, head) => {
+      if (stalled) {
+        upgrade(request, socket, head);
+        return;
+      }
+      stalled = socket;
+      socket.once('end', () => socket.end());
+      socket.once('close', markClosed);
+      socket.resume();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const adapter = new AcpAdapter('retry', {
+      id: 'retry',
+      kind: 'acp',
+      transport: 'local',
+      port,
+      connectTimeoutMs: 200,
+    });
+    cleanups.push(async () => {
+      await adapter.close();
+      stalled?.destroy();
+      for (const socket of wss.clients) socket.terminate();
+      await acpServer.close();
+      wss.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    await expect(adapter.health()).rejects.toThrow(/ACP initialize timed out/);
+    expect(stalled).toBeDefined();
+    await firstSocketClosed;
+    await expect(adapter.health()).resolves.toMatchObject({ ok: true });
+  });
+
+  it('does not start a WebSocket when closed during the same turn as connect', async () => {
+    const { createServer } = await import('node:net');
+    let opened = 0;
+    const server = createServer((socket) => {
+      opened++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+    const adapter = new AcpAdapter('closing', {
+      id: 'closing',
+      kind: 'acp',
+      transport: 'local',
+      port,
+      connectTimeoutMs: 200,
+    });
+
+    const health = adapter.health();
+    const closed = adapter.close();
+    const startup = await Promise.allSettled([health, closed]);
+    expect(opened).toBe(0);
+    expect(startup).toMatchObject([
+      { status: 'rejected', reason: { message: 'ACP adapter closed' } },
+      { status: 'fulfilled' },
+    ]);
+    await expect(adapter.health()).rejects.toThrow('ACP adapter closed');
+  });
+
   it('paginates session/list via nextCursor to recover cwd for sessions on later pages', async () => {
     const { Readable, Writable } = await import('node:stream');
     const { agent, methods, ndJsonStream, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
@@ -686,95 +770,124 @@ describe('ACP provider and bridge', () => {
     if (interim) expect(settled.timeline).toEqual([{ kind: 'commentary', text: commentary }]);
   });
 
-  it.each([[2_000_001], [1_000_001, 1_000_000]])(
-    'rejects oversized unclassified Hermes text on standard ACP',
-    async (...deltaLengths) => {
-      const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
-      const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
-      const { default: WebSocket } = await import('ws');
-      let allowOverflow = () => {};
-      let finishStop = () => {};
-      let markAdmitted = () => {};
-      let markStopping = () => {};
-      const overflowGate = new Promise<void>((resolve) => {
-        allowOverflow = resolve;
-      });
-      const stopGate = new Promise<void>((resolve) => {
-        finishStop = resolve;
-      });
-      const admitted = new Promise<void>((resolve) => {
-        markAdmitted = resolve;
-      });
-      const stopping = new Promise<void>((resolve) => {
-        markStopping = resolve;
-      });
-      class OversizedAdapter extends FakeNativeAdapter {
-        stoppedPrompt?: string;
+  it.each([
+    { deltaLengths: [2_000_001], failInitialStop: false },
+    { deltaLengths: [1_000_001, 1_000_000], failInitialStop: true },
+  ])('rejects oversized unclassified Hermes text on standard ACP', async ({ deltaLengths, failInitialStop }) => {
+    const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
+    const { default: WebSocket } = await import('ws');
+    let allowOverflow = () => {};
+    let finishStop = () => {};
+    let finishRetry = () => {};
+    let markAdmitted = () => {};
+    let markStopping = () => {};
+    let markRetrying = () => {};
+    const overflowGate = new Promise<void>((resolve) => {
+      allowOverflow = resolve;
+    });
+    const stopGate = new Promise<void>((resolve) => {
+      finishStop = resolve;
+    });
+    const retryGate = new Promise<void>((resolve) => {
+      finishRetry = resolve;
+    });
+    const admitted = new Promise<void>((resolve) => {
+      markAdmitted = resolve;
+    });
+    const stopping = new Promise<void>((resolve) => {
+      markStopping = resolve;
+    });
+    const retrying = new Promise<void>((resolve) => {
+      markRetrying = resolve;
+    });
+    class OversizedAdapter extends FakeNativeAdapter {
+      readonly stopTargets: Array<string | undefined> = [];
 
-        override async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
-          this.prompts.push({ sessionId: sessionId ?? '', text });
-          if (text !== 'oversized') {
-            yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
-            return;
-          }
-          markAdmitted();
-          await overflowGate;
-          for (const length of deltaLengths) yield { type: 'text', text: 'x'.repeat(length) };
-          yield { type: 'text', text: 'x'.repeat(2_000_001), interim: true, alreadyStreamed: true };
+      override async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
+        this.prompts.push({ sessionId: sessionId ?? '', text });
+        if (text !== 'oversized') {
           yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
+          return;
         }
-
-        override async cancel(): Promise<void> {
-          this.stoppedPrompt = this.prompts.at(-1)?.text;
-          markStopping();
-          await stopGate;
-        }
+        markAdmitted();
+        await overflowGate;
+        for (const length of deltaLengths) yield { type: 'text', text: 'x'.repeat(length) };
+        yield { type: 'text', text: 'x'.repeat(2_000_001), interim: true, alreadyStreamed: true };
+        yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
       }
-      const native = new OversizedAdapter();
-      const bridge = new AcpBridge({ id: native.id, kind: 'hermes' }, () => native);
-      const { host, port } = await bridge.start({ port: 0, token: 'acp-test-token' });
-      const connection = client().connect(
-        createWebSocketStream(`ws://${host}:${port}/acp`, {
-          WebSocket,
-          headers: { Authorization: 'Bearer acp-test-token' },
-        }),
-      );
-      cleanups.push(async () => {
-        allowOverflow();
-        finishStop();
-        connection.close();
-        await bridge.close();
-      });
-      await connection.agent.request(methods.agent.initialize, {
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
-      });
-      const session = await connection.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
-      const prompt = session.prompt('oversized');
-      const outcomes = Promise.allSettled([prompt, session.nextUpdate()]);
-      // A raw request bypasses the SDK's ActiveSession guard and exercises the bridge's ownership check.
-      const sendPrompt = (text: string) =>
-        connection.agent.request(methods.agent.session.prompt, {
-          sessionId: session.sessionId,
-          prompt: [{ type: 'text', text }],
-        });
-      await admitted;
-      await expect(sendPrompt('before overflow')).rejects.toThrow(/active prompt/i);
-      allowOverflow();
-      await stopping;
-      await expect(sendPrompt('during overflow cleanup')).rejects.toThrow(/active prompt/i);
-      finishStop();
 
-      const overflowFailure = {
-        status: 'rejected',
-        reason: { message: expect.stringMatching(/unclassified text.*buffer limit/i) },
-      };
-      expect(await outcomes).toMatchObject([overflowFailure, overflowFailure]);
-      expect(native.stoppedPrompt).toBe('oversized');
-      await expect(sendPrompt('after overflow')).resolves.toMatchObject({ stopReason: 'end_turn' });
-      expect(native.prompts.map(({ text }) => text)).toEqual(['oversized', 'after overflow']);
-    },
-  );
+      override async cancel(): Promise<void> {
+        this.stopTargets.push(this.prompts.at(-1)?.text);
+        if (this.stopTargets.length > 1) {
+          markRetrying();
+          await retryGate;
+          return;
+        }
+        markStopping();
+        await stopGate;
+        if (failInitialStop) throw new Error('Stop failed');
+      }
+    }
+    const native = new OversizedAdapter();
+    const bridge = new AcpBridge({ id: native.id, kind: 'hermes' }, () => native);
+    const { host, port } = await bridge.start({ port: 0, token: 'acp-test-token' });
+    const connection = client().connect(
+      createWebSocketStream(`ws://${host}:${port}/acp`, {
+        WebSocket,
+        headers: { Authorization: 'Bearer acp-test-token' },
+      }),
+    );
+    cleanups.push(async () => {
+      allowOverflow();
+      finishStop();
+      finishRetry();
+      connection.close();
+      await bridge.close();
+    });
+    await connection.agent.request(methods.agent.initialize, {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+    });
+    const session = await connection.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
+    const prompt = session.prompt('oversized');
+    const outcomes = Promise.allSettled([prompt, session.nextUpdate()]);
+    // A raw request bypasses the SDK's ActiveSession guard and exercises the bridge's ownership check.
+    const sendPrompt = (text: string) =>
+      connection.agent.request(methods.agent.session.prompt, {
+        sessionId: session.sessionId,
+        prompt: [{ type: 'text', text }],
+      });
+    await admitted;
+    await expect(sendPrompt('before overflow')).rejects.toThrow(/active prompt/i);
+    allowOverflow();
+    await stopping;
+    await expect(sendPrompt('during overflow cleanup')).rejects.toThrow(/active prompt/i);
+    finishStop();
+
+    const overflowFailure = {
+      status: 'rejected',
+      reason: {
+        message: expect.stringMatching(
+          failInitialStop
+            ? /unclassified text.*buffer limit.*stop is unconfirmed/i
+            : /unclassified text.*buffer limit/i,
+        ),
+      },
+    };
+    expect(await outcomes).toMatchObject([overflowFailure, overflowFailure]);
+    expect(native.stopTargets).toEqual(['oversized']);
+    if (failInitialStop) {
+      await expect(sendPrompt('before retry')).rejects.toThrow(/stop is unconfirmed/i);
+      await connection.agent.notify(methods.agent.session.cancel, { sessionId: session.sessionId });
+      await retrying;
+      expect(native.stopTargets).toEqual(['oversized', 'oversized']);
+      await expect(sendPrompt('before confirmed stop')).rejects.toThrow(/stop is unconfirmed/i);
+      finishRetry();
+    }
+    await expect(sendPrompt('after overflow')).resolves.toMatchObject({ stopReason: 'end_turn' });
+    expect(native.prompts.map(({ text }) => text)).toEqual(['oversized', 'after overflow']);
+  });
 
   it('keeps Hermes interim commentary out of model-facing job.text and standard ACP SDK readText() over WebSocket', async () => {
     const { AgentManager } = await import('../src/manager.js');

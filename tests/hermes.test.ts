@@ -526,6 +526,7 @@ describe('Hermes API Server adapter', () => {
       override async stream(): Promise<IncomingMessage> {
         return incoming(
           `data: ${JSON.stringify({ event: 'message.delta', delta: streamed })}\n\n` +
+            'data: {"event":"tool.progress","tool":"terminal"}\n\n' +
             `data: ${JSON.stringify({ event: 'message.interim', text: `${streamed}...`, already_streamed: false })}\n\n` +
             'data: {"event":"run.cancelled"}\n\n',
         );

@@ -363,10 +363,26 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it('redacts credentials split across timeline chunks in job and state responses', async () => {
+  it.each(['tool boundary', 'entry cap', 'text cap'])('redacts split credentials after %s', async (scenario) => {
     const marker = 'syntheticmarker0123456';
     class SplitOutputAdapter extends StubAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
+        if (scenario === 'text cap') {
+          yield { type: 'text', interim: true, text: `Before Basic ${'a'.repeat(2_005_000)}` };
+          yield { type: 'thought', text: 'Checking' };
+          yield { type: 'text', interim: true, text: `${marker} after.` };
+          return;
+        }
+        if (scenario === 'entry cap') {
+          yield { type: 'text', interim: true, text: 'Before Bearer ' };
+          yield { type: 'thought', text: 'Checking' };
+          yield { type: 'text', interim: true, text: `${marker} after.` };
+          for (let i = 0; i < 59; i++) {
+            yield { type: 'thought', text: '.' };
+            yield { type: 'text', text: '.' };
+          }
+          return;
+        }
         yield { type: 'text', text: 'Before Bearer ' };
         yield { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'read' };
         yield { type: 'text', text: `${marker} after.` };
@@ -403,16 +419,29 @@ describe('web UI host routes & schemastery Config', () => {
       ]);
       for (const entry of [details.value, state.value.jobs[0]]) {
         expect(JSON.stringify(entry)).not.toContain(marker);
-        expect(entry).toMatchObject({
-          text: 'Before [REDACTED] after.',
-          timeline: [
-            { kind: 'text', text: 'Before [REDACTED]' },
-            { kind: 'tool', toolId: job.tools?.[0]?.id },
-            { kind: 'text', text: ' after.' },
-          ],
-        });
+        if (scenario === 'entry cap') {
+          expect(entry.timeline).toHaveLength(120);
+          expect(entry.timeline.slice(0, 2)).toEqual([
+            { kind: 'thought', text: 'Checking' },
+            { kind: 'commentary', text: '[REDACTED] after.' },
+          ]);
+        } else if (scenario === 'text cap') {
+          expect(entry.timeline).toEqual([
+            { kind: 'commentary', text: '[REDACTED]' },
+            { kind: 'thought', text: 'Checking' },
+            { kind: 'commentary', text: ' after.' },
+          ]);
+        } else {
+          expect(entry).toMatchObject({
+            text: 'Before [REDACTED] after.',
+            timeline: [
+              { kind: 'text', text: 'Before [REDACTED]' },
+              { kind: 'tool', toolId: job.tools?.[0]?.id },
+              { kind: 'text', text: ' after.' },
+            ],
+          });
+        }
       }
-      expect(job.text).toBe(`Before Bearer ${marker} after.`);
     } finally {
       await manager.close();
     }
@@ -880,6 +909,7 @@ describe('web UI host routes & schemastery Config', () => {
       sessionId: string;
       prompt: string;
       status: string;
+      sequence?: number;
       createdAt: number;
       updatedAt: number;
       text: string;
@@ -1375,6 +1405,7 @@ describe('web UI host routes & schemastery Config', () => {
         sessionId: 'sess-5',
         prompt: 'local prompt',
         status: 'running',
+        sequence: 1,
         createdAt: 12_000,
         updatedAt: 12_000,
         historyBaseline: { length: 2, lastId: 'old2' },
@@ -1385,16 +1416,17 @@ describe('web UI host routes & schemastery Config', () => {
       expect(collectText(ownTree)).toContain('retained local reply');
       expect(collectText(ownTree)).toContain('remaining activity');
 
-      // The next job carries a fresh anchor after the local turn. History must replace the same turn in place.
-      localJob = { ...localJob, status: 'cancelled', updatedAt: 13_000 };
+      // The next job starts in the same millisecond and carries a fresh anchor after the local turn.
+      localJob = { ...localJob, status: 'cancelled' };
       currentJob = {
         id: 'next-job',
         agentId: 'hermes-remote',
         sessionId: 'sess-5',
         prompt: 'remote prompt',
         status: 'running',
-        createdAt: 14_000,
-        updatedAt: 14_000,
+        sequence: 2,
+        createdAt: 12_000,
+        updatedAt: 12_000,
         historyBaseline: { length: 4, lastId: 'own2' },
         text: 'remote reply',
       };

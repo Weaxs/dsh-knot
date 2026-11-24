@@ -162,6 +162,7 @@ export interface AgentJob {
   sessionId?: string;
   prompt?: string;
   status: JobStatus;
+  sequence?: number;
   createdAt: number;
   updatedAt: number;
   text: string;

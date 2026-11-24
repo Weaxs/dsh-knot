@@ -16,6 +16,8 @@ const CREDENTIAL_INPUT =
 const MAX_PREVIEW_LENGTH = 500;
 const MAX_PREVIEW_ITEMS = 8;
 const MAX_PREVIEW_DEPTH = 3;
+const MAX_REDACTION_CONTEXT = 4_096;
+const AUTHORIZATION_TAIL = /\b(Bearer|Basic)\s+([a-zA-Z0-9._~+/=-]*)$/i;
 
 export function toolInputPreview(value: unknown, token?: string): string | undefined {
   const display = (text: string): string => {
@@ -52,6 +54,17 @@ export function toolInputPreview(value: unknown, token?: string): string | undef
 
 export function redactText(text: string): string {
   return PATTERNS.reduce((value, pattern) => value.replace(pattern, '[REDACTED]'), text);
+}
+
+export function retainRedactionTail(previous: string, dropped: string): string {
+  const source = previous + dropped;
+  const authorization = source.length > MAX_REDACTION_CONTEXT ? AUTHORIZATION_TAIL.exec(source) : null;
+  if (authorization) {
+    // Keep the shape of an open credential without storing an arbitrarily long value.
+    return `${authorization[1]} ${'a'.repeat(Math.min(authorization[2]!.length, 12))}`;
+  }
+  // Copy the short tail so it does not keep the discarded string's backing storage alive.
+  return Buffer.from(source.slice(-MAX_REDACTION_CONTEXT), 'utf16le').toString('utf16le');
 }
 
 export function redactTextSegments(segments: readonly string[], fullText?: string): string[] {

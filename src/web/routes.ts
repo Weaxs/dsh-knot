@@ -46,7 +46,7 @@ function jobPriority(job: AgentJob): number {
   return Number(job.status === 'queued' || job.status === 'running' || job.remoteStop !== undefined);
 }
 
-function redactJob(job: AgentJob): AgentJob {
+function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
   if (!job.timeline?.length) return redact(job);
   const timeline = job.timeline.map((entry) => ({ ...entry }));
   const textEntries = timeline.filter((entry) => entry.kind !== 'tool');
@@ -56,10 +56,9 @@ function redactJob(job: AgentJob): AgentJob {
     ['commentary', undefined],
   ] as const) {
     const entries = textEntries.filter((entry) => entry.kind === kind);
-    const texts = redactTextSegments(
-      entries.map((entry) => entry.text),
-      fullText,
-    );
+    const segments = entries.map((entry) => entry.text);
+    const prefix = kind === 'commentary' && segments.length > 0 ? manager.getCommentaryPrefix(job.id) : undefined;
+    const texts = redactTextSegments(segments, prefix ? `${prefix}${segments.join('')}` : fullText);
     entries.forEach((entry, index) => {
       entry.text = texts[index]!;
     });
@@ -160,7 +159,7 @@ export function registerWebRoutes(
               .listJobs({ currentOnly: true })
               .sort((a, b) => jobPriority(b) - jobPriority(a))
               .slice(0, 50)
-              .map(redactJob),
+              .map((job) => redactJob(manager, job)),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -206,7 +205,7 @@ export function registerWebRoutes(
           return errorReply('Invalid clientMessageId', 400);
         }
         const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
-        return jsonReply({ ok: true, value: redactJob(job) });
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -220,7 +219,9 @@ export function registerWebRoutes(
         }
         if (!manager.matchesRevision(agentId, revision)) return staleGateway();
         const job = manager.getCurrentJob(agentId, jobId);
-        return job ? jsonReply({ ok: true, value: redactJob(job) }) : errorReply('Job not found for this gateway', 404);
+        return job
+          ? jsonReply({ ok: true, value: redactJob(manager, job) })
+          : errorReply('Job not found for this gateway', 404);
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -234,7 +235,7 @@ export function registerWebRoutes(
         const choice = typeof body.choice === 'string' ? body.choice : '';
         if (!jobId || !requestId || !choice) return errorReply('jobId, requestId, and choice are required', 400);
         const job = await manager.respond(jobId, choice, request.signal, requestId);
-        return jsonReply({ ok: true, value: redactJob(job) });
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -246,7 +247,7 @@ export function registerWebRoutes(
         const jobId = typeof body.jobId === 'string' ? body.jobId : '';
         if (!jobId) return errorReply('jobId is required', 400);
         const job = await manager.cancel(jobId, request.signal);
-        return jsonReply({ ok: true, value: redactJob(job) });
+        return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }

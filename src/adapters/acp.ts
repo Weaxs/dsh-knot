@@ -28,9 +28,20 @@ interface PendingPermission {
 
 type PromptMessage = { kind: 'acp'; value: ActiveSessionMessage } | { kind: 'native'; value: AgentEvent };
 
+class AcpWebSocket extends WebSocket {
+  constructor(url: string, protocols?: string | string[], options?: WebSocket.ClientOptions) {
+    super(url, protocols, options);
+    // The ACP SDK detaches its listeners when closing the stream, before ws can emit its asynchronous close error.
+    const ignoreCloseError = () => {};
+    this.on('error', ignoreCloseError);
+    this.once('close', () => this.off('error', ignoreCloseError));
+  }
+}
+
 export class AcpAdapter implements AgentAdapter {
   readonly kind = 'acp' as const;
   private readonly transport: Transport;
+  private readonly closing = new AbortController();
   private readonly queues = new Map<string, AsyncQueue<PromptMessage>>();
   private readonly cancelledQueues = new WeakSet<AsyncQueue<PromptMessage>>();
   private readonly promptTerminals = new WeakMap<AsyncQueue<PromptMessage>, Promise<unknown>>();
@@ -287,13 +298,13 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
+    this.closing.abort(new Error('ACP adapter closed'));
     this.cancelPermissions();
     for (const queue of this.queues.values()) queue.finish();
     this.queues.clear();
     this.clearSessions();
     this.connection?.close();
     this.connection = undefined;
-    this.connecting = undefined;
     await this.closeProcess();
     await this.transport.close();
   }
@@ -394,6 +405,7 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async connect(signal?: AbortSignal): Promise<void> {
+    this.closing.signal.throwIfAborted();
     if (signal?.aborted) throw signal.reason ?? new Error('request aborted');
     if (!this.connecting) {
       if (this.connection && !this.connection.signal.aborted) return;
@@ -418,6 +430,7 @@ export class AcpAdapter implements AgentAdapter {
     this.supportsInterimRetraction = false;
     this.clearSessions();
     await this.closeProcess();
+    this.closing.signal.throwIfAborted();
     const stream = this.config.acpTransport === 'stdio' ? this.openStdio() : this.openWebSocket();
     const app = client({ name: 'dsh-knot' });
     app.onNotification(methods.client.session.update, ({ params }) => {
@@ -466,7 +479,9 @@ export class AcpAdapter implements AgentAdapter {
       }),
       this.config.connectTimeoutMs ?? 30_000,
       'ACP initialize',
+      this.closing.signal,
     );
+    this.closing.signal.throwIfAborted();
     if (initialized.protocolVersion !== PROTOCOL_VERSION) {
       throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}`);
     }
@@ -480,7 +495,7 @@ export class AcpAdapter implements AgentAdapter {
     const path = this.config.basePath ?? '/acp';
     const token = secret(this.config);
     return createWebSocketStream(`${protocol}://${host}:${this.config.port ?? 18_792}${path}`, {
-      WebSocket,
+      WebSocket: AcpWebSocket,
       ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
     });
   }

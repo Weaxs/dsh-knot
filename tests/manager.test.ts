@@ -282,6 +282,22 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
+  it('assigns consecutive job order when creation timestamps tie', async () => {
+    const manager = new AgentManager([config], 10_000, () => new FakeAdapter(config.id));
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    try {
+      const first = manager.start(config.id, 'first', 'session');
+      await manager.wait(first.id);
+      const second = manager.start(config.id, 'second', 'session');
+      await manager.wait(second.id);
+      expect(first.createdAt).toBe(second.createdAt);
+      expect([first.sequence, second.sequence]).toEqual([1, 2]);
+    } finally {
+      now.mockRestore();
+      await manager.close();
+    }
+  });
+
   it('tracks jobs, approvals and completion notifications', async () => {
     let finish!: () => void;
     const finished = new Promise<void>((resolve) => {

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, normalizeToolCallId, raceAbort, secret, stripTrailingText } from './config.js';
+import { retainRedactionTail } from './policy/redact.js';
 import type {
   AgentAdapter,
   AgentConfig,
@@ -23,6 +24,7 @@ const MAX_JOB_APPROVALS = 50;
 const MAX_JOB_TEXT_LENGTH = 2_000_000;
 const MAX_JOB_THOUGHT_LENGTH = 16_000;
 const MAX_JOB_TIMELINE = 120;
+const commentaryPrefixes = new WeakMap<AgentJob, string>();
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -49,6 +51,7 @@ export class AgentManager {
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
   private readonly connectionStates = new Map<string, AgentConnectionState>();
+  private jobSequence = 0;
 
   constructor(
     configs: AgentConfig[],
@@ -248,6 +251,7 @@ export class AgentManager {
       ...(remoteSession ? { sessionId: remoteSession } : {}),
       prompt: text.slice(0, 4_000),
       status: 'queued',
+      sequence: ++this.jobSequence,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       text: '',
@@ -283,6 +287,11 @@ export class AgentManager {
     const job = this.jobs.get(id);
     const owner = this.jobOwners.get(id);
     return job?.agentId === agentId && owner && owner.adapter === this.adapters.get(agentId) ? job : undefined;
+  }
+
+  getCommentaryPrefix(id: string): string | undefined {
+    const job = this.jobs.get(id);
+    return job && commentaryPrefixes.get(job);
   }
 
   listJobs({ currentOnly = false } = {}): AgentJob[] {
@@ -721,11 +730,22 @@ function appendTimelineText(
   const timeline = job.timeline ?? [];
   const last = timeline.at(-1);
   if (last && last.kind === kind) {
-    last.text = (last.text + chunk).slice(-maxLength);
+    last.text += chunk;
   } else {
-    job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind, text: chunk.slice(-maxLength) }];
+    limitTimeline(job, [...timeline, { kind, text: chunk }]);
   }
   trimTimelineBudget(job, kind === 'thought' ? 'thought' : 'text', maxLength);
+}
+
+function rememberCommentaryPrefix(job: AgentJob, dropped: string): void {
+  commentaryPrefixes.set(job, retainRedactionTail(commentaryPrefixes.get(job) ?? '', dropped));
+}
+
+function limitTimeline(job: AgentJob, timeline: AgentTimelineEntry[]): void {
+  for (const entry of timeline.slice(0, -MAX_JOB_TIMELINE)) {
+    if (entry.kind === 'commentary') rememberCommentaryPrefix(job, entry.text);
+  }
+  job.timeline = timeline.slice(-MAX_JOB_TIMELINE);
 }
 
 function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars: number): void {
@@ -745,6 +765,7 @@ function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars:
       trimmed.push(entry);
       continue;
     }
+    if (entry.kind === 'commentary') rememberCommentaryPrefix(job, entry.text.slice(0, excess));
     if (entry.text.length <= excess) {
       excess -= entry.text.length;
       continue;
@@ -758,7 +779,7 @@ function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars:
 function appendTimelineTool(job: AgentJob, toolId: string): void {
   const timeline = job.timeline ?? [];
   if (timeline.some((entry) => entry.kind === 'tool' && entry.toolId === toolId)) return;
-  job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind: 'tool', toolId }];
+  limitTimeline(job, [...timeline, { kind: 'tool', toolId }]);
 }
 
 function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retracted: string): void {
@@ -779,7 +800,7 @@ function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retract
   }
 
   const next = [...timeline];
-  const commentaryEntry = { kind: 'commentary' as const, text: commentary.slice(-MAX_JOB_TEXT_LENGTH) };
+  const commentaryEntry = { kind: 'commentary' as const, text: commentary };
   for (let i = timeline.length - 1; i >= 0; i--) {
     const entry = timeline[i];
     if (entry?.kind !== 'text') continue;
@@ -793,7 +814,7 @@ function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retract
     next.splice(i, 1, ...replacement);
     break;
   }
-  job.timeline = next.slice(-MAX_JOB_TIMELINE);
+  limitTimeline(job, next);
   trimTimelineBudget(job, 'text', MAX_JOB_TEXT_LENGTH);
 }
 

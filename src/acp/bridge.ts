@@ -116,7 +116,7 @@ export class AcpBridge {
 export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): AgentApp {
   const cancelled = new Set<string>();
   const sessionCwds = new Map<string, string>();
-  const activeHermesPrompts = adapter.kind === 'hermes' ? new Set<string>() : undefined;
+  const hermesPrompts = adapter.kind === 'hermes' ? new Map<string, { stopUnconfirmed: boolean }>() : undefined;
   let supportsInterimRetraction = false;
   const app = agent({ name: 'dsh-knot-acp-bridge' });
   app.onConnect((connection: AgentConnection) => {
@@ -199,13 +199,20 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       output += chunk;
       await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } });
     };
-    if (activeHermesPrompts?.has(sessionId))
-      throw RequestError.internalError(undefined, 'Session already has an active prompt');
-    if (activeHermesPrompts && activeHermesPrompts.size >= MAX_TRACKED_SESSIONS) {
-      throw RequestError.internalError(undefined, 'Too many active Hermes prompts');
+    const previousPrompt = hermesPrompts?.get(sessionId);
+    if (previousPrompt) {
+      const detail = previousPrompt.stopUnconfirmed
+        ? 'The previous Hermes run stop is unconfirmed. Retry session/cancel before sending another prompt'
+        : 'Session already has an active prompt';
+      throw RequestError.internalError(undefined, detail);
     }
-    // Hermes cancels by session ID, so a prompt owns the session through any overflow cleanup.
-    activeHermesPrompts?.add(sessionId);
+    if (hermesPrompts && hermesPrompts.size >= MAX_TRACKED_SESSIONS) {
+      throw RequestError.internalError(undefined, 'Too many Hermes sessions with active prompts or unconfirmed stops');
+    }
+    const promptOwner = { stopUnconfirmed: false };
+    let stopUnconfirmed = false;
+    // Hermes cancels by session ID, so a prompt owns the session until overflow cleanup is confirmed.
+    hermesPrompts?.set(sessionId, promptOwner);
     cancelled.delete(sessionId);
     try {
       for await (const event of adapter.prompt(sessionId, text, signal)) {
@@ -245,6 +252,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
               try {
                 await adapter.cancel(sessionId, signal);
               } catch {
+                stopUnconfirmed = true;
                 throw RequestError.internalError(undefined, `${detail}. The remote stop is unconfirmed`);
               }
               throw RequestError.internalError(undefined, detail);
@@ -372,12 +380,16 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       });
       throw error;
     } finally {
-      activeHermesPrompts?.delete(sessionId);
+      if (stopUnconfirmed) promptOwner.stopUnconfirmed = true;
+      else hermesPrompts?.delete(sessionId);
     }
   });
   app.onNotification(methods.agent.session.cancel, async ({ params, signal }) => {
-    cancelled.add(params.sessionId);
-    await adapter.cancel(params.sessionId, signal);
+    const { sessionId } = params;
+    const promptOwner = hermesPrompts?.get(sessionId);
+    cancelled.add(sessionId);
+    await adapter.cancel(sessionId, signal);
+    if (promptOwner?.stopUnconfirmed && hermesPrompts?.get(sessionId) === promptOwner) hermesPrompts.delete(sessionId);
   });
   return app;
 }
