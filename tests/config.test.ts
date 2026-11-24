@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeConfig } from '../src/config.js';
-import { redact, redactText, redactTextSegments, toolInputPreview } from '../src/policy/redact.js';
+import { redact, redactText, redactTextSegments, retainRedactionTail, toolInputPreview } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
   it('defaults to direct and assigns protocol ports', () => {
@@ -75,6 +75,32 @@ describe('configuration and policy', () => {
     expect(
       redactTextSegments(['', 'synthetic', 'marker0123456 after'], 'Before Bearer syntheticmarker0123456 after'),
     ).toEqual(['', '[REDACTED]', ' after']);
+  });
+
+  it('redacts an unfinished private key until its matching footer and keeps following content', () => {
+    const header = '-----BEGIN RSA PRIVATE KEY-----';
+    const partialFooter = '-----END RSA PRI';
+    const marker = 'synthetic-only';
+    const incomplete = `${header}\n${marker}\n-----END EC PRIVATE KEY-----\n${marker}`;
+    expect(redactText(`Before ${incomplete}`)).toBe('Before [REDACTED]');
+    expect(redactText(`Before ${incomplete}\n-----END RSA PRIVATE KEY-----\nAfter`)).toBe('Before [REDACTED]\nAfter');
+    const prefix = retainRedactionTail('', `${incomplete}\n${'x'.repeat(5_000)}\n${partialFooter}`);
+    expect(prefix).toBe(`${header}${partialFooter}`);
+    const visible = 'VATE KEY-----\nAfter';
+    expect(redactTextSegments([visible], prefix + visible)).toEqual(['[REDACTED]\nAfter']);
+  });
+
+  it.each([
+    ['Cookie: ', 'suffix'],
+    ['sk-', 'suffix'],
+    ['ghp_', 'suffix'],
+    ['eyJ', '.abcdefgh.abcdefgh'],
+  ])('keeps bounded recognition of a long credential beginning with %s', (prefix, suffix) => {
+    const context = retainRedactionTail('', `${prefix}${'x'.repeat(5_000)}`);
+    expect(context.length).toBeLessThan(64);
+    expect(context).not.toContain('x');
+    const visible = `${suffix} after`;
+    expect(redactTextSegments([visible], context + visible)).toEqual(['[REDACTED] after']);
   });
 
   it('bounds tool input previews and masks credentials in nested values', () => {

@@ -363,17 +363,27 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it.each(['tool boundary', 'entry cap', 'text cap'])('redacts split credentials after %s', async (scenario) => {
+  it.each(['tool break', 'entry cap', 'text cap', 'PEM trim'])('redacts split credentials after %s', async (scene) => {
     const marker = 'syntheticmarker0123456';
     class SplitOutputAdapter extends StubAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
-        if (scenario === 'text cap') {
+        if (scene === 'PEM trim') {
+          yield {
+            type: 'text',
+            interim: true,
+            text: `Before -----BEGIN RSA PRIVATE KEY-----\n${'x'.repeat(2_005_000)}`,
+          };
+          yield { type: 'thought', text: 'Checking' };
+          yield { type: 'text', interim: true, text: `${marker}\n-----END RSA PRIVATE KEY-----\nAfter.` };
+          return;
+        }
+        if (scene === 'text cap') {
           yield { type: 'text', interim: true, text: `Before Basic ${'a'.repeat(2_005_000)}` };
           yield { type: 'thought', text: 'Checking' };
           yield { type: 'text', interim: true, text: `${marker} after.` };
           return;
         }
-        if (scenario === 'entry cap') {
+        if (scene === 'entry cap') {
           yield { type: 'text', interim: true, text: 'Before Bearer ' };
           yield { type: 'thought', text: 'Checking' };
           yield { type: 'text', interim: true, text: `${marker} after.` };
@@ -418,14 +428,20 @@ describe('web UI host routes & schemastery Config', () => {
         post(WEB_ROUTES.state),
       ]);
       for (const entry of [details.value, state.value.jobs[0]]) {
-        expect(JSON.stringify(entry)).not.toContain(marker);
-        if (scenario === 'entry cap') {
+        expect(JSON.stringify(entry).includes(marker)).toBe(false);
+        if (scene === 'entry cap') {
           expect(entry.timeline).toHaveLength(120);
           expect(entry.timeline.slice(0, 2)).toEqual([
             { kind: 'thought', text: 'Checking' },
             { kind: 'commentary', text: '[REDACTED] after.' },
           ]);
-        } else if (scenario === 'text cap') {
+        } else if (scene === 'PEM trim') {
+          expect(entry.timeline).toEqual([
+            { kind: 'commentary', text: '[REDACTED]' },
+            { kind: 'thought', text: 'Checking' },
+            { kind: 'commentary', text: '\nAfter.' },
+          ]);
+        } else if (scene === 'text cap') {
           expect(entry.timeline).toEqual([
             { kind: 'commentary', text: '[REDACTED]' },
             { kind: 'thought', text: 'Checking' },

@@ -1,10 +1,12 @@
+const PRIVATE_KEY = /-----BEGIN ((?:RSA |EC |OPENSSH )?PRIVATE KEY)-----[\s\S]*?(?:(-----END \1-----)|(?![\s\S]))/g;
+
 const PATTERNS: RegExp[] = [
   /\b(?:sk|api|key|token|secret)[-_][a-zA-Z0-9_-]{12,}\b/gi,
   /\b(?:gh[pousr]_[a-zA-Z0-9_]{20,}|AKIA[0-9A-Z]{16})\b/g,
   /\b(?:Bearer|Basic)\s+[a-zA-Z0-9._~+/=-]{12,}/gi,
   /\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b/g,
   /\b(?:set-cookie|cookie)\s*:\s*[^\s]{8,}/gi,
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g,
+  PRIVATE_KEY,
 ];
 
 const SENSITIVE_KEY =
@@ -17,7 +19,14 @@ const MAX_PREVIEW_LENGTH = 500;
 const MAX_PREVIEW_ITEMS = 8;
 const MAX_PREVIEW_DEPTH = 3;
 const MAX_REDACTION_CONTEXT = 4_096;
-const AUTHORIZATION_TAIL = /\b(Bearer|Basic)\s+([a-zA-Z0-9._~+/=-]*)$/i;
+const TOKEN_TAILS = [
+  { opener: /\b(?:set-cookie|cookie)\s*:\s*/gi, terminator: /\s/, minimumLength: 8 },
+  { opener: /\b(?:Bearer|Basic)\s+/gi, terminator: /[^a-zA-Z0-9._~+/=-]/, minimumLength: 12 },
+  { opener: /\b(?:sk|api|key|token|secret)[-_]/gi, terminator: /[^a-zA-Z0-9_-]/, minimumLength: 12 },
+  { opener: /\bgh[pousr]_/g, terminator: /[^a-zA-Z0-9_]/, minimumLength: 20 },
+];
+const JWT_TAIL = /\beyJ([a-zA-Z0-9_-]*)(?:\.([a-zA-Z0-9_-]*)(?:\.([a-zA-Z0-9_-]*))?)?$/;
+const JWT_CHARACTER = /[a-zA-Z0-9_-]/;
 
 export function toolInputPreview(value: unknown, token?: string): string | undefined {
   const display = (text: string): string => {
@@ -58,13 +67,42 @@ export function redactText(text: string): string {
 
 export function retainRedactionTail(previous: string, dropped: string): string {
   const source = previous + dropped;
-  const authorization = source.length > MAX_REDACTION_CONTEXT ? AUTHORIZATION_TAIL.exec(source) : null;
-  if (authorization) {
-    // Keep the shape of an open credential without storing an arbitrarily long value.
-    return `${authorization[1]} ${'a'.repeat(Math.min(authorization[2]!.length, 12))}`;
+  for (const match of source.matchAll(PRIVATE_KEY)) {
+    if (match[2]) continue;
+    const footer = `-----END ${match[1]}-----`;
+    // A matching footer can itself be split at the eviction boundary.
+    let length = footer.length - 1;
+    while (length && !source.endsWith(footer.slice(0, length))) length--;
+    return `-----BEGIN ${match[1]}-----${footer.slice(0, length)}`;
   }
+  // Carry the shape of open credentials without storing their values.
+  for (const { opener, terminator, minimumLength } of TOKEN_TAILS) {
+    let last: RegExpExecArray | undefined;
+    for (const match of source.matchAll(opener)) last = match;
+    if (!last) continue;
+    const value = source.slice(last.index + last[0].length);
+    if (!terminator.test(value))
+      return `${last[0].replace(/\s+/g, ' ')}${'a'.repeat(Math.min(value.length, minimumLength))}`;
+  }
+  // A valid JWT suffix has at most two separators. Restrict matching to that suffix before testing for its opener.
+  let start = source.length;
+  let dots = 0;
+  while (start > 0) {
+    const char = source[start - 1]!;
+    if (char === '.' ? ++dots > 2 : !JWT_CHARACTER.test(char)) break;
+    start--;
+  }
+  const jwt = JWT_TAIL.exec(source.slice(start));
+  if (jwt) {
+    const parts = jwt
+      .slice(1)
+      .filter((part) => part !== undefined)
+      .map((part) => 'a'.repeat(Math.min(part.length, 8)));
+    return `eyJ${parts.join('.')}`;
+  }
+
   // Copy the short tail so it does not keep the discarded string's backing storage alive.
-  return Buffer.from(source.slice(-MAX_REDACTION_CONTEXT), 'utf16le').toString('utf16le');
+  return Buffer.from(redactText(source).slice(-MAX_REDACTION_CONTEXT), 'utf16le').toString('utf16le');
 }
 
 export function redactTextSegments(segments: readonly string[], fullText?: string): string[] {
