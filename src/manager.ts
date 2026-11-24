@@ -24,7 +24,8 @@ const MAX_JOB_APPROVALS = 50;
 const MAX_JOB_TEXT_LENGTH = 2_000_000;
 const MAX_JOB_THOUGHT_LENGTH = 16_000;
 const MAX_JOB_TIMELINE = 120;
-const commentaryContexts = new WeakMap<AgentJob, RedactionContext>();
+type OutputKind = 'text' | 'thought' | 'commentary';
+const outputContexts = new WeakMap<AgentJob, Partial<Record<OutputKind, RedactionContext>>>();
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -40,6 +41,8 @@ export class AgentManager {
       submission?: string;
       cancelling?: Promise<void>;
       stopConfirmation?: 'pending' | 'received';
+      terminalConfirmation?: Promise<void>;
+      recoverStop?: (signal: AbortSignal) => Promise<void>;
     }
   >();
   private readonly configRevisions = new WeakMap<AgentConfig, string>();
@@ -236,8 +239,9 @@ export class AgentManager {
             job.status === 'running' ||
             this.completions.has(job.id) ||
             owner.cancelling !== undefined ||
-            job.remoteStop !== undefined ||
-            (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))
+            (job.remoteStop !== 'unconfirmed-released' &&
+              (job.remoteStop !== undefined ||
+                (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))))
         );
       });
       const existingJob = activeSessionJobs.find((job) => exclusive || this.jobOwners.get(job.id)?.exclusive);
@@ -300,9 +304,9 @@ export class AgentManager {
     return job?.agentId === agentId && owner && owner.adapter === this.adapters.get(agentId) ? job : undefined;
   }
 
-  getCommentaryRedactionContext(id: string): RedactionContext | undefined {
+  getOutputRedactionContext(id: string, kind: OutputKind): RedactionContext | undefined {
     const job = this.jobs.get(id);
-    return job && commentaryContexts.get(job);
+    return job && outputContexts.get(job)?.[kind];
   }
 
   listJobs({ currentOnly = false } = {}): AgentJob[] {
@@ -333,6 +337,7 @@ export class AgentManager {
 
   async cancel(id: string, signal?: AbortSignal): Promise<AgentJob> {
     const job = this.get(id);
+    if (job.remoteStop === 'unconfirmed-released') return job;
     if (job.status === 'completed' || (job.status === 'failed' && !job.remoteStop)) return job;
     if (job.status === 'cancelled' && this.remoteCancelled.has(id)) return job;
     const latest = job.sessionId ? this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) : undefined;
@@ -362,28 +367,36 @@ export class AgentManager {
     this.approvals.delete(job);
     job.updatedAt = Date.now();
     const controller = this.controllers.get(id);
-    const terminal =
-      job.sessionId && !this.preparingHistory.has(id)
-        ? owner?.adapter.promptTerminalForCancel?.(job.sessionId)
-        : undefined;
-    const drain =
-      owner && controller && terminal
-        ? {
-            controller,
-            confirmation: terminal.then(
-              () => {
-                owner.stopConfirmation = 'received';
-              },
-              () => {
-                /* Transport failures leave confirmation pending. */
-              },
-            ),
-          }
-        : undefined;
+    const confirmation = this.captureStopConfirmation(job);
+    const drain = controller && !controller.signal.aborted && confirmation ? { controller, confirmation } : undefined;
     if (!drain) {
       controller?.abort(job.sessionId ? new LocalOnlyAbortError('job cancelled') : new Error('job cancelled'));
     }
     await this.cancelRemote(job, signal, drain);
+    return job;
+  }
+
+  releaseUnconfirmedStop(id: string, signal?: AbortSignal): AgentJob {
+    signal?.throwIfAborted();
+    const job = this.get(id);
+    if (job.remoteStop === 'unconfirmed-released') return job;
+    const owner = this.jobOwners.get(id);
+    if (job.remoteStop !== 'unconfirmed' || owner?.adapter.kind !== 'acp' || !job.sessionId) {
+      throw new Error('Only an unconfirmed ACP stop can release its local session');
+    }
+    if (owner.adapter !== this.adapters.get(job.agentId) || !this.isLatestSessionJob(job)) {
+      throw new Error('The job no longer owns this gateway session');
+    }
+    if (owner.cancelling || this.completions.has(id) || owner.adapter.isSessionBusy?.(job.sessionId)) {
+      throw new Error('Wait for the local ACP prompt and stop request to finish');
+    }
+    if (owner.stopConfirmation === 'received') {
+      delete job.remoteStop;
+      this.remoteCancelled.add(id);
+    } else {
+      job.remoteStop = 'unconfirmed-released';
+    }
+    job.updatedAt = Date.now();
     return job;
   }
 
@@ -427,6 +440,26 @@ export class AgentManager {
     }
   }
 
+  private captureStopConfirmation(job: AgentJob): Promise<void> | undefined {
+    const owner = this.jobOwners.get(job.id);
+    const sessionId = job.sessionId;
+    if (!owner || !sessionId || this.preparingHistory.has(job.id)) return;
+    if (owner.terminalConfirmation) return owner.terminalConfirmation;
+    const terminal = owner.adapter.promptTerminalForCancel?.(sessionId);
+    if (!terminal) return;
+    owner.stopConfirmation = 'pending';
+    owner.recoverStop = owner.adapter.recoverPromptStopForCancel?.(sessionId);
+    owner.terminalConfirmation = terminal.then(
+      () => {
+        owner.stopConfirmation = 'received';
+      },
+      () => {
+        /* Transport failures leave confirmation pending. */
+      },
+    );
+    return owner.terminalConfirmation;
+  }
+
   private async cancelRemote(
     job: AgentJob,
     signal?: AbortSignal,
@@ -435,23 +468,32 @@ export class AgentManager {
     const owner = this.jobOwners.get(job.id);
     if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
     if (owner && job.sessionId && !this.preparingHistory.has(job.id)) {
+      const sessionId = job.sessionId;
       const deadline = AbortSignal.timeout(5_000);
       const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-      if (drain && owner.stopConfirmation === undefined) owner.stopConfirmation = 'pending';
       if (owner.exclusive || owner.stopConfirmation) job.remoteStop = 'pending';
       try {
         stopSignal.throwIfAborted();
-        const remoteStop = owner.adapter.cancel(job.sessionId, stopSignal);
         owner.cancelling = raceAbort(
-          remoteStop.then(async () => {
+          (async () => {
+            const recovering = !drain && owner.stopConfirmation === 'pending';
+            const originalPromptBusy = recovering && owner.adapter.isSessionBusy?.(sessionId);
+            if (recovering && !originalPromptBusy && owner.recoverStop) {
+              await owner.recoverStop(stopSignal);
+              owner.stopConfirmation = 'received';
+            } else if (!recovering || originalPromptBusy) {
+              await owner.adapter.cancel(sessionId, stopSignal);
+            }
             if (drain) {
               await this.wait(job.id, stopSignal);
               await raceAbort(drain.confirmation, stopSignal);
+            } else if (originalPromptBusy && owner.terminalConfirmation) {
+              await raceAbort(owner.terminalConfirmation, stopSignal);
             }
             if (owner.stopConfirmation === 'pending') {
               throw new Error('The remote stop is unconfirmed because the prompt ended without a terminal response');
             }
-          }),
+          })(),
           stopSignal,
         );
         await owner.cancelling;
@@ -503,7 +545,7 @@ export class AgentManager {
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
-      if (job.agentId !== agentId || job.status === 'completed') continue;
+      if (job.agentId !== agentId || job.status === 'completed' || job.remoteStop === 'unconfirmed-released') continue;
       const cancelling = this.jobOwners.get(id)?.cancelling;
       if ((job.status === 'cancelled' || job.status === 'failed') && !cancelling && job.remoteStop === undefined)
         continue;
@@ -512,6 +554,7 @@ export class AgentManager {
       delete job.pendingApproval;
       this.approvals.delete(job);
       job.updatedAt = Date.now();
+      if (owned) this.captureStopConfirmation(job);
       this.controllers.get(id)?.abort(new LocalOnlyAbortError(`agent "${agentId}" reconfigured`));
       if (cancelling || (owned && job.sessionId)) {
         remoteCancels.push(
@@ -540,7 +583,11 @@ export class AgentManager {
       if (
         !this.completions.has(id) &&
         !owner?.cancelling &&
-        !(job.remoteStop && owner?.adapter === this.adapters.get(job.agentId)) &&
+        !(
+          job.remoteStop &&
+          job.remoteStop !== 'unconfirmed-released' &&
+          owner?.adapter === this.adapters.get(job.agentId)
+        ) &&
         ['completed', 'failed', 'cancelled'].includes(job.status)
       ) {
         this.jobs.delete(id);
@@ -570,6 +617,7 @@ export class AgentManager {
       if (job.status !== 'running' && job.status !== 'queued') return;
       const owned = this.isLatestSessionJob(job);
       const message = `job timed out after ${this.timeoutMs}ms`;
+      if (owned) this.captureStopConfirmation(job);
       controller.abort(!owned || job.sessionId ? new LocalOnlyAbortError(message) : new Error(message));
       if (owned && job.sessionId) {
         this.cancelRemote(job).catch(() => {
@@ -628,11 +676,11 @@ export class AgentManager {
               appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
             }
           } else {
-            job.text = (job.text + event.text).slice(-MAX_JOB_TEXT_LENGTH);
+            setBoundedOutput(job, 'text', job.text + event.text, MAX_JOB_TEXT_LENGTH);
             appendTimelineText(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
           }
         } else if (event.type === 'thought' && event.text) {
-          job.thought = ((job.thought ?? '') + event.text).slice(-MAX_JOB_THOUGHT_LENGTH);
+          setBoundedOutput(job, 'thought', (job.thought ?? '') + event.text, MAX_JOB_THOUGHT_LENGTH);
           appendTimelineText(job, 'thought', event.text, MAX_JOB_THOUGHT_LENGTH);
         } else if (event.type === 'tool' && (event.phase || event.requestId)) {
           recordToolActivity(job, event);
@@ -644,6 +692,7 @@ export class AgentManager {
             const approvals = this.approvals.get(job) ?? new Map();
             if (!approvals.delete(requestId) && approvals.size >= MAX_JOB_APPROVALS) {
               approvalOverflow = true;
+              if (this.isLatestSessionJob(job)) this.captureStopConfirmation(job);
               throw new Error(`Remote agent exceeded ${MAX_JOB_APPROVALS} pending approvals`);
             }
             approvals.set(requestId, pending);
@@ -653,7 +702,10 @@ export class AgentManager {
         } else if (event.type === 'error') throw new Error(event.text ?? 'remote agent failed');
         else if (event.type === 'final') {
           if (event.text) {
-            job.text = event.text.slice(-MAX_JOB_TEXT_LENGTH);
+            if (event.text !== job.text) {
+              clearOutputContext(job, 'text');
+              setBoundedOutput(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
+            }
             reconcileFinalTimelineText(job, event.text);
           }
           if (job.status === 'running') {
@@ -732,12 +784,13 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   }
 }
 
-function appendTimelineText(
-  job: AgentJob,
-  kind: 'text' | 'commentary' | 'thought',
-  chunk: string,
-  maxLength: number,
-): void {
+function setBoundedOutput(job: AgentJob, kind: 'text' | 'thought', text: string, maxLength: number): void {
+  const dropped = text.length - maxLength;
+  if (dropped > 0) rememberOutputContext(job, kind, text.slice(0, dropped));
+  job[kind] = dropped > 0 ? text.slice(dropped) : text;
+}
+
+function appendTimelineText(job: AgentJob, kind: OutputKind, chunk: string, maxLength: number): void {
   const timeline = job.timeline ?? [];
   const last = timeline.at(-1);
   if (last && last.kind === kind) {
@@ -748,13 +801,20 @@ function appendTimelineText(
   trimTimelineBudget(job, kind === 'thought' ? 'thought' : 'text', maxLength);
 }
 
-function rememberCommentaryContext(job: AgentJob, dropped: string): void {
-  commentaryContexts.set(job, retainRedactionTail(commentaryContexts.get(job), dropped));
+function rememberOutputContext(job: AgentJob, kind: OutputKind, dropped: string): void {
+  const contexts = outputContexts.get(job) ?? {};
+  contexts[kind] = retainRedactionTail(contexts[kind], dropped);
+  outputContexts.set(job, contexts);
+}
+
+function clearOutputContext(job: AgentJob, kind: OutputKind): void {
+  const contexts = outputContexts.get(job);
+  if (contexts) delete contexts[kind];
 }
 
 function limitTimeline(job: AgentJob, timeline: AgentTimelineEntry[]): void {
   for (const entry of timeline.slice(0, -MAX_JOB_TIMELINE)) {
-    if (entry.kind === 'commentary') rememberCommentaryContext(job, entry.text);
+    if (entry.kind === 'commentary') rememberOutputContext(job, 'commentary', entry.text);
   }
   job.timeline = timeline.slice(-MAX_JOB_TIMELINE);
 }
@@ -776,7 +836,7 @@ function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars:
       trimmed.push(entry);
       continue;
     }
-    if (entry.kind === 'commentary') rememberCommentaryContext(job, entry.text.slice(0, excess));
+    if (entry.kind === 'commentary') rememberOutputContext(job, 'commentary', entry.text.slice(0, excess));
     if (entry.text.length <= excess) {
       excess -= entry.text.length;
       continue;
@@ -798,6 +858,7 @@ function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retract
   const retainedRetraction =
     previous.length === MAX_JOB_TEXT_LENGTH ? retracted.slice(-MAX_JOB_TEXT_LENGTH) : retracted;
   job.text = stripTrailingText(previous, retainedRetraction);
+  if (!job.text) clearOutputContext(job, 'text');
 
   const timeline = job.timeline ?? [];
   const retainedReplyLength = timeline.reduce(

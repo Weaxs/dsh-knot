@@ -1,10 +1,12 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import {
   type ActiveSession,
   type ActiveSessionMessage,
   type AgentCapabilities,
   type ClientConnection,
+  type ContentBlock,
   client,
   methods,
   ndJsonStream,
@@ -14,6 +16,12 @@ import {
 } from '@agentclientprotocol/sdk';
 import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
 import WebSocket from 'ws';
+import {
+  STOP_RECOVERY_CAPABILITY,
+  STOP_RECOVERY_REQUEST,
+  STOP_RECOVERY_TURN_ID,
+  type StopRecoveryResponse,
+} from '../acp/stop-recovery.js';
 import { AsyncQueue } from '../async-queue.js';
 import { raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText, urlHost } from '../config.js';
 import { requireSecureGateway } from '../policy/auth.js';
@@ -46,6 +54,7 @@ export class AcpAdapter implements AgentAdapter {
   private readonly queues = new Map<string, AsyncQueue<PromptMessage>>();
   private readonly cancelledQueues = new WeakSet<AsyncQueue<PromptMessage>>();
   private readonly promptTerminals = new WeakMap<AsyncQueue<PromptMessage>, Promise<unknown>>();
+  private readonly stopRecoveries = new WeakMap<AsyncQueue<PromptMessage>, (signal: AbortSignal) => Promise<void>>();
   private readonly inFlightPrompts = new Map<string, Promise<void>>();
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly loadedSessions = new Set<string>();
@@ -58,6 +67,7 @@ export class AcpAdapter implements AgentAdapter {
   private connecting?: Promise<void>;
   private capabilities?: AgentCapabilities;
   private supportsInterimRetraction = false;
+  private supportsStopRecovery = false;
 
   constructor(
     readonly id: string,
@@ -122,6 +132,27 @@ export class AcpAdapter implements AgentAdapter {
     return queue && this.promptTerminals.get(queue);
   }
 
+  recoverPromptStopForCancel(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined {
+    const queue = this.queues.get(this.sessionIds.get(sessionId) ?? sessionId);
+    return queue && this.stopRecoveries.get(queue);
+  }
+
+  private promptContent(sessionId: string, text: string, queue: AsyncQueue<PromptMessage>): ContentBlock[] {
+    if (!this.supportsStopRecovery) return [{ type: 'text' as const, text }];
+    const turnId = randomUUID();
+    this.stopRecoveries.set(queue, async (signal) => {
+      await this.connect(signal);
+      if (!this.supportsStopRecovery) throw new Error('ACP gateway no longer supports stop recovery');
+      const response = await this.connection!.agent.request<StopRecoveryResponse>(
+        STOP_RECOVERY_REQUEST,
+        { sessionId, turnId },
+        { cancellationSignal: signal, stopWaitingOnCancel: true },
+      );
+      if (response?.stopped !== true) throw new Error('ACP gateway did not confirm the remote stop');
+    });
+    return [{ type: 'text' as const, text, _meta: { [STOP_RECOVERY_TURN_ID]: turnId } }];
+  }
+
   async *prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent> {
     let actualId = sessionId ?? '';
     let output = '';
@@ -167,7 +198,7 @@ export class AcpAdapter implements AgentAdapter {
         this.queues.set(actualId, queue);
         const remotePrompt = this.connection!.agent.request(methods.agent.session.prompt, {
           sessionId: actualId,
-          prompt: [{ type: 'text', text }],
+          prompt: this.promptContent(actualId, text, queue),
         });
         this.trackInFlight(actualId, remotePrompt);
         remotePrompt.then(
@@ -200,7 +231,7 @@ export class AcpAdapter implements AgentAdapter {
         }
         signal?.throwIfAborted();
         this.queues.set(actualId, queue);
-        const completion = active.prompt(text);
+        const completion = active.prompt(this.promptContent(actualId, text, queue));
         this.trackInFlight(actualId, completion);
         completion.catch((error) => {
           queue.push({
@@ -429,6 +460,7 @@ export class AcpAdapter implements AgentAdapter {
 
   private async open(): Promise<void> {
     this.supportsInterimRetraction = false;
+    this.supportsStopRecovery = false;
     this.clearSessions();
     await this.closeProcess();
     this.closing.signal.throwIfAborted();
@@ -476,7 +508,7 @@ export class AcpAdapter implements AgentAdapter {
         protocolVersion: PROTOCOL_VERSION,
         clientInfo: { name: 'dsh-knot', version: VERSION },
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-        _meta: { 'dsh-knot/interimRetraction': true },
+        _meta: { 'dsh-knot/interimRetraction': true, [STOP_RECOVERY_CAPABILITY]: true },
       }),
       this.config.connectTimeoutMs ?? 30_000,
       'ACP initialize',
@@ -488,6 +520,8 @@ export class AcpAdapter implements AgentAdapter {
     }
     this.capabilities = initialized.agentCapabilities;
     this.supportsInterimRetraction = initialized._meta?.['dsh-knot/interimRetraction'] === true;
+    this.supportsStopRecovery =
+      this.config.acpTransport !== 'stdio' && initialized._meta?.[STOP_RECOVERY_CAPABILITY] === true;
   }
 
   private openWebSocket() {

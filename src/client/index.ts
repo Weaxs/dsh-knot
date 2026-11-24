@@ -114,7 +114,7 @@ interface JobSummary {
   text: string;
   thought?: string;
   error?: string;
-  remoteStop?: 'pending' | 'unconfirmed';
+  remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
   tools?: ToolActivitySummary[];
   timeline?: TimelineEntry[];
@@ -250,6 +250,9 @@ const DICTS: Record<string, Record<string, string>> = {
     chatCancelled: '已停止',
     chatStopping: '正在停止远端任务…',
     chatStopUnconfirmed: '尚未确认远端任务已停止',
+    chatStopUnconfirmedReleased: '本地会话已释放，远端停止尚未确认',
+    chatReleaseLocalSession: '释放本地会话',
+    chatRemoteMayRun: '原远端任务可能仍在运行。',
     chatBack: '助手设置',
     chatPreparing: '正在生成…',
     chatThought: '思考',
@@ -364,6 +367,9 @@ const DICTS: Record<string, Record<string, string>> = {
     chatCancelled: 'Stopped',
     chatStopping: 'Stopping the remote run…',
     chatStopUnconfirmed: 'The remote stop has not been confirmed',
+    chatStopUnconfirmedReleased: 'Local session released. Remote stop unconfirmed.',
+    chatReleaseLocalSession: 'Release local session',
+    chatRemoteMayRun: 'The previous remote task may still be running.',
     chatBack: 'Agent settings',
     chatPreparing: 'Generating…',
     chatThought: 'Thinking',
@@ -1073,6 +1079,22 @@ function formatDirectEndpoint(agent: AgentSummary): string {
   return `${scheme}://${host}${omitPort ? '' : `:${port}`}${agent.basePath ?? ''}`;
 }
 
+function isLoopbackEndpoint(address: string): boolean {
+  const hasScheme = /^(?:https?|wss?):\/\//i.test(address);
+  const bareIpv6 = !address.startsWith('[') && address.indexOf(':') !== address.lastIndexOf(':');
+  try {
+    const { hostname } = new URL(hasScheme ? address : `http://${bareIpv6 ? `[${address}]` : address}`);
+    return (
+      hostname === 'localhost' ||
+      hostname === '[::1]' ||
+      /^\[::ffff:7f[\da-f]{2}:[\da-f]+\]$/.test(hostname) ||
+      (/^127(?:\.\d{1,3}){3}$/.test(hostname) && (hasScheme || hostname === address.replace(/:\d+$/, '')))
+    );
+  } catch {
+    return false;
+  }
+}
+
 type Language = 'zh-CN' | 'en';
 type Translate = (key: string) => string;
 
@@ -1090,7 +1112,12 @@ const TOOL_STATUS_LABEL: Record<ToolStatus, string> = {
 };
 
 function isRunning(job?: JobSummary): boolean {
-  return job?.status === 'queued' || job?.status === 'running' || job?.remoteStop !== undefined;
+  return (
+    job?.status === 'queued' ||
+    job?.status === 'running' ||
+    job?.remoteStop === 'pending' ||
+    job?.remoteStop === 'unconfirmed'
+  );
 }
 
 function compareJobOrder(a: JobSummary, b: JobSummary): number {
@@ -1449,6 +1476,12 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       },
       [onSession, reloadSessions, refreshState],
     );
+
+    React.useEffect(() => {
+      if (activeJob?.remoteStop !== 'unconfirmed') return;
+      const released = jobs.find((job) => job.id === activeJob.id && job.remoteStop === 'unconfirmed-released');
+      if (released) applyProgress(released, released.id === ownActiveId);
+    }, [activeJob, jobs, ownActiveId, applyProgress]);
 
     React.useEffect(() => {
       if (!progressId) return;
@@ -1865,6 +1898,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const renderJob = (job: JobSummary, matchedTurn?: MatchedLiveTurn) => {
       const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
+      const releaseAvailable = agent.kind === 'acp' && active && job.remoteStop === 'unconfirmed';
+      const released = job.remoteStop === 'unconfirmed-released';
       const status =
         job.remoteStop === 'pending'
           ? 'chatStopping'
@@ -1873,7 +1908,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             : approval
               ? 'wantsApproval'
               : 'chatPreparing';
-      const terminalNotice = job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop);
+      const terminalNotice = !released && (job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop));
       const persistedTurn = matchedTurn?.persistedTurn ?? [];
       const persistedUser = persistedTurn.find((item) => item.role === 'user');
       const persistedAssistant = persistedTurn.filter((item) => item.role === 'assistant');
@@ -1930,7 +1965,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       flushTools('tail');
 
       const hasPrompt = Boolean(promptText);
-      const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice);
+      const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice || released);
       if (!hasPrompt && !hasAssistantContent) return null;
       const assistantParts = [
         ...contentParts,
@@ -1951,6 +1986,26 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
                 icons.stop(11),
                 t('stopTask'),
               ),
+            )
+          : null,
+        releaseAvailable || released
+          ? h(
+              'div',
+              { key: 'stop-recovery', className: 'dk-warnbox' },
+              released ? h('div', { role: 'status' }, t('chatStopUnconfirmedReleased')) : null,
+              h('div', { className: 'dk-muted' }, t('chatRemoteMayRun')),
+              releaseAvailable
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dk-btn dk-btn-sm',
+                      disabled: acting,
+                      onClick: () => void actOnJob('cancel', job, { releaseUnconfirmed: true }),
+                    },
+                    t('chatReleaseLocalSession'),
+                  )
+                : null,
             )
           : null,
         approval
@@ -2232,7 +2287,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
     const showEncryptedOverlay =
       formAddress &&
       !/^(?:https|wss):\/\//i.test(formAddress) &&
-      !/^(?:127\.0\.0\.1|localhost|\[?::1\]?)$/i.test(formAddress) &&
+      !isLoopbackEndpoint(formAddress) &&
       !(form?.kind === 'acp' && form.acpTransport === 'stdio');
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const stateRequest = React.useRef(0);

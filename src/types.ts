@@ -108,6 +108,7 @@ export interface AgentAdapter {
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
+  recoverPromptStopForCancel?(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;
@@ -172,6 +173,6 @@ export interface AgentJob {
   timeline?: AgentTimelineEntry[];
   historyBaseline?: SessionHistoryBaseline;
   error?: string;
-  remoteStop?: 'pending' | 'unconfirmed';
+  remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
 }

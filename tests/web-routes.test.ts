@@ -15,6 +15,7 @@ import type {
   AgentAdapter,
   AgentConfig,
   AgentEvent,
+  AgentJob,
   AgentTimelineEntry,
   AgentToolActivity,
   AgentTranscriptMessage,
@@ -150,11 +151,13 @@ describe('web UI host routes & schemastery Config', () => {
         text: 'finished',
       })),
       olderStop,
+      { ...olderStop, id: 'released-stop', remoteStop: 'unconfirmed-released' },
     ]);
     try {
       const state = await post(WEB_ROUTES.state);
       expect(state.value.jobs).toHaveLength(50);
       expect(state.value.jobs[0]).toEqual(olderStop);
+      expect(state.value.jobs).not.toContainEqual(expect.objectContaining({ id: 'released-stop' }));
     } finally {
       jobList.mockRestore();
     }
@@ -503,6 +506,102 @@ describe('web UI host routes & schemastery Config', () => {
     }
   });
 
+  it('masks truncated job output and resets stale context on replacement', async () => {
+    const marker = 'synthetic-truncation-marker';
+    const oversizedReply = `Before Bearer ${'a'.repeat(2_005_000)}${marker} after. `;
+    const oversizedThought = `Before -----BEGIN EC PRIVATE KEY-----\n${'x'.repeat(18_000)}${marker}\n-----END EC PRIVATE KEY-----\nAfter thought.`;
+    class TruncatedOutputAdapter extends StubAdapter {
+      override async *prompt(_sessionId?: string, scenario?: string): AsyncIterable<AgentEvent> {
+        if (scenario === 'large final') {
+          yield { type: 'final', text: oversizedReply };
+          return;
+        }
+        yield { type: 'text', text: oversizedReply };
+        if (scenario === 'equal final') {
+          yield { type: 'final', text: oversizedReply.slice(-2_000_000) };
+          return;
+        }
+        if (scenario === 'replacement') {
+          yield { type: 'final', text: 'OrdinaryReplacement' };
+          return;
+        }
+        if (scenario === 'retraction') {
+          yield { type: 'text', interim: true, alreadyStreamed: true, text: oversizedReply };
+          yield { type: 'text', text: 'OrdinaryReplacement' };
+          return;
+        }
+        yield { type: 'thought', text: oversizedThought };
+        for (let i = 0; i < 60; i++) {
+          yield { type: 'text', interim: true, text: 'Progress.' };
+          yield { type: 'thought', text: '.' };
+        }
+        yield { type: 'text', text: 'VisibleAnswer' };
+      }
+    }
+    const config: AgentConfig = { id: 'truncated-output', kind: 'hermes', transport: 'local' };
+    const manager = new AgentManager([config], 10_000, () => new TruncatedOutputAdapter(config.id));
+    const routes = new Map<string, (req: Request) => Promise<Response>>();
+    registerWebRoutes(
+      {
+        connection: {
+          fetch: {
+            register(route: { path: string; fetch: (req: Request) => Promise<Response> }) {
+              routes.set(route.path, route.fetch);
+              return () => routes.delete(route.path);
+            },
+          },
+        },
+        effect() {},
+      } as any,
+      manager,
+      undefined,
+      undefined,
+    );
+    const post = async (path: string, body?: object) => {
+      const response = await routes.get(path)!(
+        new Request(`http://localhost${path}`, { method: 'POST', body: JSON.stringify(body) }),
+      );
+      expect(response.ok).toBe(true);
+      return response.json();
+    };
+    try {
+      const job = await manager.wait(manager.start(config.id, 'inspect truncated output', undefined).id);
+      const revision = manager.list()[0]?.revision;
+      const read = async (jobId: string) => {
+        const [details, state] = await Promise.all([
+          post(WEB_ROUTES.job, { agentId: config.id, revision, jobId }),
+          post(WEB_ROUTES.state),
+        ]);
+        return [details.value, state.value.jobs.find(({ id }: { id: string }) => id === jobId)];
+      };
+      for (const entry of await read(job.id)) {
+        expect(JSON.stringify(entry).includes(marker)).toBe(false);
+        expect(entry.text).toBe('[REDACTED] after. VisibleAnswer');
+        expect(entry.thought).toBe(`[REDACTED]\nAfter thought.${'.'.repeat(60)}`);
+        expect(entry.timeline.filter(({ kind }: AgentTimelineEntry) => kind === 'text')).toEqual([
+          { kind: 'text', text: 'VisibleAnswer' },
+        ]);
+      }
+      job.timeline = [];
+      for (const entry of await read(job.id)) {
+        expect(JSON.stringify(entry).includes(marker)).toBe(false);
+        expect(entry.text).toBe('[REDACTED] after. VisibleAnswer');
+        expect(entry.thought).toBe(`[REDACTED]\nAfter thought.${'.'.repeat(60)}`);
+      }
+      for (const scenario of ['large final', 'equal final', 'replacement', 'retraction']) {
+        const next = await manager.wait(manager.start(config.id, scenario, undefined).id);
+        const expected = scenario.endsWith('final') ? '[REDACTED] after. ' : 'OrdinaryReplacement';
+        for (const entry of await read(next.id)) {
+          expect(JSON.stringify(entry).includes(marker)).toBe(false);
+          expect(entry.text).toBe(expected);
+          expect(entry.timeline.find(({ kind }: AgentTimelineEntry) => kind === 'text')?.text).toBe(expected);
+        }
+      }
+    } finally {
+      await manager.close();
+    }
+  });
+
   it('captures a fresh baseline for each admitted turn despite out-of-order history requests', async () => {
     let transcript: AgentTranscriptMessage[] = [];
     let holdNextRead = true;
@@ -752,7 +851,58 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it('activates cleanly in real Cordis 4.1.0 without sessionController, mounts routes on connection, and gates agent_respond with ask', async () => {
+  it('releases an unconfirmed ACP stop locally through the cancel route', async () => {
+    const cancel = vi.fn(async () => {
+      throw new Error('Connection lost before confirming the stop');
+    });
+    const adapter: AgentAdapter = {
+      id: 'acp-remote',
+      kind: 'acp',
+      health: async () => ({ ok: true }),
+      listSessions: async () => [],
+      async *prompt(_session, _text, signal) {
+        if (!signal?.aborted) {
+          await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+        }
+      },
+      cancel,
+      close: async () => {},
+    };
+    const manager = new AgentManager([{ id: adapter.id, kind: 'acp', transport: 'local' }], 10_000, () => adapter);
+    let handler: ((request: Request) => Promise<Response>) | undefined;
+    registerWebRoutes(
+      {
+        connection: {
+          fetch: {
+            register(route: { path: string; fetch: (request: Request) => Promise<Response> }) {
+              if (route.path === WEB_ROUTES.cancel) handler = route.fetch;
+              return () => {};
+            },
+          },
+        },
+        effect() {},
+      } as any,
+      manager,
+      undefined,
+      undefined,
+    );
+    const job = manager.start(adapter.id, 'test', 'session', undefined, true);
+    const request = (body: object) =>
+      handler!(new Request(`http://localhost${WEB_ROUTES.cancel}`, { method: 'POST', body: JSON.stringify(body) }));
+    try {
+      expect((await request({ jobId: job.id })).ok).toBe(false);
+      await manager.wait(job.id);
+      expect(job.remoteStop).toBe('unconfirmed');
+      expect((await request({ jobId: job.id, releaseUnconfirmed: 'true' })).ok).toBe(false);
+      const released = await request({ jobId: job.id, releaseUnconfirmed: true });
+      expect(await released.json()).toMatchObject({ ok: true, value: { remoteStop: 'unconfirmed-released' } });
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('activates in real Cordis 4.1.0 and requires user confirmation for approvals and local release', async () => {
     const root = new Context();
     const registeredTools: string[] = [];
     const registeredRoutes: string[] = [];
@@ -785,6 +935,18 @@ describe('web UI host routes & schemastery Config', () => {
     );
     expect(decision).toMatchObject({ kind: 'ask' });
     expect(decision.reason).toContain('req-1');
+
+    const cancelDecision = (releaseUnconfirmed?: boolean) =>
+      (root as any).waterfall(
+        'tools/pre-execute',
+        { name: 'agent_cancel', arguments: { job: 'job-1', releaseUnconfirmed } },
+        async () => ({ kind: 'allow' }),
+      );
+    await expect(cancelDecision()).resolves.toEqual({ kind: 'allow' });
+    await expect(cancelDecision(true)).resolves.toMatchObject({
+      kind: 'ask',
+      reason: expect.stringContaining('remote task may still be running'),
+    });
 
     const passthrough = await (root as any).waterfall(
       'tools/pre-execute',
@@ -971,6 +1133,7 @@ describe('web UI host routes & schemastery Config', () => {
       text: string;
       thought?: string;
       error?: string;
+      remoteStop?: AgentJob['remoteStop'];
       tools?: AgentToolActivity[];
       timeline?: AgentTimelineEntry[];
       historyBaseline?: SessionHistoryBaseline;
@@ -994,6 +1157,8 @@ describe('web UI host routes & schemastery Config', () => {
     };
     let localJob: typeof currentJob | undefined;
     let localJobSubmitted = false;
+    let fixtureAgentKind: AgentConfig['kind'] = 'hermes';
+    let localReleaseRequests = 0;
     const settledJobs: Array<typeof currentJob> = [];
     const transcriptBySession = new Map<string, AgentTranscriptMessage[]>([
       [
@@ -1042,12 +1207,12 @@ describe('web UI host routes & schemastery Config', () => {
                 {
                   id: 'hermes-remote',
                   revision: 'rev-1',
-                  kind: 'hermes',
+                  kind: fixtureAgentKind,
                   transport: 'direct',
                   host: '127.0.0.1',
                   port: 8642,
                   supportsRespond: true,
-                  supportsSessionMessages: true,
+                  supportsSessionMessages: fixtureAgentKind === 'hermes',
                   connection: { status: 'connected' },
                 },
               ],
@@ -1063,6 +1228,7 @@ describe('web UI host routes & schemastery Config', () => {
                 { id: 'sess-3', title: 'Live session 3' },
                 { id: 'sess-4', title: 'Live session 4' },
                 { id: 'sess-5', title: 'Live session 5' },
+                { id: 'sess-release', title: 'Unconfirmed ACP session' },
               ],
             });
           }
@@ -1083,6 +1249,12 @@ describe('web UI host routes & schemastery Config', () => {
             if (jobId === localJob?.id) return ok(localJob);
             if (jobId === currentJob.id) return ok(currentJob);
             throw new Error(`Unexpected job ${jobId}`);
+          }
+          if (path === WEB_ROUTES.cancel) {
+            expect(JSON.parse(String(init?.body))).toEqual({ jobId: currentJob.id, releaseUnconfirmed: true });
+            localReleaseRequests++;
+            currentJob = { ...currentJob, remoteStop: 'unconfirmed-released', updatedAt: currentJob.updatedAt + 1 };
+            return ok(currentJob);
           }
           return ok({});
         },
@@ -1134,6 +1306,19 @@ describe('web UI host routes & schemastery Config', () => {
         (endpoint.props.onInput as (e: { target: { value: string } }) => void)({ target: { value } });
       const overlayInput = (node: unknown) =>
         findNode(node, (vnode) => vnode.type === 'input' && vnode.props.type === 'checkbox');
+      for (const address of [
+        'http://LOCALHOST:8642',
+        'http://127.7.8.9:8642',
+        '127.7.8.9:8642',
+        'ws://[::1]:18792/acp',
+        '0:0:0:0:0:0:0:1',
+        'ws://[::ffff:127.7.8.9]:18792/acp',
+      ]) {
+        enterEndpoint(address);
+        expect(overlayInput(await flush()), address).toBeUndefined();
+      }
+      enterEndpoint('http://127.gateway.test:8642');
+      expect(overlayInput(await flush())?.props.checked).toBe(false);
       enterEndpoint('http://100.64.0.3:8642');
       const overlay = overlayInput(await flush())!;
       expect(overlay.props.checked).toBe(false);
@@ -1560,6 +1745,39 @@ describe('web UI host routes & schemastery Config', () => {
       expect(nextTexts.filter((t) => t === 'latest remote prompt')).toHaveLength(1);
       expect(nextTexts.indexOf('partial prompt')).toBeLessThan(nextTexts.indexOf('partial reply'));
       expect(nextTexts.indexOf('partial reply')).toBeLessThan(nextTexts.indexOf('latest remote prompt'));
+
+      fixtureAgentKind = 'acp';
+      currentJob = {
+        id: 'release-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-release',
+        prompt: 'Disconnected prompt',
+        status: 'cancelled',
+        remoteStop: 'unconfirmed',
+        createdAt: 19_000,
+        updatedAt: 19_000,
+        text: '',
+      };
+      const beforeRelease = await flush();
+      (findButton(beforeRelease, 'Unconfirmed ACP session')!.props.onClick as () => void)();
+      const unconfirmed = await flush();
+      expect(localReleaseRequests).toBe(0);
+      expect(findButton(unconfirmed, '停止')).toBeDefined();
+      expect(collectText(unconfirmed)).toContain('原远端任务可能仍在运行。');
+      const input = findNode(unconfirmed, (vnode) => vnode.type === 'textarea')!;
+      (input.props.onInput as (event: { target: { value: string } }) => void)({ target: { value: 'Next prompt' } });
+      const sendButton = (tree: unknown) =>
+        findNode(tree, (vnode) => vnode.type === 'button' && vnode.props.type === 'submit');
+      const withInput = await flush();
+      expect(sendButton(withInput)?.props.disabled).toBe(true);
+      (findButton(withInput, '释放本地会话')!.props.onClick as () => void)();
+      const released = await flush();
+      expect(localReleaseRequests).toBe(1);
+      expect(collectText(released)).toContain('本地会话已释放，远端停止尚未确认');
+      expect(collectText(released)).not.toContain('已停止');
+      expect(findButton(released, '停止')).toBeUndefined();
+      expect(findButton(released, '释放本地会话')).toBeUndefined();
+      expect(sendButton(released)?.props.disabled).toBe(false);
     } finally {
       try {
         try {

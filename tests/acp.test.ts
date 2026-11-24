@@ -609,7 +609,9 @@ describe('ACP provider and bridge', () => {
     { scenario: 'a fresh interim prefix', interim: true, sessionId: undefined },
     { scenario: 'resumed interim with a pending approval', interim: true, sessionId: 'existing-session' },
     { scenario: 'a terminal arriving after the cancel caller aborts', interim: false, callerAborts: true },
-  ])('drains $scenario when AgentManager cancels Hermes over ACP', async ({ interim, sessionId, callerAborts }) => {
+    { scenario: 'a WebSocket disconnect before the original terminal', interim: false, disconnect: true },
+  ])('drains $scenario when AgentManager cancels Hermes over ACP', async (scenario) => {
+    const { interim, sessionId, callerAborts, disconnect } = scenario;
     const http = await import('node:http');
     const { AgentManager } = await import('../src/manager.js');
     const { HermesAdapter } = await import('../src/adapters/hermes.js');
@@ -620,6 +622,8 @@ describe('ACP provider and bridge', () => {
     });
     let closeSse!: (cancelled?: boolean) => void;
     let stopRequests = 0;
+    let runs = 0;
+    let knownSession = 'existing-session';
     const commentary = 'Checking repository...';
     const streamed = sessionId ? commentary : interim ? 'Checking ' : 'partial hermes';
     const partial = interim ? '' : streamed;
@@ -641,12 +645,17 @@ describe('ACP provider and bridge', () => {
       }
       if (req.url === '/api/sessions?source=api_server') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"sessions":[{"id":"existing-session"}]}');
+        res.end(JSON.stringify({ sessions: [{ id: knownSession }] }));
         return;
       }
       if (req.method === 'POST' && req.url === '/v1/runs') {
         res.writeHead(202, { 'Content-Type': 'application/json' });
-        res.end('{"run_id":"run_live_1"}');
+        res.end(JSON.stringify({ run_id: `run_live_${++runs}` }));
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/v1/runs/run_live_2/events') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end('data: {"event":"run.completed","output":"next reply"}\n\n');
         return;
       }
       if (req.method === 'GET' && req.url === '/v1/runs/run_live_1/events') {
@@ -672,13 +681,14 @@ describe('ACP provider and bridge', () => {
       }
       if (req.method === 'GET' && req.url === '/v1/runs/run_live_1') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'cancelled', output: partial }));
+        res.end(JSON.stringify({ status: disconnect && stopRequests < 2 ? 'running' : 'cancelled', output: partial }));
         return;
       }
       if (req.method === 'POST' && req.url === '/v1/runs/run_live_1/stop') {
         stopRequests++;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end('{"status":"cancelled"}', markStopped);
+        const stillRunning = disconnect && stopRequests === 1;
+        res.writeHead(stillRunning ? 202 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: stillRunning ? 'running' : 'cancelled' }), markStopped);
         return;
       }
       res.writeHead(404).end();
@@ -738,6 +748,19 @@ describe('ACP provider and bridge', () => {
     await stopDone;
     expect(job.remoteStop).toBe('pending');
     expect(() => manager.start('bridged-live', 'too early', job.sessionId)).toThrow(/active or cancelling job/);
+    if (disconnect) {
+      knownSession = job.sessionId!;
+      const sockets = Reflect.get(bridge, 'webSocketServer') as import('ws').WebSocketServer;
+      expect(sockets.clients.size).toBe(1);
+      for (const socket of sockets.clients) socket.terminate();
+      await expect(stopping).rejects.toThrow(/terminal response/);
+      expect(await manager.wait(job.id)).toMatchObject({ remoteStop: 'unconfirmed', text: partial });
+      expect((await manager.cancel(job.id)).remoteStop).toBeUndefined();
+      expect(stopRequests).toBe(2);
+      const next = manager.start('bridged-live', 'continue after stop', job.sessionId);
+      expect(await manager.wait(next.id)).toMatchObject({ status: 'completed', text: 'next reply' });
+      return;
+    }
     const retry = new AbortController();
     const retryResult = manager.cancel(job.id, retry.signal);
     const retryError = new Error('cancel caller disconnected');

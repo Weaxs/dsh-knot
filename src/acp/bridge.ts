@@ -17,13 +17,28 @@ import {
 import { createNodeWebSocketUpgradeHandler } from '@agentclientprotocol/sdk/experimental/node';
 import { AcpServer } from '@agentclientprotocol/sdk/experimental/server';
 import { WebSocketServer } from 'ws';
+import { HermesAdapter } from '../adapters/hermes.js';
 import { createNativeAdapter, createNativeSessionId } from '../adapters/native.js';
 import { matchStreamedInterim, stripTrailingText } from '../config.js';
 import { verifyBearerToken } from '../policy/auth.js';
 import type { AgentAdapter, AgentConfig } from '../types.js';
 import { VERSION } from '../version.js';
+import {
+  STOP_RECOVERY_CAPABILITY,
+  STOP_RECOVERY_REQUEST,
+  STOP_RECOVERY_TURN_ID,
+  type StopRecoveryParams,
+  type StopRecoveryResponse,
+} from './stop-recovery.js';
 
 const MAX_TRACKED_SESSIONS = 500;
+const MAX_RECOVERY_ID_LENGTH = 1024;
+const STOP_RECOVERY_TURN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+interface RecoverableTurn {
+  sessionId: string;
+  runId?: string;
+}
 
 export type NativeAdapterFactory = (config: AgentConfig) => AgentAdapter;
 
@@ -62,7 +77,10 @@ export class AcpBridge {
     if (!['127.0.0.1', '::1', 'localhost'].includes(host) && !token) {
       throw new Error('DSH_KNOT_ACP_TOKEN is required when the ACP bridge is not loopback-only');
     }
-    const acpServer = new AcpServer({ createAgent: () => createAcpAgent(this.config, this.factory(this.config)) });
+    const stopRecovery = new Map<string, RecoverableTurn>();
+    const acpServer = new AcpServer({
+      createAgent: () => createAcpAgent(this.config, this.factory(this.config), stopRecovery),
+    });
     const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
     const upgrade = createNodeWebSocketUpgradeHandler(acpServer, webSocketServer);
     const server = http.createServer((request, response) => {
@@ -113,22 +131,36 @@ export class AcpBridge {
   }
 }
 
-export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): AgentApp {
+export function createAcpAgent(
+  config: AgentConfig,
+  adapter: AgentAdapter,
+  stopRecovery?: Map<string, RecoverableTurn>,
+): AgentApp {
   const cancelled = new Set<string>();
   const sessionCwds = new Map<string, string>();
   const hermesPrompts = adapter.kind === 'hermes' ? new Map<string, { stopUnconfirmed: boolean }>() : undefined;
+  const recoveryAdapter = stopRecovery && adapter instanceof HermesAdapter ? adapter : undefined;
   let supportsInterimRetraction = false;
+  let supportsStopRecovery = false;
   const app = agent({ name: 'dsh-knot-acp-bridge' });
   app.onConnect((connection: AgentConnection) => {
     void connection.closed.then(() => adapter.close());
   });
   app.onRequest(methods.agent.initialize, async ({ params, signal }) => {
-    supportsInterimRetraction = adapter.kind === 'hermes' && params._meta?.['dsh-knot/interimRetraction'] === true;
     await adapter.health(signal);
+    supportsInterimRetraction = adapter.kind === 'hermes' && params._meta?.['dsh-knot/interimRetraction'] === true;
+    supportsStopRecovery = recoveryAdapter !== undefined && params._meta?.[STOP_RECOVERY_CAPABILITY] === true;
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: 'dsh-knot-acp-bridge', version: VERSION },
-      ...(supportsInterimRetraction ? { _meta: { 'dsh-knot/interimRetraction': true } } : {}),
+      ...(supportsInterimRetraction || supportsStopRecovery
+        ? {
+            _meta: {
+              ...(supportsInterimRetraction ? { 'dsh-knot/interimRetraction': true } : {}),
+              ...(supportsStopRecovery ? { [STOP_RECOVERY_CAPABILITY]: true } : {}),
+            },
+          }
+        : {}),
       agentCapabilities: {
         loadSession: false,
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
@@ -136,6 +168,21 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       },
     };
   });
+  if (stopRecovery && recoveryAdapter) {
+    app.onRequest<StopRecoveryParams, StopRecoveryResponse>(
+      STOP_RECOVERY_REQUEST,
+      parseStopRecoveryParams,
+      async ({ params, signal }) => {
+        if (!supportsStopRecovery) throw RequestError.methodNotFound(STOP_RECOVERY_REQUEST);
+        const turn = stopRecovery.get(params.turnId);
+        if (turn?.sessionId !== params.sessionId || !turn.runId) {
+          throw RequestError.internalError(undefined, 'The Hermes run is unavailable for stop recovery');
+        }
+        await recoveryAdapter.cancelRun(turn.runId, signal);
+        return { stopped: true };
+      },
+    );
+  }
   app.onRequest(methods.agent.session.new, ({ params }) => {
     const sessionId = createNativeSessionId(config);
     sessionCwds.delete(sessionId);
@@ -209,13 +256,33 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     if (hermesPrompts && hermesPrompts.size >= MAX_TRACKED_SESSIONS) {
       throw RequestError.internalError(undefined, 'Too many Hermes sessions with active prompts or unconfirmed stops');
     }
+    let recoveryTurn: RecoverableTurn | undefined;
+    if (supportsStopRecovery && stopRecovery) {
+      const turnId = params.prompt.find((block) => block.type === 'text')?._meta?.[STOP_RECOVERY_TURN_ID];
+      if (turnId !== undefined) {
+        const recoveryParams = parseStopRecoveryParams({ sessionId, turnId });
+        if (stopRecovery.has(recoveryParams.turnId)) throw RequestError.invalidParams(undefined, 'Duplicate turn ID');
+        recoveryTurn = { sessionId };
+        stopRecovery.set(recoveryParams.turnId, recoveryTurn);
+        if (stopRecovery.size > MAX_TRACKED_SESSIONS) {
+          const oldest = stopRecovery.keys().next().value;
+          if (oldest !== undefined) stopRecovery.delete(oldest);
+        }
+      }
+    }
     const promptOwner = { stopUnconfirmed: false };
     let stopUnconfirmed = false;
     // Hermes cancels by session ID, so a prompt owns the session until overflow cleanup is confirmed.
     hermesPrompts?.set(sessionId, promptOwner);
     cancelled.delete(sessionId);
     try {
-      for await (const event of adapter.prompt(sessionId, text, signal)) {
+      const events =
+        recoveryTurn && recoveryAdapter
+          ? recoveryAdapter.prompt(sessionId, text, signal, undefined, (runId) => {
+              if (runId.length <= MAX_RECOVERY_ID_LENGTH) recoveryTurn.runId = runId;
+            })
+          : adapter.prompt(sessionId, text, signal);
+      for await (const event of events) {
         if (event.type === 'text' && event.text) {
           if (event.interim) {
             const buffer = deferTextUntilBoundary ? pendingText : stepStreamed;
@@ -392,6 +459,22 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     if (promptOwner?.stopUnconfirmed && hermesPrompts?.get(sessionId) === promptOwner) hermesPrompts.delete(sessionId);
   });
   return app;
+}
+
+function parseStopRecoveryParams(params: unknown): StopRecoveryParams {
+  if (params && typeof params === 'object' && 'sessionId' in params && 'turnId' in params) {
+    const { sessionId, turnId } = params;
+    if (
+      typeof sessionId === 'string' &&
+      sessionId.length > 0 &&
+      sessionId.length <= MAX_RECOVERY_ID_LENGTH &&
+      typeof turnId === 'string' &&
+      STOP_RECOVERY_TURN_RE.test(turnId)
+    ) {
+      return { sessionId, turnId };
+    }
+  }
+  throw RequestError.invalidParams(undefined, 'Invalid Hermes stop recovery session or turn ID');
 }
 
 function acpStopReason(reason: string | undefined): StopReason {

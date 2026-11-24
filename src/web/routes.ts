@@ -43,28 +43,37 @@ function errorReply(message: string, status = 400): Response {
 }
 
 function jobPriority(job: AgentJob): number {
-  return Number(job.status === 'queued' || job.status === 'running' || job.remoteStop !== undefined);
+  return Number(
+    job.status === 'queued' ||
+      job.status === 'running' ||
+      job.remoteStop === 'pending' ||
+      job.remoteStop === 'unconfirmed',
+  );
 }
 
 function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
-  if (!job.timeline?.length) return redact(job);
-  const timeline = job.timeline.map((entry) => ({ ...entry }));
-  const textEntries = timeline.filter((entry) => entry.kind !== 'tool');
+  const { text, thought, timeline: originalTimeline, ...fields } = job;
+  const result: AgentJob = { ...redact(fields), text: '' };
+  const timeline = originalTimeline?.map((entry) => ({ ...entry }));
+  const textEntries = timeline?.filter((entry) => entry.kind !== 'tool') ?? [];
   for (const [kind, fullText] of [
-    ['text', job.text],
-    ['thought', job.thought],
+    ['text', text],
+    ['thought', thought],
     ['commentary', undefined],
   ] as const) {
+    const context = manager.getOutputRedactionContext(job.id, kind);
+    if (kind !== 'commentary' && fullText !== undefined) {
+      result[kind] = redactTextSegments([fullText], undefined, context)[0]!;
+    }
     const entries = textEntries.filter((entry) => entry.kind === kind);
     const segments = entries.map((entry) => entry.text);
-    const context =
-      kind === 'commentary' && segments.length > 0 ? manager.getCommentaryRedactionContext(job.id) : undefined;
     const texts = redactTextSegments(segments, fullText, context);
     entries.forEach((entry, index) => {
       entry.text = texts[index]!;
     });
   }
-  return redact({ ...job, timeline });
+  if (timeline) result.timeline = redact(timeline);
+  return result;
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -247,7 +256,12 @@ export function registerWebRoutes(
         const body = await parseBody(request);
         const jobId = typeof body.jobId === 'string' ? body.jobId : '';
         if (!jobId) return errorReply('jobId is required', 400);
-        const job = await manager.cancel(jobId, request.signal);
+        if (body.releaseUnconfirmed !== undefined && typeof body.releaseUnconfirmed !== 'boolean') {
+          return errorReply('releaseUnconfirmed must be a boolean', 400);
+        }
+        const job = body.releaseUnconfirmed
+          ? manager.releaseUnconfirmedStop(jobId, request.signal)
+          : await manager.cancel(jobId, request.signal);
         return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);

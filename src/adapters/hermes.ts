@@ -131,9 +131,11 @@ export class HermesAdapter implements AgentAdapter {
     text: string,
     signal?: AbortSignal,
     options?: AgentPromptOptions,
+    onRunAdmitted?: (runId: string) => void,
   ): AsyncIterable<AgentEvent> {
     const id = sessionId ?? `dsh_${randomUUID()}`;
     const runId = await this.admitRun(id, text, signal, options);
+    onRunAdmitted?.(runId);
     signal?.throwIfAborted();
     let terminal = false;
     let output = '';
@@ -283,6 +285,30 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async cancel(sessionId: string, signal?: AbortSignal): Promise<void> {
+    await this.withStopDeadline(signal, async (stopSignal) => {
+      const admission = this.admissions.get(sessionId);
+      const runId = admission ? await raceAbort(admission, stopSignal) : this.runs.get(sessionId);
+      if (!runId) throw new Error('The run ID is unavailable');
+      await this.stopRun(runId, stopSignal);
+    });
+  }
+
+  async cancelRun(runId: string, signal?: AbortSignal): Promise<void> {
+    await this.withStopDeadline(signal, async (stopSignal) => {
+      try {
+        await this.stopRun(runId, stopSignal);
+      } catch (error) {
+        stopSignal.throwIfAborted();
+        const state = await this.status(runId, stopSignal).catch(() => undefined);
+        if (!TERMINAL_RUN_STATUSES.has(String(state?.status))) throw error;
+      }
+    });
+  }
+
+  private async withStopDeadline(
+    signal: AbortSignal | undefined,
+    stop: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
     const stopSignal = AbortSignal.any([
       this.closing.signal,
       AbortSignal.timeout(STOP_TIMEOUT_MS),
@@ -290,23 +316,24 @@ export class HermesAdapter implements AgentAdapter {
     ]);
     try {
       stopSignal.throwIfAborted();
-      const admission = this.admissions.get(sessionId);
-      const runId = admission ? await raceAbort(admission, stopSignal) : this.runs.get(sessionId);
-      if (!runId) throw new Error('The run ID is unavailable');
-      const acknowledgement = await this.json(`/v1/runs/${encodeURIComponent(runId)}/stop`, {
-        method: 'POST',
-        body: {},
-        signal: stopSignal,
-      });
-      if (TERMINAL_RUN_STATUSES.has(acknowledgement.status)) return;
-      while (true) {
-        const state = await this.status(runId, stopSignal);
-        if (TERMINAL_RUN_STATUSES.has(String(state.status))) return;
-        await delay(250, undefined, { signal: stopSignal });
-      }
+      await stop(stopSignal);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Hermes remote stop is unconfirmed: ${detail}`, { cause: error });
+    }
+  }
+
+  private async stopRun(runId: string, signal: AbortSignal): Promise<void> {
+    const acknowledgement = await this.json(`/v1/runs/${encodeURIComponent(runId)}/stop`, {
+      method: 'POST',
+      body: {},
+      signal,
+    });
+    if (TERMINAL_RUN_STATUSES.has(acknowledgement.status)) return;
+    while (true) {
+      const state = await this.status(runId, signal);
+      if (TERMINAL_RUN_STATUSES.has(String(state.status))) return;
+      await delay(250, undefined, { signal });
     }
   }
 

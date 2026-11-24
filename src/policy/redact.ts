@@ -227,11 +227,11 @@ function maskSpans(source: string, pattern: RegExp, offset: number): Span[] {
   return spans;
 }
 
-function continuationSpan(shape: string, text: string, kind: CredentialKind): Span[] {
+function continuationSpan(shape: string, text: string, kind: CredentialKind, offset: number): Span[] {
   const pattern = CONTINUATIONS.get(kind)!;
   pattern.lastIndex = 0;
   const match = pattern.exec(shape + text);
-  const end = (match?.[0].length ?? 0) - shape.length;
+  const end = (match?.[0].length ?? 0) - shape.length - offset;
   return end > 0 ? [{ start: 0, end }] : [];
 }
 
@@ -259,14 +259,18 @@ export function redactTextSegments(
 ): string[] {
   if (segments.length === 0) return [];
   const joined = segments.join('');
-  // The retained segments can start inside a credential whose prefix was evicted.
-  const source = fullText?.endsWith(joined) ? fullText : (context?.suffix ?? '') + joined;
+  if (!joined) return [...segments];
+  // Context precedes the retained aggregate. A timeline can start further to its right.
+  const retained = fullText?.endsWith(joined) ? fullText : joined;
+  const alignedContext = fullText === undefined || fullText === retained ? context : undefined;
+  const source = (alignedContext?.suffix ?? '') + retained;
+  const skipped = retained.length - joined.length;
   let spans: Span[] = [];
   for (const kind of CREDENTIAL_KINDS) {
     const pattern = PATTERNS[kind];
     spans = mergeSpans(spans, maskSpans(source, pattern, source.length - joined.length));
-    for (const shape of context?.shapes.get(kind) ?? []) {
-      spans = mergeSpans(spans, continuationSpan(shape, joined, kind));
+    for (const shape of alignedContext?.shapes.get(kind) ?? []) {
+      spans = mergeSpans(spans, continuationSpan(shape, retained, kind, skipped));
     }
   }
   if (!spans.length) return [...segments];

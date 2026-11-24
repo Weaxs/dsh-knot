@@ -173,7 +173,7 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
-  it('keeps a negotiated cancellation unconfirmed when the prompt disconnects before its terminal response', async () => {
+  it('keeps a disconnected ACP stop unconfirmed until explicitly releasing the local session', async () => {
     let disconnect!: () => void;
     let rejectTerminal!: (error: Error) => void;
     const terminal = new Promise<unknown>((_, reject) => {
@@ -184,7 +184,11 @@ describe('AgentManager', () => {
         return this.cancelled ? undefined : terminal;
       }
 
-      override async *prompt(): AsyncIterable<AgentEvent> {
+      override async *prompt(_sessionId: string | undefined, text?: string): AsyncIterable<AgentEvent> {
+        if (text !== 'Hello') {
+          yield { type: 'final', text: 'next reply' };
+          return;
+        }
         yield { type: 'text', text: 'partial reply' };
         await new Promise<void>((resolve) => {
           disconnect = resolve;
@@ -205,7 +209,9 @@ describe('AgentManager', () => {
     try {
       const job = manager.start(config.id, 'Hello', 'shared');
       await vi.waitFor(() => expect(disconnect).toBeTypeOf('function'));
-      await expect(manager.cancel(job.id)).rejects.toThrow(/terminal response/);
+      const stopping = manager.cancel(job.id);
+      expect(() => manager.releaseUnconfirmedStop(job.id)).toThrow(/unconfirmed ACP stop/);
+      await expect(stopping).rejects.toThrow(/terminal response/);
       expect(await manager.wait(job.id)).toMatchObject({
         status: 'cancelled',
         text: 'partial reply',
@@ -213,8 +219,66 @@ describe('AgentManager', () => {
         remoteStop: 'unconfirmed',
       });
       await expect(manager.cancel(job.id)).rejects.toThrow(/terminal response/);
-      expect(cancel).toHaveBeenCalledTimes(2);
+      expect(cancel).toHaveBeenCalledOnce();
       expect(job.remoteStop).toBe('unconfirmed');
+      expect(() => manager.start(config.id, 'next prompt', 'shared')).toThrow(/active or cancelling/);
+      expect(manager.releaseUnconfirmedStop(job.id).remoteStop).toBe('unconfirmed-released');
+      const next = manager.start(config.id, 'next prompt', 'shared');
+      await manager.cancel(job.id);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect((await manager.wait(next.id)).text).toBe('next reply');
+      await Promise.all(
+        Array.from({ length: 198 }, () => manager.wait(manager.start(config.id, 'other prompt', undefined).id)),
+      );
+      await manager.wait(manager.start(config.id, 'fill a reclaimed slot', undefined).id);
+      expect(() => manager.get(job.id)).toThrow(/unknown job/i);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('retains exact ACP stop recovery when a job times out before the terminal response', async () => {
+    let rejectTerminal!: (error: Error) => void;
+    const terminal = new Promise<unknown>((_, reject) => {
+      rejectTerminal = reject;
+    });
+    const recover = vi.fn(async () => {});
+    class TimedOutAdapter extends RunningAdapter {
+      private started = false;
+
+      override async *prompt(
+        session: string | undefined,
+        text?: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        this.started = true;
+        yield* super.prompt(session, text, signal);
+      }
+
+      isSessionBusy() {
+        return this.started && !this.cancelled;
+      }
+      promptTerminalForCancel() {
+        return terminal;
+      }
+      recoverPromptStopForCancel() {
+        return recover;
+      }
+      override async cancel() {
+        this.cancelled = true;
+        rejectTerminal(new Error('ACP connection closed'));
+      }
+    }
+    const adapter = new TimedOutAdapter(config.id, 'acp');
+    const manager = new AgentManager([{ ...config, kind: 'acp' }], 20, () => adapter);
+    try {
+      const job = manager.start(config.id, 'Hello', 'shared');
+      await manager.wait(job.id);
+      await vi.waitFor(() => expect(job.remoteStop).toBe('unconfirmed'));
+      expect(recover).not.toHaveBeenCalled();
+      await manager.cancel(job.id);
+      expect(recover).toHaveBeenCalledOnce();
+      expect(job.remoteStop).toBeUndefined();
     } finally {
       await manager.close();
     }
