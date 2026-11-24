@@ -457,11 +457,11 @@ describe('Hermes API Server adapter', () => {
     for await (const event of adapter.prompt('session-1', 'check repo')) events.push(event);
     expect(events).toEqual([
       { type: 'thought', text: 'Inspect git status first.' },
-      { type: 'text', text: 'Checking repo...' },
+      { type: 'text', text: 'Checking repo...', interim: true },
       { type: 'tool', phase: 'start', name: 'terminal', requestId: 'call-1', inputPreview: 'git status' },
       { type: 'tool', phase: 'end', name: 'terminal', requestId: 'call-1' },
       { type: 'text', text: 'All clean.' },
-      { type: 'final', text: 'Checking repo...All clean.', stopReason: 'run.completed' },
+      { type: 'final', text: 'All clean.', stopReason: 'run.completed' },
     ]);
   });
 });

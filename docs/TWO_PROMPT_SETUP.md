@@ -74,7 +74,7 @@ Task steps:
      - Note whether device pairing is currently required (`openclaw devices list`) so the local agent knows to expect first-connection pairing.
    - **Remote dsh (`kind: dsh`)**:
      - Reuse the native `dsh web` HTTP API (default port `18790`).
-     - Keep `dsh web` on loopback behind a private reverse proxy (such as Tailscale Serve), OR bind it to a concrete private network IP with `--trusted-host <private-host-or-ip>`.
+     - Keep `dsh web` on loopback (`127.0.0.1`) behind a private reverse proxy such as Tailscale Serve (adding `--trusted-host <advertised-host>` when accessed through a proxy or advertised hostname), OR bind it directly to a concrete private network interface with `--host <private-ip>` (and add `--trusted-host <advertised-host>` if clients reach it via a hostname or proxy authority other than the bound IP).
      - Verify the launch token works locally against `/connect?token=...&interactions=none` without printing the token or tokenized URL.
    - **ACP v1 (`kind: acp`, including Claude Code)**:
      - If `Network choice` is `same-host` and a local ACP v1 stdio binary is installed (for example `claude-code-acp` or `hermes acp`), verify the binary path and executable permissions — no network listener is needed.
@@ -155,9 +155,15 @@ Task steps:
      - Transport: `direct` for networked URLs (Tailscale/Headscale/WireGuard/LAN), or `local` for same-host loopback / ACP stdio (`acpTransport: stdio`, `acpCommand`, `acpArgs`).
      - Endpoint URL: clean `endpoint_url` with no credentials, query string, or fragment.
    - Credential handling:
-     - If `credential_type` is not `none`, check whether the matching local env var (`HERMES_API_KEY`, `OPENCLAW_GATEWAY_TOKEN`, `DSH_GATEWAY_TOKEN`, or `DSH_KNOT_ACP_TOKEN`) or an existing saved token for this exact endpoint is already configured.
-     - Otherwise, ask me to enter the secret safely (either directly in **Remote Agents → + Add Agent / Edit** where it is saved to `$DSH_HOME/knot/agents.json` with `0600` permissions, or in a `0600` local env file), referencing `credential_reference` so I know which secret to copy. Never print the secret value.
-   - Save or update the agent in **Remote Agents** (using the active `dsh` instance's Remote Agents state/API so it appears immediately in the **Remote Agents / 远端助手** panel).
+     - **Saving via Remote Agents (`/api/dsh-knot/agent-save` or panel UI)**:
+       - Note that saving a **new** connection (or changing a gateway endpoint) without an explicit `token` writes `token: ""` and clears `tokenEnv`, which intentionally disables ambient environment-variable fallback.
+       - If `credential_type` is not `none`:
+         - When updating an **unchanged** gateway endpoint that already has a saved token, omit `token` to preserve it.
+         - When creating a new connection (or changing the endpoint), if the exact gateway's secret is already available locally (for example in the matching local env var `HERMES_API_KEY`, `OPENCLAW_GATEWAY_TOKEN`, `DSH_GATEWAY_TOKEN`, or `DSH_KNOT_ACP_TOKEN`, or a local secret file), pass that secret in the `token` field when saving — never echo or log the secret value.
+         - Otherwise, pause and ask me to enter the secret directly in **Remote Agents → + Add Agent / Edit** (saved to `$DSH_HOME/knot/agents.json` with `0600` permissions), referencing `credential_reference` so I know which secret to copy.
+     - **Env-only declarative config path (optional)**:
+       - If I prefer not to store the token in `$DSH_HOME/knot/agents.json`, configure the agent declaratively in plugin settings with `tokenEnv` (for example `tokenEnv: HERMES_API_KEY`) and omit `token`, ensure that env var is present in the running `dsh` process environment, and reload/restart `dsh` for the declarative config to take effect (do not overwrite it with an empty-token save through Remote Agents).
+   - Save or update the agent in **Remote Agents** (using the active `dsh` instance's Remote Agents state/API so it appears immediately in the **Remote Agents / 远端助手** panel, unless using the declarative `tokenEnv` path above).
 
 5. Run connection diagnostics:
    - Run `knot_doctor` (or trigger **Test all connections / Retest** in Remote Agents) targeting `agent_id`.

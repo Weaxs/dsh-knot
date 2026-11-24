@@ -828,4 +828,94 @@ describe('AgentManager', () => {
     ]);
     await finalManager.close();
   });
+
+  it('reconciles aggregate and divergent finals, keeps interim commentary out of job.text, and bounds timeline budgets', async () => {
+    // 1. Aggregate final after tool appends only the missing suffix (text('A') -> tool -> final('AB'))
+    class AggregateFinalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'A' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'AB' };
+      }
+    }
+    const aggManager = new AgentManager([config], 10_000, () => new AggregateFinalAdapter(config.id));
+    const aggDone = await aggManager.wait(aggManager.start(config.id, 'agg', undefined).id);
+    expect(aggDone.text).toBe('AB');
+    expect(aggDone.timeline).toEqual([
+      { kind: 'text', text: 'A' },
+      { kind: 'tool', toolId: aggDone.tools![0]!.id },
+      { kind: 'text', text: 'B' },
+    ]);
+    await aggManager.close();
+
+    // 2. Divergent authoritative final drops stale draft text while keeping thought, commentary, and tools
+    class DivergentFinalAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'thought', text: 'Plan check' };
+        yield { type: 'text', text: 'Checking repo...', interim: true };
+        yield { type: 'text', text: 'stale draft' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'Authoritative reply' };
+      }
+    }
+    const divManager = new AgentManager([config], 10_000, () => new DivergentFinalAdapter(config.id));
+    const divDone = await divManager.wait(divManager.start(config.id, 'div', undefined).id);
+    expect(divDone.text).toBe('Authoritative reply');
+    expect(divDone.timeline).toEqual([
+      { kind: 'thought', text: 'Plan check' },
+      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'tool', toolId: divDone.tools![0]!.id },
+      { kind: 'text', text: 'Authoritative reply' },
+    ]);
+    await divManager.close();
+
+    // 3. Interim commentary stays in UI timeline without polluting model-facing job.text
+    class InterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Working on it...', interim: true };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'text', text: 'All clean.' };
+        yield { type: 'final', text: 'All clean.' };
+      }
+    }
+    const interimManager = new AgentManager([config], 10_000, () => new InterimAdapter(config.id));
+    const interimDone = await interimManager.wait(interimManager.start(config.id, 'check', undefined).id);
+    expect(interimDone.text).toBe('All clean.');
+    expect(interimDone.timeline).toEqual([
+      { kind: 'commentary', text: 'Working on it...' },
+      { kind: 'tool', toolId: interimDone.tools![0]!.id },
+      { kind: 'text', text: 'All clean.' },
+    ]);
+    await interimManager.close();
+
+    // 4. Aggregate per-job text and thought budgets cap total timeline size across alternating segments
+    class HugeTimelineAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        for (let i = 0; i < 30; i++) {
+          yield { type: 'text', text: String(i % 10).repeat(200_000) };
+          yield { type: 'thought', text: String((i + 1) % 10).repeat(1_000) };
+        }
+        yield { type: 'final', text: '' };
+      }
+    }
+    const hugeManager = new AgentManager([config], 10_000, () => new HugeTimelineAdapter(config.id));
+    const hugeDone = await hugeManager.wait(hugeManager.start(config.id, 'huge', undefined).id);
+    const totalTextChars = (hugeDone.timeline ?? [])
+      .filter(
+        (entry): entry is { kind: 'text' | 'commentary'; text: string } =>
+          entry.kind === 'text' || entry.kind === 'commentary',
+      )
+      .reduce((sum, entry) => sum + entry.text.length, 0);
+    const totalThoughtChars = (hugeDone.timeline ?? [])
+      .filter((entry): entry is { kind: 'thought'; text: string } => entry.kind === 'thought')
+      .reduce((sum, entry) => sum + entry.text.length, 0);
+    expect(hugeDone.text.length).toBe(2_000_000);
+    expect(totalTextChars).toBe(2_000_000);
+    expect(hugeDone.thought?.length).toBe(16_000);
+    expect(totalThoughtChars).toBe(16_000);
+    await hugeManager.close();
+  });
 });

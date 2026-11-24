@@ -204,12 +204,10 @@ export class HermesAdapter implements AgentAdapter {
           continue;
         }
         if (type === 'message.interim') {
+          // Mid-turn commentary belongs in the UI timeline only; keep `output` aligned with the final reply.
           if (event.already_streamed !== true) {
             const interim = textOf(event.text ?? event.content ?? event.delta);
-            if (interim) {
-              output += interim;
-              yield { type: 'text', text: interim };
-            }
+            if (interim) yield { type: 'text', text: interim, interim: true };
           }
           continue;
         }

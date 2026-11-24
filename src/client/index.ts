@@ -96,6 +96,7 @@ interface ToolActivitySummary {
 
 type TimelineEntry =
   | { kind: 'thought'; text: string }
+  | { kind: 'commentary'; text: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; toolId: string };
 
@@ -1668,34 +1669,85 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         h(MarkdownText, { text, streaming, labels: MARKDOWN_LABELS[lang], omitHtml: true }),
       );
 
-    const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
-    const loadedObservedJob = Boolean(history && liveJob?.id === historyJobId);
-    const persistedPrompt = loadedObservedJob && lastUserText === liveJob?.prompt;
-    let lastUserIndex = -1;
-    if (history) {
+    interface PersistedTurnCoverage {
+      prompt: boolean;
+      reply: boolean;
+      allText: boolean;
+      thoughts: string[];
+      texts: string[];
+      toolNameCounts: Map<string, number>;
+    }
+
+    const computePersistedCoverage = (job: JobSummary | undefined, matchedHistory: boolean): PersistedTurnCoverage => {
+      const empty: PersistedTurnCoverage = {
+        prompt: false,
+        reply: false,
+        allText: false,
+        thoughts: [],
+        texts: [],
+        toolNameCounts: new Map(),
+      };
+      if (!matchedHistory || !history || !job) return empty;
+      let lastUserIndex = -1;
       for (let i = history.length - 1; i >= 0; i--) {
         if (history[i]?.role === 'user') {
           lastUserIndex = i;
           break;
         }
       }
-    }
-    const lastTurnHistory = history && lastUserIndex >= 0 ? history.slice(lastUserIndex + 1) : (history ?? []);
-    const persistedThought =
-      loadedObservedJob && lastTurnHistory.some((item) => item.role === 'assistant' && Boolean(item.thought));
-    const persistedTools =
-      loadedObservedJob && lastTurnHistory.some((item) => item.role === 'assistant' && Boolean(item.tools?.length));
-    const persistedReply =
-      loadedObservedJob &&
-      lastMessage?.role === 'assistant' &&
-      (lastMessage.text === liveJob?.text || Boolean(lastMessage.text && liveJob?.text.endsWith(lastMessage.text)));
+      const promptMatches = Boolean(job.prompt) && lastUserText === job.prompt;
+      const activeLive = isAvailableAndRunning(job);
+      // While the job is still running, any assistant messages in history belong to an earlier turn;
+      // only suppress the user bubble if the gateway already persisted this prompt as the trailing row.
+      if (activeLive) {
+        return { ...empty, prompt: promptMatches && lastMessage?.role === 'user' };
+      }
+      const lastTurnAssistant = (lastUserIndex >= 0 ? history.slice(lastUserIndex + 1) : history).filter(
+        (item) => item.role === 'assistant',
+      );
+      if (job.prompt && !promptMatches) return empty;
+      const persistedTexts = lastTurnAssistant.map((item) => item.text.trim()).filter(Boolean);
+      const joinedAssistantText = lastTurnAssistant.map((item) => item.text).join('');
+      const fullReplyMatches =
+        lastMessage?.role === 'assistant' &&
+        Boolean(job.text) &&
+        (lastMessage.text === job.text || joinedAssistantText === job.text);
+      const replyMatches =
+        fullReplyMatches ||
+        (lastMessage?.role === 'assistant' &&
+          Boolean(lastMessage.text) &&
+          Boolean(job.text) &&
+          job.text.endsWith(lastMessage.text));
+      const belongsToTurn = replyMatches || (!job.text && promptMatches && lastTurnAssistant.length > 0);
+      if (!belongsToTurn) {
+        return { ...empty, prompt: promptMatches && lastMessage?.role === 'user' };
+      }
+      const toolNameCounts = new Map<string, number>();
+      for (const item of lastTurnAssistant) {
+        for (const tool of item.tools ?? []) {
+          toolNameCounts.set(tool.name, (toolNameCounts.get(tool.name) ?? 0) + 1);
+        }
+      }
+      return {
+        prompt: promptMatches,
+        reply: replyMatches,
+        allText: fullReplyMatches,
+        thoughts: lastTurnAssistant.map((item) => item.thought?.trim() ?? '').filter(Boolean),
+        texts: persistedTexts,
+        toolNameCounts,
+      };
+    };
+
+    const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
+    const loadedObservedJob = Boolean(history && liveJob?.id === historyJobId);
+    const liveCoverage = computePersistedCoverage(liveJob, loadedObservedJob);
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(
             (job) => belongsToSession(job) && !turns.some(({ id }) => id === job.id) && job.id !== liveJob?.id,
           )
         : [];
-    const renderJob = (job: JobSummary, showPrompt = true, showText = true, showThought = true, showTools = true) => {
+    const renderJob = (job: JobSummary, coverage?: PersistedTurnCoverage) => {
       const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
       const status =
@@ -1707,6 +1759,33 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
               ? 'wantsApproval'
               : 'chatPreparing';
       const terminalNotice = job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop);
+      const showPrompt = !(coverage?.prompt ?? false);
+      const showText = !(coverage?.reply ?? false);
+      const remainingThoughts = [...(coverage?.thoughts ?? [])];
+      const remainingTools = new Map(coverage?.toolNameCounts ?? []);
+      const persistedTexts = coverage?.texts ?? [];
+      const consumeThought = (text: string): boolean => {
+        const trimmed = text.trim();
+        if (!trimmed || !remainingThoughts.length) return false;
+        const idx = remainingThoughts.findIndex(
+          (item) => item === trimmed || item.includes(trimmed) || trimmed.includes(item),
+        );
+        if (idx < 0) return false;
+        remainingThoughts.splice(idx, 1);
+        return true;
+      };
+      const consumeTool = (tool: ToolActivitySummary): boolean => {
+        const count = remainingTools.get(tool.name) ?? 0;
+        if (count <= 0) return false;
+        remainingTools.set(tool.name, count - 1);
+        return true;
+      };
+      const isPersistedCommentary = (text: string): boolean => {
+        const trimmed = text.trim();
+        return Boolean(trimmed && persistedTexts.some((item) => item === trimmed || item.includes(trimmed)));
+      };
+      const isPersistedText = (text: string): boolean => Boolean(coverage?.allText) || isPersistedCommentary(text);
+
       const contentParts: unknown[] = [];
       if (job.timeline?.length) {
         const toolById = new Map((job.tools ?? []).map((tool) => [tool.id, tool]));
@@ -1719,25 +1798,36 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         };
         job.timeline.forEach((entry, index) => {
           if (entry.kind === 'tool') {
-            if (!showTools) return;
             const tool = toolById.get(entry.toolId);
-            if (tool) pendingTools.push(tool);
+            if (tool && !consumeTool(tool)) pendingTools.push(tool);
             return;
           }
           flushTools(index);
-          if (entry.kind === 'thought' && showThought && entry.text) {
-            contentParts.push(renderThoughtBlock(`thought-${index}`, entry.text, active));
-          } else if (entry.kind === 'text' && showText && entry.text) {
-            contentParts.push(renderTextBlock(`text-${index}`, entry.text, active));
+          if (entry.kind === 'thought' && entry.text) {
+            if (!consumeThought(entry.text))
+              contentParts.push(renderThoughtBlock(`thought-${index}`, entry.text, active));
+          } else if (entry.kind === 'commentary' && entry.text) {
+            if (!isPersistedCommentary(entry.text)) {
+              contentParts.push(renderTextBlock(`commentary-${index}`, entry.text, active));
+            }
+          } else if (entry.kind === 'text' && entry.text) {
+            if (!isPersistedText(entry.text)) {
+              contentParts.push(renderTextBlock(`text-${index}`, entry.text, active));
+            }
           }
         });
         flushTools(job.timeline.length);
       } else {
-        if (showThought && job.thought) contentParts.push(renderThoughtBlock('thought', job.thought, active));
-        if (showTools && job.tools?.length) contentParts.push(renderToolGroup('tools', job.tools));
+        if (job.thought && !consumeThought(job.thought)) {
+          contentParts.push(renderThoughtBlock('thought', job.thought, active));
+        }
+        const visibleTools = (job.tools ?? []).filter((tool) => !consumeTool(tool));
+        if (visibleTools.length) contentParts.push(renderToolGroup('tools', visibleTools));
         if (showText && job.text) contentParts.push(renderTextBlock('text', job.text, active));
       }
+      const hasPrompt = Boolean(showPrompt && job.prompt);
       const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice);
+      if (!hasPrompt && !hasAssistantContent) return null;
       const assistantParts = [
         ...contentParts,
         active
@@ -1804,7 +1894,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       return h(
         'div',
         { key: job.id, className: 'dk-chat-turn' },
-        showPrompt && job.prompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
+        hasPrompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
         hasAssistantContent ? renderAssistant(undefined, assistantParts) : null,
       );
     };
@@ -1913,16 +2003,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             .sort((a, b) => a.createdAt - b.createdAt)
             .slice(-20)
             .map((job) => renderJob(job)),
-          liveJob &&
-            !turns.some(({ id }) => id === liveJob.id) &&
-            (!loadedObservedJob ||
-              liveJob.status !== 'completed' ||
-              (!persistedThought && liveJob.thought) ||
-              (!persistedTools && liveJob.tools?.length) ||
-              (!persistedPrompt && liveJob.prompt) ||
-              (!persistedReply && liveJob.text))
-            ? renderJob(liveJob, !persistedPrompt, !persistedReply, !persistedThought, !persistedTools)
-            : null,
+          liveJob && !turns.some(({ id }) => id === liveJob.id) ? renderJob(liveJob, liveCoverage) : null,
           turns.map((job) => renderJob(job)),
         ),
       ),

@@ -510,4 +510,282 @@ describe('web UI host routes & schemastery Config', () => {
       mod._load = origLoad;
     }
   });
+
+  it('keeps live running turn activity visible when session history still ends at a previous turn', async () => {
+    const clientPlugin = await import('../src/client/index.js');
+    const mod = createRequire(import.meta.url)('node:module') as {
+      _load: (req: string, parent: unknown, isMain: boolean) => unknown;
+    };
+    const origLoad = mod._load;
+
+    interface VNode {
+      type: unknown;
+      props: Record<string, unknown>;
+      children: unknown[];
+    }
+    const hooksByPath = new Map<string, unknown[]>();
+    let currentPath = '';
+    let hookIndex = 0;
+    const pendingEffects: Array<() => void> = [];
+    const cleanups: Array<() => void> = [];
+    const fakeReact = {
+      createElement(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): VNode {
+        return {
+          type,
+          props: props ?? {},
+          children: children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false && c !== true),
+        };
+      },
+      useState<T>(init: T | (() => T)): [T, (next: T | ((prev: T) => T)) => void] {
+        const list = hooksByPath.get(currentPath) ?? [];
+        if (!hooksByPath.has(currentPath)) hooksByPath.set(currentPath, list);
+        const idx = hookIndex++;
+        if (list.length <= idx) list[idx] = typeof init === 'function' ? (init as () => T)() : init;
+        const path = currentPath;
+        return [
+          list[idx] as T,
+          (next) => {
+            const target = hooksByPath.get(path)!;
+            target[idx] = typeof next === 'function' ? (next as (prev: T) => T)(target[idx] as T) : next;
+          },
+        ];
+      },
+      useRef<T>(init: T) {
+        const list = hooksByPath.get(currentPath) ?? [];
+        if (!hooksByPath.has(currentPath)) hooksByPath.set(currentPath, list);
+        const idx = hookIndex++;
+        if (list.length <= idx) list[idx] = { current: init };
+        return list[idx] as { current: T };
+      },
+      useCallback<T>(fn: T): T {
+        return fn;
+      },
+      useEffect(fn: () => undefined | (() => void), deps?: readonly unknown[]) {
+        const list = hooksByPath.get(currentPath) ?? [];
+        if (!hooksByPath.has(currentPath)) hooksByPath.set(currentPath, list);
+        const idx = hookIndex++;
+        const prev = list[idx] as { deps: readonly unknown[] | null; cleanup?: () => void } | undefined;
+        const changed = !prev || !deps || !prev.deps || deps.some((d, i) => !Object.is(d, prev.deps![i]));
+        if (changed) {
+          if (prev?.cleanup) prev.cleanup();
+          const slot: { deps: readonly unknown[] | null; cleanup?: () => void } = {
+            deps: deps ? [...deps] : null,
+          };
+          list[idx] = slot;
+          pendingEffects.push(() => {
+            const cleanup = fn();
+            if (typeof cleanup === 'function') {
+              slot.cleanup = cleanup;
+              cleanups.push(cleanup);
+            }
+          });
+        }
+      },
+    };
+    const renderNode = (node: unknown, path = 'root'): unknown => {
+      if (node === null || node === undefined || typeof node !== 'object') return node;
+      const vnode = node as VNode;
+      if (typeof vnode.type === 'function') {
+        const prevPath = currentPath;
+        const prevIdx = hookIndex;
+        const key = vnode.props.key !== undefined ? `:${String(vnode.props.key)}` : '';
+        currentPath = `${path}/${vnode.type.name || 'fn'}${key}`;
+        hookIndex = 0;
+        const out = (vnode.type as (p: Record<string, unknown>) => unknown)({
+          ...vnode.props,
+          children: vnode.children,
+        });
+        const rendered = renderNode(out, currentPath);
+        currentPath = prevPath;
+        hookIndex = prevIdx;
+        return rendered;
+      }
+      return {
+        ...vnode,
+        children: vnode.children.map((child, i) => renderNode(child, `${path}.${i}`)),
+      };
+    };
+    const collectText = (node: unknown): string[] => {
+      if (typeof node === 'string' || typeof node === 'number') return [String(node)];
+      if (!node || typeof node !== 'object') return [];
+      const vnode = node as VNode;
+      const own = typeof vnode.props?.text === 'string' ? [vnode.props.text] : [];
+      return [...own, ...vnode.children.flatMap(collectText)];
+    };
+    const findButton = (node: unknown, label: string): VNode | undefined => {
+      if (!node || typeof node !== 'object') return undefined;
+      const vnode = node as VNode;
+      if (vnode.type === 'button' && collectText(vnode).join('').includes(label)) return vnode;
+      for (const child of vnode.children) {
+        const found = findButton(child, label);
+        if (found) return found;
+      }
+      return undefined;
+    };
+
+    let currentJob = {
+      id: 'job-2',
+      agentId: 'hermes-remote',
+      sessionId: 'sess-1',
+      prompt: 'current prompt',
+      status: 'running',
+      createdAt: 2000,
+      updatedAt: 2000,
+      text: '',
+      thought: 'live turn thought',
+      tools: [{ id: 't-live', name: 'terminal', status: 'running', inputPreview: 'ls -la' }],
+      timeline: [
+        { kind: 'thought', text: 'live turn thought' },
+        { kind: 'commentary', text: 'Checking live state...' },
+        { kind: 'tool', toolId: 't-live' },
+      ],
+    };
+    let historyMessages = [
+      { id: 'm1', role: 'user', text: 'previous prompt' },
+      {
+        id: 'm2',
+        role: 'assistant',
+        text: 'previous reply',
+        thought: 'previous turn thought',
+        tools: [{ id: 't-old', name: 'terminal', status: 'completed', inputPreview: 'pwd' }],
+      },
+    ];
+
+    mod._load = (req, parent, isMain) => {
+      if (req === 'react') return fakeReact;
+      if (req === '@deepseek-ai/dsh-client-ui-primitives') {
+        const passthrough = (props: Record<string, unknown>) =>
+          fakeReact.createElement('div', props, ...(Array.isArray(props.children) ? props.children : []));
+        return {
+          Button: passthrough,
+          CommandText: passthrough,
+          MarkdownText: passthrough,
+          UserMessageBubble: passthrough,
+        };
+      }
+      return origLoad(req, parent, isMain);
+    };
+
+    try {
+      let renderMain: (() => unknown) | undefined;
+      const root = new Context();
+      (root as any).provide('slots');
+      (root as any).provide('connection');
+      (root as any).set('connection', {
+        async fetch(path: string) {
+          const ok = (value: unknown) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
+          if (path === WEB_ROUTES.state) {
+            return ok({
+              version: '0.2.1',
+              agents: [
+                {
+                  id: 'hermes-remote',
+                  revision: 'rev-1',
+                  kind: 'hermes',
+                  transport: 'direct',
+                  host: '127.0.0.1',
+                  port: 8642,
+                  supportsRespond: true,
+                  supportsSessionMessages: true,
+                  connection: { status: 'connected' },
+                },
+              ],
+              jobs: [currentJob],
+              mcp: { enabled: false, address: null, allowSessions: [], localSessions: [] },
+            });
+          }
+          if (path === WEB_ROUTES.sessions) return ok({ sessions: [{ id: 'sess-1', title: 'Live session' }] });
+          if (path === WEB_ROUTES.sessionMessages) return ok({ messages: historyMessages });
+          if (path === WEB_ROUTES.job) return ok(currentJob);
+          return ok({});
+        },
+      });
+      (root as any).set('slots', {
+        inject(_name: string, factory: () => () => void) {
+          return factory();
+        },
+        register(meta: Record<string, unknown>, render: () => unknown) {
+          if (meta.name === 'main') renderMain = render;
+          return () => {};
+        },
+      });
+      const fiber = root.plugin(clientPlugin as any, {});
+      await fiber;
+      const flush = async () => {
+        for (let step = 0; step < 6; step++) {
+          const tree = renderNode(renderMain!());
+          while (pendingEffects.length > 0) pendingEffects.shift()!();
+          await new Promise((r) => setTimeout(r, 0));
+          if (step === 5) return tree;
+        }
+        return renderNode(renderMain!());
+      };
+
+      const dashboard = await flush();
+      const chatBtn = findButton(dashboard, '对话');
+      expect(chatBtn).toBeDefined();
+      (chatBtn!.props.onClick as () => void)();
+      const opened = await flush();
+      const sessionBtn = findButton(opened, 'Live session');
+      expect(sessionBtn).toBeDefined();
+      (sessionBtn!.props.onClick as () => void)();
+      const liveTree = await flush();
+      const liveText = collectText(liveTree).join('\n');
+      expect(liveText).toContain('previous turn thought');
+      expect(liveText).toContain('current prompt');
+      expect(liveText).toContain('live turn thought');
+      expect(liveText).toContain('Checking live state...');
+      expect(liveText).toContain('ls -la');
+
+      // Once the job completes and history persists only the final reply + 1st tool (not the commentary or 2nd tool),
+      // already-persisted segments are not duplicated while unpersisted live segments remain visible.
+      currentJob = {
+        ...currentJob,
+        status: 'completed',
+        text: 'final answer',
+        tools: [
+          { id: 't-live', name: 'terminal', status: 'completed', inputPreview: 'ls -la' },
+          { id: 't-extra', name: 'memory', status: 'completed', inputPreview: 'save note' },
+        ],
+        timeline: [
+          { kind: 'thought', text: 'live turn thought' },
+          { kind: 'commentary', text: 'Checking live state...' },
+          { kind: 'tool', toolId: 't-live' },
+          { kind: 'tool', toolId: 't-extra' },
+          { kind: 'text', text: 'final answer' },
+        ],
+      };
+      historyMessages = [
+        ...historyMessages,
+        { id: 'm3', role: 'user', text: 'current prompt' },
+        {
+          id: 'm4',
+          role: 'assistant',
+          text: 'final answer',
+          thought: 'live turn thought',
+          tools: [{ id: 't-live', name: 'terminal', status: 'completed', inputPreview: 'ls -la' }],
+        },
+      ];
+      // Re-open session to load the updated history and completed job
+      const backBtn = findButton(liveTree, '助手设置');
+      expect(backBtn).toBeDefined();
+      (backBtn!.props.onClick as () => void)();
+      const backDash = await flush();
+      (findButton(backDash, '对话')!.props.onClick as () => void)();
+      const reopened = await flush();
+      (findButton(reopened, 'Live session')!.props.onClick as () => void)();
+      const settledTree = await flush();
+      const settledTexts = collectText(settledTree);
+      expect(settledTexts.filter((t) => t === 'final answer')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'live turn thought')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'ls -la')).toHaveLength(1);
+      expect(settledTexts).toContain('Checking live state...');
+      expect(settledTexts).toContain('save note');
+
+      for (const cleanup of cleanups) cleanup();
+      await fiber.dispose();
+    } finally {
+      mod._load = origLoad;
+    }
+  });
 });

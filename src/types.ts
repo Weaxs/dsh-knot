@@ -60,6 +60,7 @@ export interface PluginConfig {
 export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
+  interim?: boolean;
   name?: string;
   title?: string;
   phase?: 'pending' | 'start' | 'end';
@@ -143,6 +144,7 @@ export interface AgentToolActivity {
 
 export type AgentTimelineEntry =
   | { kind: 'thought'; text: string }
+  | { kind: 'commentary'; text: string }
   | { kind: 'text'; text: string }
   | { kind: 'tool'; toolId: string };
 

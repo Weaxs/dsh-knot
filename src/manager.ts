@@ -9,6 +9,7 @@ import type {
   AgentEvent,
   AgentJob,
   AgentPromptOptions,
+  AgentTimelineEntry,
   AgentToolActivity,
   DoctorStep,
   PluginConfig,
@@ -496,8 +497,12 @@ export class AgentManager {
           }
         }
         if (event.type === 'text' && event.text) {
-          job.text = (job.text + event.text).slice(-MAX_JOB_TEXT_LENGTH);
-          appendTimelineText(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
+          if (event.interim) {
+            appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
+          } else {
+            job.text = (job.text + event.text).slice(-MAX_JOB_TEXT_LENGTH);
+            appendTimelineText(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
+          }
         } else if (event.type === 'thought' && event.text) {
           job.thought = ((job.thought ?? '') + event.text).slice(-MAX_JOB_THOUGHT_LENGTH);
           appendTimelineText(job, 'thought', event.text, MAX_JOB_THOUGHT_LENGTH);
@@ -599,7 +604,12 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   }
 }
 
-function appendTimelineText(job: AgentJob, kind: 'text' | 'thought', chunk: string, maxLength: number): void {
+function appendTimelineText(
+  job: AgentJob,
+  kind: 'text' | 'commentary' | 'thought',
+  chunk: string,
+  maxLength: number,
+): void {
   const timeline = job.timeline ?? [];
   const last = timeline.at(-1);
   if (last && last.kind === kind) {
@@ -607,6 +617,34 @@ function appendTimelineText(job: AgentJob, kind: 'text' | 'thought', chunk: stri
   } else {
     job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind, text: chunk.slice(-maxLength) }];
   }
+  trimTimelineBudget(job, kind === 'thought' ? 'thought' : 'text', maxLength);
+}
+
+function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars: number): void {
+  const timeline = job.timeline;
+  if (!timeline?.length) return;
+  const matches = (entry: AgentTimelineEntry): entry is { kind: 'text' | 'commentary' | 'thought'; text: string } =>
+    bucket === 'thought' ? entry.kind === 'thought' : entry.kind === 'text' || entry.kind === 'commentary';
+  let total = 0;
+  for (const entry of timeline) {
+    if (matches(entry)) total += entry.text.length;
+  }
+  if (total <= maxChars) return;
+  let excess = total - maxChars;
+  const trimmed: AgentTimelineEntry[] = [];
+  for (const entry of timeline) {
+    if (!matches(entry) || excess <= 0) {
+      trimmed.push(entry);
+      continue;
+    }
+    if (entry.text.length <= excess) {
+      excess -= entry.text.length;
+      continue;
+    }
+    trimmed.push({ ...entry, text: entry.text.slice(excess) });
+    excess = 0;
+  }
+  job.timeline = trimmed;
 }
 
 function appendTimelineTool(job: AgentJob, toolId: string): void {
@@ -629,15 +667,17 @@ function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {
   if (combined === bounded || lastText.text === bounded || lastText.text.endsWith(bounded)) {
     return;
   }
-  if (lastEntry?.kind === 'text' && bounded.startsWith(combined)) {
-    lastEntry.text = (lastEntry.text + bounded.slice(combined.length)).slice(-MAX_JOB_TEXT_LENGTH);
+  if (bounded.startsWith(combined)) {
+    appendTimelineText(job, 'text', bounded.slice(combined.length), MAX_JOB_TEXT_LENGTH);
     return;
   }
-  if (lastEntry?.kind === 'text') {
-    lastEntry.text = bounded;
-  } else {
-    appendTimelineText(job, 'text', bounded, MAX_JOB_TEXT_LENGTH);
+  if (lastEntry?.kind === 'text' && bounded.startsWith(lastText.text)) {
+    appendTimelineText(job, 'text', bounded.slice(lastText.text.length), MAX_JOB_TEXT_LENGTH);
+    return;
   }
+  // Divergent authoritative final replaces stale streamed text while preserving thoughts, tools, and commentary.
+  job.timeline = timeline.filter((entry) => entry.kind !== 'text');
+  appendTimelineText(job, 'text', bounded, MAX_JOB_TEXT_LENGTH);
 }
 
 function sessionKey(agentId: string, sessionId: string): string {
