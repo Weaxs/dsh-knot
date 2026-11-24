@@ -190,16 +190,23 @@ export class HermesAdapter implements AgentAdapter {
           stepText = '';
           // Hermes session_authority emits `prompt_id` + `execution_generation`; legacy runs emit `request_id`.
           const requestId = firstNonEmptyString(event.prompt_id, event.request_id, event.id, frame.id);
+          const executionGeneration =
+            typeof event.execution_generation === 'number' && Number.isInteger(event.execution_generation)
+              ? event.execution_generation
+              : undefined;
           if (APPROVAL_SETTLED_RE.test(type)) {
             if (requestId) {
-              this.approvalContexts.delete(approvalKey(id, requestId));
+              const key = approvalKey(id, requestId);
+              const context = this.approvalContexts.get(key);
+              if (
+                context?.runId === runId &&
+                (executionGeneration === undefined || context.executionGeneration === executionGeneration)
+              ) {
+                this.approvalContexts.delete(key);
+              }
               yield { type: 'approval', phase: 'end', requestId };
             }
           } else {
-            const executionGeneration =
-              typeof event.execution_generation === 'number' && Number.isInteger(event.execution_generation)
-                ? event.execution_generation
-                : undefined;
             if (requestId) this.rememberApproval(id, requestId, runId, executionGeneration);
             yield {
               type: 'approval',
@@ -266,11 +273,12 @@ export class HermesAdapter implements AgentAdapter {
           break;
         }
       }
+      if (!terminal && !signal?.aborted) {
+        yield runStatusEvent(await this.status(runId, signal), output);
+      }
     } finally {
       response.destroy();
-    }
-    if (!terminal && !signal?.aborted) {
-      yield runStatusEvent(await this.status(runId, signal), output);
+      this.clearRunApprovals(id, runId);
     }
   }
 
@@ -305,19 +313,18 @@ export class HermesAdapter implements AgentAdapter {
   async respond(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
     const key = approvalKey(sessionId, requestId);
     const context = this.approvalContexts.get(key);
-    const runId = context?.runId ?? this.runs.get(sessionId);
-    if (!runId) throw new Error(`No active Hermes run is recorded for session ${sessionId}`);
+    if (!context) throw new Error(`No pending Hermes approval request ${requestId} for session ${sessionId}`);
     // Hermes session_authority strictly requires the exact 3-key set including `execution_generation`.
     const body =
-      context?.executionGeneration !== undefined
+      context.executionGeneration !== undefined
         ? { request_id: requestId, execution_generation: context.executionGeneration, choice }
         : { request_id: requestId, choice };
-    await this.json(`/v1/runs/${encodeURIComponent(runId)}/approval`, {
+    await this.json(`/v1/runs/${encodeURIComponent(context.runId)}/approval`, {
       method: 'POST',
       body,
       signal,
     });
-    this.approvalContexts.delete(key);
+    if (this.approvalContexts.get(key) === context) this.approvalContexts.delete(key);
   }
 
   async close(): Promise<void> {
@@ -349,7 +356,6 @@ export class HermesAdapter implements AgentAdapter {
     };
     signal?.addEventListener('abort', abortAdmission, { once: true });
     this.runs.delete(id);
-    this.clearSessionApprovals(id);
     const admission = this.json('/v1/runs', {
       method: 'POST',
       body: { input: text, session_id: id, ...(this.config.model ? { model: this.config.model } : {}) },
@@ -392,10 +398,10 @@ export class HermesAdapter implements AgentAdapter {
     }
   }
 
-  private clearSessionApprovals(sessionId: string): void {
+  private clearRunApprovals(sessionId: string, runId: string): void {
     const prefix = `${sessionId}\0`;
-    for (const key of this.approvalContexts.keys()) {
-      if (key.startsWith(prefix)) this.approvalContexts.delete(key);
+    for (const [key, context] of this.approvalContexts) {
+      if (context.runId === runId && key.startsWith(prefix)) this.approvalContexts.delete(key);
     }
   }
 

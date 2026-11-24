@@ -106,6 +106,7 @@ export interface AgentAdapter {
     options?: AgentPromptOptions,
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
+  promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;
@@ -153,7 +154,6 @@ export type AgentTimelineEntry =
 export interface SessionHistoryBaseline {
   length: number;
   lastId?: string;
-  lastUserId?: string;
 }
 
 export interface AgentJob {

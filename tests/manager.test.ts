@@ -173,6 +173,53 @@ describe('AgentManager', () => {
     await manager.close();
   });
 
+  it('keeps a negotiated cancellation unconfirmed when the prompt disconnects before its terminal response', async () => {
+    let disconnect!: () => void;
+    let rejectTerminal!: (error: Error) => void;
+    const terminal = new Promise<unknown>((_, reject) => {
+      rejectTerminal = reject;
+    });
+    class DisconnectedAdapter extends FakeAdapter {
+      promptTerminalForCancel(): Promise<unknown> | undefined {
+        return this.cancelled ? undefined : terminal;
+      }
+
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'partial reply' };
+        await new Promise<void>((resolve) => {
+          disconnect = resolve;
+        });
+        yield { type: 'error', text: 'ACP connection closed' };
+      }
+
+      override async cancel() {
+        this.cancelled = true;
+        disconnect();
+        rejectTerminal(new Error('ACP connection closed'));
+      }
+    }
+
+    const adapter = new DisconnectedAdapter(config.id, 'acp');
+    const cancel = vi.spyOn(adapter, 'cancel');
+    const manager = new AgentManager([{ ...config, kind: 'acp' }], 10_000, () => adapter);
+    try {
+      const job = manager.start(config.id, 'Hello', 'shared');
+      await vi.waitFor(() => expect(disconnect).toBeTypeOf('function'));
+      await expect(manager.cancel(job.id)).rejects.toThrow(/terminal response/);
+      expect(await manager.wait(job.id)).toMatchObject({
+        status: 'cancelled',
+        text: 'partial reply',
+        error: 'ACP connection closed',
+        remoteStop: 'unconfirmed',
+      });
+      await expect(manager.cancel(job.id)).rejects.toThrow(/terminal response/);
+      expect(cancel).toHaveBeenCalledTimes(2);
+      expect(job.remoteStop).toBe('unconfirmed');
+    } finally {
+      await manager.close();
+    }
+  });
+
   it.each(['hermes', 'acp', 'openclaw'] as const)(
     'keeps an exclusive %s session locked until a remote stop retry succeeds',
     async (kind) => {
@@ -890,16 +937,14 @@ describe('AgentManager', () => {
     ]);
     await prefixManager.close();
 
-    // 2c. alreadyStreamed interim commentary strips streamed delta from job.text and reclassifies timeline
+    // 2c. Retraction can span text blocks split by a thought event.
     class AlreadyStreamedInterimAdapter extends FakeAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
-        yield { type: 'text', text: 'Checking ' };
+        yield { type: 'text', text: 'Keep this. Checking ' };
+        yield { type: 'thought', text: 'Inspect the repository.' };
         yield { type: 'text', text: 'repo...' };
         yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
-        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
-        yield { type: 'tool', requestId: 't1', phase: 'end' };
-        yield { type: 'text', text: 'All clean.' };
-        yield { type: 'final', text: 'All clean.' };
+        yield { type: 'final', text: '', stopReason: 'cancelled' };
       }
     }
     const streamedInterimManager = new AgentManager(
@@ -910,11 +955,12 @@ describe('AgentManager', () => {
     const streamedInterimDone = await streamedInterimManager.wait(
       streamedInterimManager.start(config.id, 'check', undefined).id,
     );
-    expect(streamedInterimDone.text).toBe('All clean.');
+    expect(streamedInterimDone.status).toBe('cancelled');
+    expect(streamedInterimDone.text).toBe('Keep this. ');
     expect(streamedInterimDone.timeline).toEqual([
+      { kind: 'text', text: 'Keep this. ' },
       { kind: 'commentary', text: 'Checking repo...' },
-      { kind: 'tool', toolId: streamedInterimDone.tools![0]!.id },
-      { kind: 'text', text: 'All clean.' },
+      { kind: 'thought', text: 'Inspect the repository.' },
     ]);
     await streamedInterimManager.close();
 

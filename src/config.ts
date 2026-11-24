@@ -172,12 +172,10 @@ export function stripTrailingText(source: string, suffix: string): string {
 
 export function matchStreamedInterim(streamed: string, interim: string): string {
   if (!streamed || !interim) return '';
-  const trimmedStreamed = streamed.trim();
-  const trimmedInterim = interim.trim();
-  if (!trimmedStreamed || !trimmedInterim) return '';
-  if (trimmedStreamed === trimmedInterim || interim.trimStart().startsWith(streamed.trimStart())) {
-    return streamed;
-  }
+  const normalizedStreamed = streamed.trim().replace(/\s+/g, ' ');
+  const normalizedInterim = interim.trim().replace(/\s+/g, ' ');
+  if (!normalizedStreamed || !normalizedInterim) return '';
+  if (normalizedInterim.startsWith(normalizedStreamed)) return streamed;
   const remaining = stripTrailingText(streamed, interim);
   return remaining !== streamed ? streamed.slice(remaining.length) : '';
 }

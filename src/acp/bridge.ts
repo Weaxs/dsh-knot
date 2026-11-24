@@ -120,11 +120,12 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     void connection.closed.then(() => adapter.close());
   });
   app.onRequest(methods.agent.initialize, async ({ params, signal }) => {
-    supportsInterimRetraction = params._meta?.['dsh-knot/interimRetraction'] === true;
+    supportsInterimRetraction = adapter.kind === 'hermes' && params._meta?.['dsh-knot/interimRetraction'] === true;
     await adapter.health(signal);
     return {
       protocolVersion: PROTOCOL_VERSION,
       agentInfo: { name: 'dsh-knot-acp-bridge', version: VERSION },
+      ...(supportsInterimRetraction ? { _meta: { 'dsh-knot/interimRetraction': true } } : {}),
       agentCapabilities: {
         loadSession: false,
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
@@ -303,7 +304,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
             );
             continue;
           }
-          if (event.phase === 'end') continue;
+          if (event.phase === 'end' || (supportsInterimRetraction && cancelled.has(sessionId))) continue;
           const choices = event.choices?.length ? event.choices : ['approve', 'reject'];
           const toolCallId = event.requestId || randomUUID();
           const response = (await client.request(
@@ -324,6 +325,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
             },
             { cancellationSignal: signal, stopWaitingOnCancel: true },
           )) as RequestPermissionResponse;
+          if (supportsInterimRetraction && cancelled.has(sessionId)) continue;
           if (response.outcome.outcome !== 'selected') {
             cancelled.add(sessionId);
             await adapter.cancel(sessionId, signal);

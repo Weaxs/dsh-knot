@@ -115,7 +115,7 @@ interface JobSummary {
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
   tools?: ToolActivitySummary[];
   timeline?: TimelineEntry[];
-  historyBaseline?: { length: number; lastId?: string; lastUserId?: string };
+  historyBaseline?: { length: number; lastId?: string };
 }
 
 interface LocalSessionSummary {
@@ -1323,8 +1323,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
   const icons = makeIcons(React);
   const { CommandText, MarkdownText, UserMessageBubble } = primitives;
   const submissions = new Map<string, { message: string; sessionId: string; id: string }>();
-  const lastIdleBaselines = new Map<string, { length: number; lastId?: string; lastUserId?: string }>();
-
   return function ChatThread({
     agent,
     jobs,
@@ -1348,31 +1346,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const [unavailableJobId, setUnavailableJobId] = React.useState<string | undefined>(undefined);
     const [historyError, setHistoryError] = React.useState('');
     const [history, setHistory] = React.useState<TranscriptMessage[] | null>(null);
-    const [historyMeta, setHistoryMeta] = React.useState<{ fetchedWhileRunning: boolean; settledJobId?: string }>({
-      fetchedWhileRunning: false,
-    });
+    const [historyJob, setHistoryJob] = React.useState<{ id: string; settled: boolean } | undefined>(undefined);
     const [historyAttempts, setHistoryAttempts] = React.useState(0);
     const [turns, setTurns] = React.useState<JobSummary[]>([]);
     const belongsToSession = (job: JobSummary) =>
       Boolean(sessionId && job.sessionId === sessionId && job.agentId === agent.id);
     const [initialJob] = React.useState(() => jobs.find((job) => belongsToSession(job) && isRunning(job)));
     const [observedJob, setObservedJob] = React.useState(initialJob);
-    const [historyJobId, setHistoryJobId] = React.useState(initialJob?.id);
-    const [retryMatchedJobId, setRetryMatchedJobId] = React.useState<string | undefined>(undefined);
-    const sessionBaselineKey = session ? `${agent.revision}\0${session}` : '';
-    const historyBaselines = React.useRef<Map<string, { length: number; lastId?: string; lastUserId?: string }>>(
-      (() => {
-        const seeded = new Map<string, { length: number; lastId?: string; lastUserId?: string }>();
-        const prior =
-          initialJob?.historyBaseline ?? (sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined);
-        if (initialJob && prior) seeded.set(initialJob.id, prior);
-        return seeded;
-      })(),
-    );
-    const sessionAbortRef = React.useRef<AbortController | null>(null);
-    const historySeqRef = React.useRef(0);
-    const appliedHistorySeqRef = React.useRef(0);
-    const [, setBaselineVersion] = React.useState(0);
     const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
     const [copyStatus, setCopyStatus] = React.useState('');
     const [copiedOk, setCopiedOk] = React.useState(false);
@@ -1403,30 +1383,9 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, [input]);
 
     React.useEffect(() => {
-      const controller = new AbortController();
-      sessionAbortRef.current = controller;
-      appliedHistorySeqRef.current = 0;
-      return () => {
-        controller.abort();
-        if (sessionAbortRef.current === controller) sessionAbortRef.current = null;
-      };
-    }, [agent.id, agent.revision, session]);
-
-    React.useEffect(() => {
       if (!canReadHistory) return;
-      if (!sessionAbortRef.current || sessionAbortRef.current.signal.aborted) {
-        sessionAbortRef.current = new AbortController();
-      }
-      const controller = sessionAbortRef.current;
-      const seq = ++historySeqRef.current;
-      const runningJobId = observedJobRunning ? observedJob?.id : undefined;
-      const settledJobId =
-        !observedJobRunning && observedJob && !isAvailableAndRunning(observedJob) ? observedJob.id : undefined;
-      if (runningJobId && !historyBaselines.current.has(runningJobId)) {
-        const prior =
-          observedJob?.historyBaseline ?? (sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined);
-        if (prior) historyBaselines.current.set(runningJobId, prior);
-      }
+      const controller = new AbortController();
+      const jobId = observedJob?.id;
       setHistoryError('');
       void apiPost<{ messages: TranscriptMessage[] }>(
         ctx,
@@ -1437,35 +1396,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       )
         .then(({ messages }) => {
           if (controller.signal.aborted) return;
-          const snapshot = {
-            length: messages.length,
-            lastId: messages.at(-1)?.id,
-            lastUserId: messages.findLast((item) => item.role === 'user')?.id,
-          };
-          if (runningJobId && !historyBaselines.current.has(runningJobId)) {
-            historyBaselines.current.set(runningJobId, snapshot);
-            setBaselineVersion((version) => version + 1);
-          }
-          // Let an in-flight baseline fetch record its pre-run snapshot without overwriting newer post-completion history.
-          if (seq < appliedHistorySeqRef.current) return;
-          appliedHistorySeqRef.current = seq;
-          if (!runningJobId && sessionBaselineKey) {
-            lastIdleBaselines.delete(sessionBaselineKey);
-            lastIdleBaselines.set(sessionBaselineKey, snapshot);
-            if (lastIdleBaselines.size > 200) {
-              const oldest = lastIdleBaselines.keys().next().value;
-              if (oldest !== undefined) lastIdleBaselines.delete(oldest);
-            }
-          }
-          if (runningJobId ?? settledJobId) setHistoryJobId(runningJobId ?? settledJobId);
-          setHistoryMeta({ fetchedWhileRunning: Boolean(runningJobId), settledJobId });
+          setHistoryJob(jobId ? { id: jobId, settled: !observedJobRunning } : undefined);
           setHistory(messages);
         })
         .catch((error: unknown) => {
-          if (!controller.signal.aborted && seq >= appliedHistorySeqRef.current) {
-            setHistoryError(errorMessage(error));
-          }
+          if (!controller.signal.aborted) setHistoryError(errorMessage(error));
         });
+      return () => controller.abort();
     }, [agent.id, agent.revision, canReadHistory, historyAttempts, observedJobRunning, observedJob?.id, session]);
 
     const ownRunning = turns.find(isAvailableAndRunning);
@@ -1546,7 +1483,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
 
     const historyPending = canReadHistory && !history && !historyError;
     const lastMessage = history?.at(-1);
-    const lastUserText = history?.findLast(({ role }) => role === 'user')?.text;
     const send = async () => {
       const message = input.trim();
       if (!message || activeId || historyPending || sendLock.current || actionLock.current) return;
@@ -1588,16 +1524,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         if (!alive.current) return;
         submission.current = undefined;
         setInput('');
-        if (
-          job.id === initialJob?.id ||
-          (retry &&
-            job.status === 'completed' &&
-            lastMessage?.role === 'assistant' &&
-            lastMessage.text === job.text &&
-            lastUserText === request.message)
-        ) {
-          setHistoryJobId(job.id);
-          if (job.id !== initialJob?.id) setRetryMatchedJobId(job.id);
+        if (job.id === initialJob?.id || (retry && job.status === 'completed' && canReadHistory)) {
           applyProgress(job, false);
           return;
         }
@@ -1740,54 +1667,22 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       suppressPromptOnly?: boolean;
     }
 
-    const matchObservedTurnInHistory = (
-      job: JobSummary | undefined,
-      matchedHistory: boolean,
-    ): MatchedLiveTurn | undefined => {
-      if (!matchedHistory || !history?.length || !job) return undefined;
-      let lastUserIndex = -1;
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i]?.role === 'user') {
-          lastUserIndex = i;
-          break;
-        }
-      }
-      const lastUser = lastUserIndex >= 0 ? history[lastUserIndex] : undefined;
-      const promptMatches = Boolean(job.prompt) && lastUser?.text === job.prompt;
-      const baseline = historyBaselines.current.get(job.id) ?? job.historyBaseline;
-      const activeLive = isAvailableAndRunning(job);
-      // While the job is still running, any assistant rows in history belong to an earlier turn;
-      // only suppress the user bubble when the gateway already persisted this prompt as a new trailing row.
-      if (activeLive) {
-        const baselineAlreadyEndedOnSameUser = Boolean(
-          baseline?.lastUserId && baseline.lastId === baseline.lastUserId && lastUser?.id === baseline.lastUserId,
-        );
-        if (promptMatches && lastMessage?.role === 'user' && !baselineAlreadyEndedOnSameUser) {
-          return { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true };
-        }
-        return undefined;
+    const matchObservedTurnInHistory = (job: JobSummary | undefined): MatchedLiveTurn | undefined => {
+      if (!job || historyJob?.id !== job.id || !history?.length || !job.historyBaseline) return undefined;
+      const baseline = job.historyBaseline;
+      const boundary = history.findIndex((message) => message.id === baseline.lastId);
+      if (baseline.length > 0 && boundary < 0) return undefined;
+      const turnStart = history.findIndex((message, index) => index > boundary && message.role === 'user');
+      if (turnStart < 0 || history[turnStart]?.text !== job.prompt) return undefined;
+      const lastTurnAssistant = history.slice(turnStart + 1);
+      // A session may be advanced outside Knot. Multiple new prompts do not identify this job.
+      if (lastTurnAssistant.some((message) => message.role === 'user')) return undefined;
+      if (isAvailableAndRunning(job) || !historyJob.settled) {
+        return lastMessage?.role === 'user'
+          ? { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true }
+          : undefined;
       }
 
-      // Require turn-scoped evidence before folding a settled run into persisted transcript rows:
-      // 1) Explicit idempotent retry already matched on send()
-      const retryProven = retryMatchedJobId === job.id;
-      // 2) History fetched after completion strictly advanced past a pre-run baseline
-      // (provider tool-call IDs can repeat across turns, so they never override an unchanged tail).
-      const postCompleteFetch = !historyMeta.fetchedWhileRunning && historyMeta.settledJobId === job.id;
-      const baselineEndedOnAssistant = Boolean(baseline?.lastId && baseline.lastId !== baseline.lastUserId);
-      const historyAdvanced = Boolean(
-        baseline &&
-          postCompleteFetch &&
-          (history.length > baseline.length || history.at(-1)?.id !== baseline.lastId) &&
-          (!baselineEndedOnAssistant || lastUser?.id !== baseline.lastUserId),
-      );
-      if (!retryProven && !historyAdvanced) return undefined;
-
-      const turnStart = Math.max(lastUserIndex, 0);
-      const lastTurnAssistant = (lastUserIndex >= 0 ? history.slice(lastUserIndex + 1) : history).filter(
-        (item) => item.role === 'assistant',
-      );
-      if (job.prompt && !promptMatches) return undefined;
       const joinedAssistantText = lastTurnAssistant.map((item) => item.text).join('');
       const replyMatches =
         lastMessage?.role === 'assistant' &&
@@ -1798,9 +1693,9 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       // Never attach a previous/persisted assistant answer to a failed or cancelled run that produced no reply.
       const contentMatches =
         (job.status === 'completed' || Boolean(job.text)) &&
-        (replyMatches || (job.status === 'completed' && !job.text && promptMatches && lastTurnAssistant.length > 0));
+        (replyMatches || (job.status === 'completed' && !job.text && lastTurnAssistant.length > 0));
       if (!contentMatches) {
-        if (promptMatches && lastMessage?.role === 'user') {
+        if (lastMessage?.role === 'user') {
           return { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true };
         }
         return undefined;
@@ -1810,9 +1705,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     };
 
     const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
-    const loadedObservedJob = Boolean(history && liveJob?.id === historyJobId);
     const liveIsOwnTurn = Boolean(liveJob && turns.some(({ id }) => id === liveJob.id));
-    const matchedLiveTurn = liveIsOwnTurn ? undefined : matchObservedTurnInHistory(liveJob, loadedObservedJob);
+    const matchedLiveTurn = liveIsOwnTurn ? undefined : matchObservedTurnInHistory(liveJob);
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(

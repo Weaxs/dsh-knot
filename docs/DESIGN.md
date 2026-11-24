@@ -58,6 +58,8 @@ The `acp` kind is the single provider for ACP-compatible endpoints. The official
 
 The optional `dsh-knot-acp` bridge exposes `initialize`, `session/new`, `session/list`, `session/prompt`, `session/cancel`, `session/update`, and `session/request_permission` over WebSocket or `DSH_KNOT_ACP_STDIO=1` stdio mode. Each bridge connection constructs a native adapter for Hermes, OpenClaw, or remote DSH and translates only that adapter's normalized events. A native ACP endpoint bypasses the bridge entirely. Non-loopback bridge listeners require `DSH_KNOT_ACP_TOKEN`; native gateway credentials and ACP bearer tokens remain separate.
 
+For Hermes, dsh-knot peers negotiate interim retraction so they can stream text immediately and correct it when a commentary marker arrives. Other ACP clients receive text at classification boundaries to keep commentary out of the answer channel.
+
 ACP v2, A2A, and additional UI transports are intentionally outside the current scope.
 
 ### Hermes
@@ -121,6 +123,8 @@ Remote deployments should keep the native listener on loopback behind a private 
 - optionally calls `Agent.followup()` on completion.
 
 The originating Agent's `followup` receives a marked `source.kind: knot` message. Missing follow-up support does not fail the remote job.
+
+Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately.
 
 ## Reverse MCP endpoint
 

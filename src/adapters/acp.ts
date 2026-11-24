@@ -32,6 +32,8 @@ export class AcpAdapter implements AgentAdapter {
   readonly kind = 'acp' as const;
   private readonly transport: Transport;
   private readonly queues = new Map<string, AsyncQueue<PromptMessage>>();
+  private readonly cancelledQueues = new WeakSet<AsyncQueue<PromptMessage>>();
+  private readonly promptTerminals = new WeakMap<AsyncQueue<PromptMessage>, Promise<unknown>>();
   private readonly inFlightPrompts = new Map<string, Promise<void>>();
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly loadedSessions = new Set<string>();
@@ -43,6 +45,7 @@ export class AcpAdapter implements AgentAdapter {
   private child?: ChildProcess;
   private connecting?: Promise<void>;
   private capabilities?: AgentCapabilities;
+  private supportsInterimRetraction = false;
 
   constructor(
     readonly id: string,
@@ -101,6 +104,12 @@ export class AcpAdapter implements AgentAdapter {
     return this.queues.has(actualId) || this.inFlightPrompts.has(actualId);
   }
 
+  promptTerminalForCancel(sessionId: string): Promise<unknown> | undefined {
+    const actualId = this.sessionIds.get(sessionId) ?? sessionId;
+    const queue = this.queues.get(actualId);
+    return queue && this.promptTerminals.get(queue);
+  }
+
   async *prompt(sessionId: string | undefined, text: string, signal?: AbortSignal): AsyncIterable<AgentEvent> {
     let actualId = sessionId ?? '';
     let output = '';
@@ -142,8 +151,8 @@ export class AcpAdapter implements AgentAdapter {
         if (this.queues.has(actualId) || this.inFlightPrompts.has(actualId)) {
           throw new Error(`ACP session "${actualId}" already has an active prompt in progress`);
         }
+        signal?.throwIfAborted();
         this.queues.set(actualId, queue);
-        yield { type: 'text', text: '', sessionId: actualId };
         const remotePrompt = this.connection!.agent.request(methods.agent.session.prompt, {
           sessionId: actualId,
           prompt: [{ type: 'text', text }],
@@ -153,7 +162,7 @@ export class AcpAdapter implements AgentAdapter {
           (response) => {
             queue.push({
               kind: 'native',
-              value: { type: 'final', text: output, stopReason: response.stopReason, sessionId: actualId },
+              value: { type: 'final', stopReason: response.stopReason, sessionId: actualId },
             });
           },
           (error) => {
@@ -177,8 +186,8 @@ export class AcpAdapter implements AgentAdapter {
         if (this.queues.has(actualId) || this.inFlightPrompts.has(actualId)) {
           throw new Error(`ACP session "${actualId}" already has an active prompt in progress`);
         }
+        signal?.throwIfAborted();
         this.queues.set(actualId, queue);
-        yield { type: 'text', text: '', sessionId: actualId };
         const completion = active.prompt(text);
         this.trackInFlight(actualId, completion);
         completion.catch((error) => {
@@ -189,6 +198,7 @@ export class AcpAdapter implements AgentAdapter {
         });
         this.pumpUpdates(actualId, active);
       }
+      yield { type: 'text', text: '', sessionId: actualId };
       while (true) {
         const next = await queue.next(signal);
         if (next.done) throw new Error('ACP event stream ended before the prompt completed');
@@ -212,7 +222,7 @@ export class AcpAdapter implements AgentAdapter {
           const event = next.value.value;
           if (event.type === 'error') throw new Error(event.text ?? 'ACP agent failed');
           if (event.type === 'final') {
-            yield { ...event, text: output || event.text || '', sessionId: actualId };
+            yield { ...event, text: output, sessionId: actualId };
             return;
           }
           if (event.type === 'text' && event.text) {
@@ -255,7 +265,15 @@ export class AcpAdapter implements AgentAdapter {
   async cancel(sessionId: string, signal?: AbortSignal): Promise<void> {
     await this.connect(signal);
     const actualId = this.sessionIds.get(sessionId) ?? sessionId;
-    await this.connection!.agent.notify(methods.agent.session.cancel, { sessionId: actualId });
+    const queue = this.queues.get(actualId);
+    const rejectPermissions = queue && this.supportsInterimRetraction && !this.cancelledQueues.has(queue);
+    if (rejectPermissions) this.cancelledQueues.add(queue);
+    try {
+      await this.connection!.agent.notify(methods.agent.session.cancel, { sessionId: actualId });
+    } catch (error) {
+      if (rejectPermissions) this.cancelledQueues.delete(queue);
+      throw error;
+    }
     this.cancelPermissions(actualId);
   }
 
@@ -289,6 +307,8 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private trackInFlight(sessionId: string, promise: Promise<unknown>): void {
+    const queue = this.queues.get(sessionId);
+    if (this.supportsInterimRetraction && queue) this.promptTerminals.set(queue, promise);
     const settled = promise.then(
       () => {},
       () => {},
@@ -395,6 +415,7 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private async open(): Promise<void> {
+    this.supportsInterimRetraction = false;
     this.clearSessions();
     await this.closeProcess();
     const stream = this.config.acpTransport === 'stdio' ? this.openStdio() : this.openWebSocket();
@@ -406,7 +427,7 @@ export class AcpAdapter implements AgentAdapter {
     });
     app.onRequest(methods.client.session.requestPermission, ({ params }) => {
       const queue = this.queues.get(params.sessionId);
-      if (!queue || queue.failure) return { outcome: { outcome: 'cancelled' } };
+      if (!queue || queue.failure || this.cancelledQueues.has(queue)) return { outcome: { outcome: 'cancelled' } };
       const requestId = params.toolCall.toolCallId;
       const key = permissionKey(params.sessionId, requestId);
       const previous = this.permissions.get(key);
@@ -450,6 +471,7 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; expected ${PROTOCOL_VERSION}`);
     }
     this.capabilities = initialized.agentCapabilities;
+    this.supportsInterimRetraction = initialized._meta?.['dsh-knot/interimRetraction'] === true;
   }
 
   private openWebSocket() {

@@ -283,17 +283,53 @@ describe('Hermes API Server adapter', () => {
   });
 
   it('supports cancellation and approvals', async () => {
-    const transport = new FakeTransport();
+    let reportStatusRead!: () => void;
+    const statusRead = new Promise<void>((resolve) => {
+      reportStatusRead = resolve;
+    });
+    let finishStatus!: (response: HttpResponse) => void;
+    const statusResponse = new Promise<HttpResponse>((resolve) => {
+      finishStatus = resolve;
+    });
+    const complete = () => finishStatus({ status: 200, headers: {}, text: '{"status":"completed","output":"done"}' });
+    class LegacyApprovalTransport extends FakeTransport {
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1') {
+          reportStatusRead();
+          return statusResponse;
+        }
+        return super.request(request);
+      }
+
+      override async stream(): Promise<IncomingMessage> {
+        return incoming('data: {"type":"approval.required","request_id":"request-1","choices":["once"]}\n\n');
+      }
+    }
+    const transport = new LegacyApprovalTransport();
     const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
-    for await (const _ of adapter.prompt('session-1', 'task')) void _;
-    await adapter.respond('session-1', 'request-1', 'once');
-    await adapter.cancel('session-1');
-    expect(
-      transport.requests.some(
-        (request) => request.path.endsWith('/approval') && (request.body as any)?.choice === 'once',
-      ),
-    ).toBe(true);
-    expect(transport.requests.some((request) => request.path.endsWith('/stop'))).toBe(true);
+    const events = adapter.prompt('session-1', 'task')[Symbol.asyncIterator]();
+    try {
+      expect(await events.next()).toMatchObject({ value: { type: 'approval', requestId: 'request-1' } });
+      const final = events.next();
+      await statusRead;
+      await expect(adapter.respond('session-1', 'unknown-request', 'once')).rejects.toThrow(
+        'No pending Hermes approval',
+      );
+      await adapter.respond('session-1', 'request-1', 'once');
+      complete();
+      await expect(final).resolves.toMatchObject({ value: { type: 'final', text: 'done' } });
+      expect((await events.next()).done).toBe(true);
+      await expect(adapter.respond('session-1', 'request-1', 'once')).rejects.toThrow('No pending Hermes approval');
+      await adapter.cancel('session-1');
+      expect(transport.requests.filter((request) => request.path.endsWith('/approval'))).toMatchObject([
+        { path: '/v1/runs/run_1/approval', body: { request_id: 'request-1', choice: 'once' } },
+      ]);
+      expect(transport.requests.some((request) => request.path.endsWith('/stop'))).toBe(true);
+    } finally {
+      complete();
+      await events.return?.();
+      await adapter.close();
+    }
   });
 
   it('stops the newly admitted run after a local-only abort during submission', async () => {
@@ -444,6 +480,45 @@ describe('Hermes API Server adapter', () => {
     });
   });
 
+  it('keeps a pending approval bound to its run when another run is queued in the same session', async () => {
+    class ConcurrentApprovalTransport extends FakeTransport {
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs' && (request.body as { input?: string }).input === 'second turn') {
+          return { status: 202, headers: {}, text: '{"run_id":"run_2","status":"queued"}' };
+        }
+        return super.request(request);
+      }
+
+      override async stream(request?: HttpRequest): Promise<IncomingMessage> {
+        if (request?.path === '/v1/runs/run_2/events') {
+          return incoming('data: {"event":"run.cancelled"}\n\n');
+        }
+        return incoming(
+          'data: {"event":"approval.request","prompt_id":"apr_1","execution_generation":7,"choices":["once"]}\n\n',
+        );
+      }
+    }
+
+    const transport = new ConcurrentApprovalTransport();
+    const adapter = new HermesAdapter('hermes', { id: 'hermes', kind: 'hermes', transport: 'local' }, transport);
+    const first = adapter.prompt('session-1', 'first turn')[Symbol.asyncIterator]();
+    try {
+      expect(await first.next()).toMatchObject({ value: { type: 'approval', requestId: 'apr_1' }, done: false });
+      for await (const event of adapter.prompt('session-1', 'second turn')) {
+        expect(event).toMatchObject({ type: 'final', stopReason: 'cancelled' });
+      }
+      await adapter.respond('session-1', 'apr_1', 'once');
+      const approval = transport.requests.find((request) => request.path.endsWith('/approval'));
+      expect(approval).toMatchObject({
+        path: '/v1/runs/run_1/approval',
+        body: { request_id: 'apr_1', execution_generation: 7, choice: 'once' },
+      });
+    } finally {
+      await first.return?.();
+      await adapter.close();
+    }
+  });
+
   it('normalizes Hermes reasoning and interim commentary on both already_streamed paths', async () => {
     class UnstreamedInterimTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {
@@ -511,9 +586,9 @@ describe('Hermes API Server adapter', () => {
     class PartialResendTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {
         return incoming(
-          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking\\nrepo"}\n\n' +
             'id: 2\ndata: {"event":"reasoning.available","text":"Inspect git status"}\n\n' +
-            'id: 3\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+            'id: 3\ndata: {"event":"message.interim","text":"Checking repo now...","already_streamed":false}\n\n' +
             'id: 4\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
             'id: 5\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
             'id: 6\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
@@ -529,9 +604,15 @@ describe('Hermes API Server adapter', () => {
     const partialEvents = [];
     for await (const event of partialResend.prompt('session-3', 'check repo')) partialEvents.push(event);
     expect(partialEvents).toEqual([
-      { type: 'text', text: 'Checking ' },
+      { type: 'text', text: 'Checking\nrepo' },
       { type: 'thought', text: 'Inspect git status' },
-      { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true, retractText: 'Checking ' },
+      {
+        type: 'text',
+        text: 'Checking repo now...',
+        interim: true,
+        alreadyStreamed: true,
+        retractText: 'Checking\nrepo',
+      },
       { type: 'tool', phase: 'start', name: 'terminal', requestId: 'call-1', inputPreview: 'git status' },
       { type: 'tool', phase: 'end', name: 'terminal', requestId: 'call-1' },
       { type: 'text', text: 'All clean.' },
@@ -552,7 +633,7 @@ describe('Hermes API Server adapter', () => {
     expect(settled.status).toBe('completed');
     expect(settled.text).toBe('All clean.');
     expect(settled.timeline).toEqual([
-      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'commentary', text: 'Checking repo now...' },
       { kind: 'thought', text: 'Inspect git status' },
       { kind: 'tool', toolId: settled.tools![0]!.id },
       { kind: 'text', text: 'All clean.' },

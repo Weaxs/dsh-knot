@@ -11,10 +11,8 @@ import type {
   AgentPromptOptions,
   AgentTimelineEntry,
   AgentToolActivity,
-  AgentTranscriptMessage,
   DoctorStep,
   PluginConfig,
-  SessionHistoryBaseline,
 } from './types.js';
 
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
@@ -34,14 +32,20 @@ export class AgentManager {
   private readonly approvals = new WeakMap<AgentJob, Map<string, NonNullable<AgentJob['pendingApproval']>>>();
   private readonly jobOwners = new Map<
     string,
-    { adapter: AgentAdapter; exclusive: boolean; submission?: string; cancelling?: Promise<void> }
+    {
+      adapter: AgentAdapter;
+      exclusive: boolean;
+      submission?: string;
+      cancelling?: Promise<void>;
+      stopConfirmation?: 'pending' | 'received';
+    }
   >();
   private readonly configRevisions = new WeakMap<AgentConfig, string>();
   private readonly completions = new Map<string, Promise<AgentJob>>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly remoteCancelled = new Set<string>();
   private readonly latestSessionJob = new Map<string, string>();
-  private readonly sessionBaselines = new Map<string, SessionHistoryBaseline>();
+  private readonly preparingHistory = new Map<string, { ready: Promise<void>; capture: boolean }>();
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
   private readonly connectionStates = new Map<string, AgentConnectionState>();
@@ -171,33 +175,6 @@ export class AgentManager {
     });
   }
 
-  recordSessionBaseline(agentId: string, sessionId: string, messages: AgentTranscriptMessage[]): void {
-    const adapter = this.adapters.get(agentId);
-    if (!adapter) return;
-    // Only record an idle baseline when no job is currently running on this session.
-    for (const job of this.jobs.values()) {
-      if (
-        job.agentId === agentId &&
-        job.sessionId === sessionId &&
-        this.jobOwners.get(job.id)?.adapter === adapter &&
-        (job.status === 'queued' || job.status === 'running')
-      ) {
-        return;
-      }
-    }
-    const key = sessionKey(agentId, sessionId);
-    this.sessionBaselines.delete(key);
-    this.sessionBaselines.set(key, {
-      length: messages.length,
-      lastId: messages.at(-1)?.id,
-      lastUserId: messages.findLast((item) => item.role === 'user')?.id,
-    });
-    if (this.sessionBaselines.size > MAX_JOBS) {
-      const oldest = this.sessionBaselines.keys().next().value;
-      if (oldest !== undefined) this.sessionBaselines.delete(oldest);
-    }
-  }
-
   adapter(id: string): AgentAdapter {
     const adapter = this.adapters.get(id);
     if (adapter) return adapter;
@@ -232,15 +209,15 @@ export class AgentManager {
     const remoteSession =
       sessionId ??
       (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config, clientMessageId));
+    let historyOverlaps: AgentJob[] = [];
     if (remoteSession) {
       const exclusive = exclusiveSession || adapter.kind === 'acp';
-      const existingJob = [...this.jobs.values()].find((job) => {
+      const activeSessionJobs = [...this.jobs.values()].filter((job) => {
         const owner = this.jobOwners.get(job.id);
         return (
           job.agentId === agentId &&
           job.sessionId === remoteSession &&
           owner?.adapter === adapter &&
-          (exclusive || owner.exclusive) &&
           (job.status === 'queued' ||
             job.status === 'running' ||
             this.completions.has(job.id) ||
@@ -249,15 +226,22 @@ export class AgentManager {
             (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))
         );
       });
+      const existingJob = activeSessionJobs.find((job) => exclusive || this.jobOwners.get(job.id)?.exclusive);
       if (existingJob || (exclusive && adapter.isSessionBusy?.(remoteSession))) {
         throw new Error(
           `Session "${remoteSession}" still has an active or cancelling job (${existingJob?.id ?? remoteSession})`,
         );
       }
+      if (adapter.getSessionMessages) historyOverlaps = activeSessionJobs;
     }
     this.evictFinishedJobs();
     if (this.jobs.size >= MAX_JOBS) throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
-    const historyBaseline = !sessionId ? { length: 0 } : this.sessionBaselines.get(sessionKey(agentId, sessionId));
+    // Concurrent turns cannot be distinguished by their position in remote history.
+    for (const activeJob of historyOverlaps) {
+      delete activeJob.historyBaseline;
+      const preparation = this.preparingHistory.get(activeJob.id);
+      if (preparation) preparation.capture = false;
+    }
     const job: AgentJob = {
       id,
       agentId,
@@ -267,13 +251,18 @@ export class AgentManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       text: '',
-      ...(historyBaseline ? { historyBaseline } : {}),
+      ...(!sessionId && adapter.getSessionMessages ? { historyBaseline: { length: 0 } } : {}),
     };
     this.jobs.set(id, job);
     this.jobOwners.set(id, { adapter, exclusive: exclusiveSession, submission });
-    if (remoteSession) this.latestSessionJob.set(sessionKey(agentId, remoteSession), id);
+    const lastPreparing = historyOverlaps.findLast((activeJob) => this.preparingHistory.has(activeJob.id));
+    const prepareAfter = lastPreparing && this.preparingHistory.get(lastPreparing.id)?.ready;
+    const captureHistory = Boolean(adapter.getSessionMessages && sessionId && historyOverlaps.length === 0);
+    if (remoteSession && !captureHistory && !prepareAfter) {
+      this.latestSessionJob.set(sessionKey(agentId, remoteSession), id);
+    }
     const options = clientMessageId ? { idempotencyKey: `dsh-knot:${clientMessageId}` } : undefined;
-    const completion = this.run(job, adapter, text, remoteSession, onDone, options);
+    const completion = this.run(job, adapter, text, remoteSession, onDone, options, captureHistory, prepareAfter);
     this.completions.set(id, completion);
     completion
       .finally(() => {
@@ -327,7 +316,7 @@ export class AgentManager {
     if (job.status === 'completed' || (job.status === 'failed' && !job.remoteStop)) return job;
     if (job.status === 'cancelled' && this.remoteCancelled.has(id)) return job;
     const latest = job.sessionId ? this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) : undefined;
-    if (latest && latest !== id) {
+    if (latest && latest !== id && !this.preparingHistory.has(id)) {
       throw new Error(
         `Cannot cancel job ${id}: session "${job.sessionId}" already has a newer job on agent "${job.agentId}"`,
       );
@@ -338,14 +327,43 @@ export class AgentManager {
       throw new Error(`Cannot cancel job ${id}: agent "${job.agentId}" has been reconfigured or removed`);
     }
     signal?.throwIfAborted();
+    if (owner?.cancelling) {
+      await raceAbort(owner.cancelling, signal);
+      return job;
+    }
+    if (job.status === 'cancelled' && owner?.stopConfirmation === 'received') {
+      delete job.remoteStop;
+      this.remoteCancelled.add(id);
+      job.updatedAt = Date.now();
+      return job;
+    }
     if (job.status !== 'failed') job.status = 'cancelled';
     delete job.pendingApproval;
     this.approvals.delete(job);
     job.updatedAt = Date.now();
-    this.controllers
-      .get(id)
-      ?.abort(job.sessionId ? new LocalOnlyAbortError('job cancelled') : new Error('job cancelled'));
-    await this.cancelRemote(job, signal);
+    const controller = this.controllers.get(id);
+    const terminal =
+      job.sessionId && !this.preparingHistory.has(id)
+        ? owner?.adapter.promptTerminalForCancel?.(job.sessionId)
+        : undefined;
+    const drain =
+      owner && controller && terminal
+        ? {
+            controller,
+            confirmation: terminal.then(
+              () => {
+                owner.stopConfirmation = 'received';
+              },
+              () => {
+                /* Transport failures leave confirmation pending. */
+              },
+            ),
+          }
+        : undefined;
+    if (!drain) {
+      controller?.abort(job.sessionId ? new LocalOnlyAbortError('job cancelled') : new Error('job cancelled'));
+    }
+    await this.cancelRemote(job, signal, drain);
     return job;
   }
 
@@ -389,22 +407,41 @@ export class AgentManager {
     }
   }
 
-  private async cancelRemote(job: AgentJob, signal?: AbortSignal): Promise<void> {
+  private async cancelRemote(
+    job: AgentJob,
+    signal?: AbortSignal,
+    drain?: { controller: AbortController; confirmation: Promise<void> },
+  ): Promise<void> {
     const owner = this.jobOwners.get(job.id);
     if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
-    if (owner && job.sessionId) {
+    if (owner && job.sessionId && !this.preparingHistory.has(job.id)) {
       const deadline = AbortSignal.timeout(5_000);
       const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-      if (owner.exclusive) job.remoteStop = 'pending';
+      if (drain && owner.stopConfirmation === undefined) owner.stopConfirmation = 'pending';
+      if (owner.exclusive || owner.stopConfirmation) job.remoteStop = 'pending';
       try {
         stopSignal.throwIfAborted();
-        owner.cancelling = raceAbort(owner.adapter.cancel(job.sessionId, stopSignal), stopSignal);
+        const remoteStop = owner.adapter.cancel(job.sessionId, stopSignal);
+        owner.cancelling = raceAbort(
+          remoteStop.then(async () => {
+            if (drain) {
+              await this.wait(job.id, stopSignal);
+              await raceAbort(drain.confirmation, stopSignal);
+            }
+            if (owner.stopConfirmation === 'pending') {
+              throw new Error('The remote stop is unconfirmed because the prompt ended without a terminal response');
+            }
+          }),
+          stopSignal,
+        );
         await owner.cancelling;
         delete job.remoteStop;
       } catch (error) {
-        if (owner.exclusive) job.remoteStop = 'unconfirmed';
+        if (owner.exclusive || owner.stopConfirmation) job.remoteStop = 'unconfirmed';
         throw error;
       } finally {
+        // Retractions can precede the remote terminal event even after the cancellation request.
+        drain?.controller.abort(new LocalOnlyAbortError('job cancelled'));
         delete owner.cancelling;
         job.updatedAt = Date.now();
       }
@@ -473,9 +510,6 @@ export class AgentManager {
     for (const key of this.latestSessionJob.keys()) {
       if (key.startsWith(prefix)) this.latestSessionJob.delete(key);
     }
-    for (const key of this.sessionBaselines.keys()) {
-      if (key.startsWith(prefix)) this.sessionBaselines.delete(key);
-    }
   }
 
   private evictFinishedJobs(): void {
@@ -506,11 +540,14 @@ export class AgentManager {
     sessionId: string | undefined,
     onDone?: (job: AgentJob) => void,
     options?: AgentPromptOptions,
+    captureHistory = false,
+    prepareAfter?: Promise<void>,
   ): Promise<AgentJob> {
     const controller = new AbortController();
     this.controllers.set(job.id, controller);
     let approvalOverflow = false;
     const timer = setTimeout(() => {
+      if (job.status !== 'running' && job.status !== 'queued') return;
       const owned = this.isLatestSessionJob(job);
       const message = `job timed out after ${this.timeoutMs}ms`;
       controller.abort(!owned || job.sessionId ? new LocalOnlyAbortError(message) : new Error(message));
@@ -520,9 +557,40 @@ export class AgentManager {
         });
       }
     }, this.timeoutMs);
-    job.status = 'running';
-    job.updatedAt = Date.now();
     try {
+      if (captureHistory || prepareAfter) {
+        let finishPreparation!: () => void;
+        const preparation = {
+          ready: new Promise<void>((resolve) => {
+            finishPreparation = resolve;
+          }),
+          capture: captureHistory,
+        };
+        this.preparingHistory.set(job.id, preparation);
+        try {
+          if (prepareAfter) await raceAbort(prepareAfter, controller.signal);
+          if (preparation.capture && sessionId && adapter.getSessionMessages) {
+            const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(1_000)]);
+            try {
+              const messages = await raceAbort(adapter.getSessionMessages(sessionId, signal), signal);
+              if (preparation.capture) {
+                job.historyBaseline = { length: messages.length, lastId: messages.at(-1)?.id };
+              }
+            } catch {
+              // History is best-effort and does not prevent the prompt from running.
+            }
+          }
+        } finally {
+          this.preparingHistory.delete(job.id);
+          // Cancelling a waiting job must not let its successors overtake the preceding preparation.
+          if (prepareAfter) void prepareAfter.then(finishPreparation);
+          else finishPreparation();
+        }
+        controller.signal.throwIfAborted();
+        if (sessionId) this.latestSessionJob.set(sessionKey(job.agentId, sessionId), job.id);
+      }
+      job.status = 'running';
+      job.updatedAt = Date.now();
       for await (const event of adapter.prompt(sessionId, text, controller.signal, options)) {
         if (event.sessionId) {
           job.sessionId = event.sessionId;
@@ -696,26 +764,33 @@ function appendTimelineTool(job: AgentJob, toolId: string): void {
 
 function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retracted = commentary): void {
   const timeline = job.timeline ?? [];
+  const reply = timeline
+    .filter((entry) => entry.kind === 'text')
+    .map((entry) => entry.text)
+    .join('');
+  let charsToRemove = reply.length - stripTrailingText(reply, retracted).length;
+  if (!charsToRemove) {
+    appendTimelineText(job, 'commentary', commentary, MAX_JOB_TEXT_LENGTH);
+    return;
+  }
+
+  const next = [...timeline];
+  const commentaryEntry = { kind: 'commentary' as const, text: commentary };
   for (let i = timeline.length - 1; i >= 0; i--) {
     const entry = timeline[i];
     if (entry?.kind !== 'text') continue;
-    const remaining = stripTrailingText(entry.text, retracted);
-    if (remaining !== entry.text) {
-      const next = [...timeline];
-      const replacement = remaining
-        ? [
-            { kind: 'text' as const, text: remaining },
-            { kind: 'commentary' as const, text: commentary },
-          ]
-        : [{ kind: 'commentary' as const, text: commentary }];
-      next.splice(i, 1, ...replacement);
-      job.timeline = next.slice(-MAX_JOB_TIMELINE);
-      trimTimelineBudget(job, 'text', MAX_JOB_TEXT_LENGTH);
-      return;
+    charsToRemove -= entry.text.length;
+    if (charsToRemove > 0) {
+      next.splice(i, 1);
+      continue;
     }
+    const prefix = entry.text.slice(0, -charsToRemove);
+    const replacement = prefix ? [{ ...entry, text: prefix }, commentaryEntry] : [commentaryEntry];
+    next.splice(i, 1, ...replacement);
     break;
   }
-  appendTimelineText(job, 'commentary', commentary, MAX_JOB_TEXT_LENGTH);
+  job.timeline = next.slice(-MAX_JOB_TIMELINE);
+  trimTimelineBudget(job, 'text', MAX_JOB_TEXT_LENGTH);
 }
 
 function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {

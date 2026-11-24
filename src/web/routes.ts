@@ -268,7 +268,6 @@ export function registerWebRoutes(
         const signal = AbortSignal.any([request.signal, AbortSignal.timeout(timeoutMs)]);
         const messages = await adapter.getSessionMessages(sessionId, signal);
         if (!manager.matchesRevision(agentId, revision)) return staleGateway();
-        manager.recordSessionBaseline(agentId, sessionId, messages);
         return jsonReply({ ok: true, value: { messages: redact(messages) } });
       } catch (error) {
         return errorReply(redact(error instanceof Error ? error.message : String(error)), 400);

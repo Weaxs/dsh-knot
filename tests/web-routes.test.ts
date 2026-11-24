@@ -18,6 +18,7 @@ import type {
   AgentTimelineEntry,
   AgentToolActivity,
   AgentTranscriptMessage,
+  SessionHistoryBaseline,
 } from '../src/types.js';
 import { registerWebRoutes, WEB_ROUTES } from '../src/web/routes.js';
 
@@ -32,7 +33,7 @@ class StubAdapter implements AgentAdapter {
   async listSessions() {
     return [{ id: 'remote-1', title: 'Remote Task', updatedAt: '2026-11-20T00:00:00Z' }];
   }
-  async getSessionMessages(sessionId: string) {
+  async getSessionMessages(sessionId: string): Promise<AgentTranscriptMessage[]> {
     return [{ id: 'message-1', role: 'assistant' as const, text: `${sessionId}: Bearer very-secret-value` }];
   }
   async *prompt(): AsyncIterable<AgentEvent> {
@@ -362,6 +363,187 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
+  it('captures a fresh baseline for each admitted turn despite out-of-order history requests', async () => {
+    let transcript: AgentTranscriptMessage[] = [];
+    let holdNextRead = true;
+    let releaseRead!: () => void;
+    let startedRead!: () => void;
+    const historyHeld = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const historyStarted = new Promise<void>((resolve) => {
+      startedRead = resolve;
+    });
+    class HistoryAdapter extends StubAdapter {
+      override async getSessionMessages() {
+        const snapshot = transcript.slice();
+        if (holdNextRead) {
+          holdNextRead = false;
+          startedRead();
+          await historyHeld;
+        }
+        return snapshot;
+      }
+      override async *prompt(_sessionId?: string, prompt?: string): AsyncIterable<AgentEvent> {
+        const turn = transcript.length / 2 + 1;
+        transcript = [
+          ...transcript,
+          { id: `user-${turn}`, role: 'user', text: prompt ?? '' },
+          { id: `assistant-${turn}`, role: 'assistant', text: 'done' },
+        ];
+        yield { type: 'final', text: 'done' };
+      }
+    }
+    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const manager = new AgentManager([config], 10_000, () => new HistoryAdapter(config.id));
+    const routes = new Map<string, (req: Request) => Promise<Response>>();
+    const ctx = {
+      connection: {
+        fetch: {
+          register(route: { path: string; fetch: (req: Request) => Promise<Response> }) {
+            routes.set(route.path, route.fetch);
+            return () => routes.delete(route.path);
+          },
+        },
+      },
+      effect() {},
+    } as any;
+    registerWebRoutes(ctx, manager, undefined, undefined);
+    const readHistory = () =>
+      routes.get(WEB_ROUTES.sessionMessages)!(
+        new Request('http://localhost/', {
+          method: 'POST',
+          body: JSON.stringify({ agentId: config.id, revision: manager.list()[0]?.revision, sessionId: 'remote' }),
+        }),
+      );
+
+    const olderRead = readHistory();
+    try {
+      await historyStarted;
+      const first = await manager.wait(manager.start(config.id, 'repeat', 'remote').id);
+      expect(first.historyBaseline).toEqual({ length: 0 });
+      expect((await readHistory()).ok).toBe(true);
+      releaseRead();
+      await expect(olderRead.then((response) => response.json())).resolves.toMatchObject({
+        value: { messages: [] },
+      });
+
+      const second = await manager.wait(manager.start(config.id, 'repeat', 'remote').id);
+      expect(second.historyBaseline).toEqual({ length: 2, lastId: 'assistant-1' });
+      const third = await manager.wait(manager.start(config.id, 'repeat', 'remote').id);
+      expect(third.historyBaseline).toEqual({ length: 4, lastId: 'assistant-2' });
+    } finally {
+      releaseRead();
+      await manager.close();
+    }
+  });
+
+  it('cancels a pending history read before submitting or stopping a remote run', async () => {
+    let releaseHistory!: (transcript: AgentTranscriptMessage[]) => void;
+    const history = new Promise<AgentTranscriptMessage[]>((resolve) => {
+      releaseHistory = resolve;
+    });
+    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const adapter = new StubAdapter(config.id);
+    vi.spyOn(adapter, 'getSessionMessages').mockReturnValue(history);
+    const prompt = vi.spyOn(adapter, 'prompt');
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const job = manager.start(config.id, 'new turn', 'remote');
+      expect(job.status).toBe('queued');
+      expect((await manager.cancel(job.id)).status).toBe('cancelled');
+      expect((await manager.wait(job.id)).historyBaseline).toBeUndefined();
+      expect(prompt).not.toHaveBeenCalled();
+      expect(adapter.cancelled).toBe(false);
+    } finally {
+      releaseHistory([]);
+      await manager.close();
+    }
+  });
+
+  it('admits overlapping turns in order without attaching ambiguous history evidence', async () => {
+    let releaseHistory!: () => void;
+    const historyHeld = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    const prompts: string[] = [];
+    class ConcurrentAdapter extends StubAdapter {
+      override async getSessionMessages(sessionId: string) {
+        await historyHeld;
+        return super.getSessionMessages(sessionId);
+      }
+      override async *prompt(_sessionId?: string, prompt?: string): AsyncIterable<AgentEvent> {
+        prompts.push(prompt ?? '');
+        yield { type: 'final', text: 'done' };
+      }
+    }
+    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const adapter = new ConcurrentAdapter(config.id);
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const first = manager.start(config.id, 'first', 'remote');
+      const waiting = manager.start(config.id, 'cancelled', 'remote');
+      expect((await manager.cancel(waiting.id)).status).toBe('cancelled');
+      expect(adapter.cancelled).toBe(false);
+      const second = manager.start(config.id, 'second', 'remote');
+      const third = manager.start(config.id, 'third', 'remote');
+      expect(prompts).toEqual([]);
+      releaseHistory();
+      const settled = await Promise.all([manager.wait(first.id), manager.wait(second.id), manager.wait(third.id)]);
+      expect(prompts).toEqual(['first', 'second', 'third']);
+      expect(settled.every((job) => job.status === 'completed' && job.historyBaseline === undefined)).toBe(true);
+    } finally {
+      releaseHistory();
+      await manager.close();
+    }
+  });
+
+  it('keeps remote cancellation ownership when a newer preparation is cancelled locally', async () => {
+    let releaseHistory!: () => void;
+    const historyHeld = new Promise<void>((resolve) => {
+      releaseHistory = resolve;
+    });
+    let enterPrompt!: () => void;
+    let releasePrompt!: () => void;
+    const promptStarted = new Promise<void>((resolve) => {
+      enterPrompt = resolve;
+    });
+    const promptHeld = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    class ConcurrentAdapter extends StubAdapter {
+      override async getSessionMessages(sessionId: string) {
+        await historyHeld;
+        return super.getSessionMessages(sessionId);
+      }
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        enterPrompt();
+        await promptHeld;
+        yield { type: 'final', stopReason: 'cancelled' };
+      }
+    }
+    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const adapter = new ConcurrentAdapter(config.id);
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const first = manager.start(config.id, 'first', 'remote');
+      const second = manager.start(config.id, 'second', 'remote');
+      expect((await manager.cancel(second.id)).status).toBe('cancelled');
+      expect(adapter.cancelled).toBe(false);
+      releaseHistory();
+      await promptStarted;
+
+      expect((await manager.cancel(first.id)).status).toBe('cancelled');
+      expect(adapter.cancelled).toBe(true);
+      releasePrompt();
+      await Promise.all([manager.wait(first.id), manager.wait(second.id)]);
+    } finally {
+      releaseHistory();
+      releasePrompt();
+      await manager.close();
+    }
+  });
+
   it('bounds hanging sessions requests and records failedStep on doctor errors', async () => {
     const hangingAdapter: AgentAdapter = {
       id: 'slow-hermes',
@@ -643,6 +825,7 @@ describe('web UI host routes & schemastery Config', () => {
       error?: string;
       tools?: AgentToolActivity[];
       timeline?: AgentTimelineEntry[];
+      historyBaseline?: SessionHistoryBaseline;
     } = {
       id: 'job-2',
       agentId: 'hermes-remote',
@@ -652,6 +835,7 @@ describe('web UI host routes & schemastery Config', () => {
       createdAt: 2000,
       updatedAt: 2000,
       text: '',
+      historyBaseline: { length: 2, lastId: 'm2' },
       thought: 'live turn thought',
       tools: [{ id: 't-live', name: 'terminal', status: 'running', inputPreview: 'ls -la' }],
       timeline: [
@@ -821,6 +1005,7 @@ describe('web UI host routes & schemastery Config', () => {
         createdAt: 4000,
         updatedAt: 4000,
         text: '',
+        historyBaseline: { length: 2, lastId: 'm2' },
         thought: 'Check the status',
         tools: [{ id: toolAId, name: 'terminal', status: 'running', inputPreview: 'cmd-A' }],
         timeline: [
@@ -920,17 +1105,22 @@ describe('web UI host routes & schemastery Config', () => {
       expect(idxWorking).toBeLessThan(idxCmdB);
       expect(idxCmdB).toBeLessThan(idxFinal);
 
-      // Case D1 (Fresh history): Fast text-only job settles before Fetch 1 returns; Fetch 1 is NOT aborted
-      // and delivers the pre-run baseline `[]` while Fetch 2 returns `[f1, f2]` -> merges cleanly without duplicates.
+      // Case D1: Both history reads can include the fast job. Only its server-side pre-run baseline is authoritative.
       const stalledResolvers = new Map<string, () => void>();
       const sessionFetchCounts = new Map<string, number>();
       const firstFetchMessages = new Map<string, AgentTranscriptMessage[] | 'fail'>([
-        ['sess-3', []],
+        [
+          'sess-3',
+          [
+            { id: 'f1', role: 'user', text: 'fast prompt' },
+            { id: 'f2', role: 'assistant', text: 'fast reply' },
+          ],
+        ],
         [
           'sess-4',
           [
-            { id: 'old1', role: 'user', text: 'fast prompt' },
-            { id: 'old2', role: 'assistant', text: 'fast reply' },
+            { id: 'older1', role: 'user', text: 'older prompt' },
+            { id: 'older2', role: 'assistant', text: 'older reply' },
           ],
         ],
         ['sess-5', 'fail'],
@@ -965,6 +1155,7 @@ describe('web UI host routes & schemastery Config', () => {
         updatedAt: 6000,
         text: '',
         timeline: [],
+        historyBaseline: { length: 0 },
       };
       historyMessages = [
         { id: 'f1', role: 'user', text: 'fast prompt' },
@@ -975,9 +1166,11 @@ describe('web UI host routes & schemastery Config', () => {
       (findButton(dash3, '对话')!.props.onClick as () => void)();
       const reopened3 = await flush();
       (findButton(reopened3, 'Live session 3')!.props.onClick as () => void)();
-      // Render once so Fetch 1 starts (stalled), then complete job-4 before Fetch 1 resolves
+      // The adapter can already persist this turn while the last job poll still reports "running".
       renderNode(renderMain!());
       while (pendingEffects.length > 0) pendingEffects.shift()!();
+      stalledResolvers.get('sess-3')?.();
+      await flush();
       currentJob = {
         ...currentJob,
         status: 'completed',
@@ -986,15 +1179,13 @@ describe('web UI host routes & schemastery Config', () => {
         timeline: [{ kind: 'text', text: 'fast reply' }],
       };
       await new Promise((r) => setTimeout(r, 450));
-      stalledResolvers.get('sess-3')?.();
       const fastFreshTree = await flush();
       const fastFreshTexts = collectText(fastFreshTree);
       expect(sessionFetchCounts.get('sess-3')).toBeGreaterThanOrEqual(2);
       expect(fastFreshTexts.filter((t) => t === 'fast prompt')).toHaveLength(1);
       expect(fastFreshTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
 
-      // Case D2 (Stale history): Repeated quick turn settles before Fetch 1 returns, and Fetch 2 STILL
-      // returns the OLD transcript IDs `[old1, old2]` — must NOT fold the new turn into the old one.
+      // Case D2: History reads spanning an intervening turn cannot substitute for a missing pre-run baseline.
       currentJob = {
         id: 'job-5',
         agentId: 'hermes-remote',
