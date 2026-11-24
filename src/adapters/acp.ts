@@ -15,7 +15,7 @@ import {
 import { createWebSocketStream } from '@agentclientprotocol/sdk/experimental/ws-client';
 import WebSocket from 'ws';
 import { AsyncQueue } from '../async-queue.js';
-import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
+import { raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText, urlHost } from '../config.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession, Transport } from '../types.js';
@@ -199,7 +199,13 @@ export class AcpAdapter implements AgentAdapter {
           }
           const event = acpEvent(next.value.value.update, secret(this.config));
           if (!event) continue;
-          if (event.type === 'text' && event.text) output += event.text;
+          if (event.type === 'text' && event.text) {
+            if (event.interim) {
+              if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
+            } else {
+              output += event.text;
+            }
+          }
           yield { ...event, sessionId: actualId };
         } else {
           const event = next.value.value;
@@ -208,7 +214,13 @@ export class AcpAdapter implements AgentAdapter {
             yield { ...event, text: output || event.text || '', sessionId: actualId };
             return;
           }
-          if (event.type === 'text' && event.text) output += event.text;
+          if (event.type === 'text' && event.text) {
+            if (event.interim) {
+              if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
+            } else {
+              output += event.text;
+            }
+          }
           yield { ...event, sessionId: actualId };
         }
       }
@@ -500,6 +512,15 @@ function acpEvent(update: SessionUpdate, token?: string): AgentEvent | undefined
     return { type: 'text', text: update.content.text };
   }
   if (update.sessionUpdate === 'agent_thought_chunk' && update.content.type === 'text') {
+    const meta = update._meta;
+    if (meta?.['dsh-knot/commentary'] === true) {
+      return {
+        type: 'text',
+        text: update.content.text,
+        interim: true,
+        ...(meta['dsh-knot/alreadyStreamed'] === true ? { alreadyStreamed: true } : {}),
+      };
+    }
     return { type: 'thought', text: update.content.text };
   }
   if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {

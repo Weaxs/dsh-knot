@@ -4,7 +4,7 @@ import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { HermesAdapter } from '../src/adapters/hermes.js';
 import { readSse } from '../src/adapters/sse.js';
-import { LocalOnlyAbortError } from '../src/config.js';
+import { LocalOnlyAbortError, normalizeToolCallId } from '../src/config.js';
 import type { HttpRequest, HttpResponse, Transport } from '../src/types.js';
 
 function incoming(text: string): IncomingMessage {
@@ -121,8 +121,18 @@ describe('Hermes API Server adapter', () => {
           text: '',
           thought: 'Check status first',
           tools: [
-            { id: 'call_1', name: 'terminal', status: 'completed', inputPreview: '{\n  "command": "git status"\n}' },
-            { id: 'call_2', name: 'terminal', status: 'completed', inputPreview: '{\n  "command": "[REDACTED]"\n}' },
+            {
+              id: normalizeToolCallId('call_1'),
+              name: 'terminal',
+              status: 'completed',
+              inputPreview: '{\n  "command": "git status"\n}',
+            },
+            {
+              id: normalizeToolCallId('call_2'),
+              name: 'terminal',
+              status: 'completed',
+              inputPreview: '{\n  "command": "[REDACTED]"\n}',
+            },
           ],
         },
         { id: 'row:3', role: 'assistant', text: 'one two' },
@@ -434,12 +444,42 @@ describe('Hermes API Server adapter', () => {
     });
   });
 
-  it('normalizes Hermes reasoning and interim commentary events without duplication', async () => {
-    class ReasoningAndInterimTransport extends FakeTransport {
+  it('normalizes Hermes reasoning and interim commentary on both already_streamed paths', async () => {
+    class UnstreamedInterimTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {
         return incoming(
           'id: 1\ndata: {"event":"reasoning.available","text":"Inspect git status first."}\n\n' +
             'id: 2\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
+            'id: 3\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
+            'id: 4\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+            'id: 5\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
+            'id: 6\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
+        );
+      }
+    }
+    const unstreamed = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new UnstreamedInterimTransport(),
+    );
+    const unstreamedEvents = [];
+    for await (const event of unstreamed.prompt('session-1', 'check repo')) unstreamedEvents.push(event);
+    expect(unstreamedEvents).toEqual([
+      { type: 'thought', text: 'Inspect git status first.' },
+      { type: 'text', text: 'Checking repo...', interim: true },
+      { type: 'tool', phase: 'start', name: 'terminal', requestId: 'call-1', inputPreview: 'git status' },
+      { type: 'tool', phase: 'end', name: 'terminal', requestId: 'call-1' },
+      { type: 'text', text: 'All clean.' },
+      { type: 'final', text: 'All clean.', stopReason: 'run.completed' },
+    ]);
+
+    // Documented already_streamed: true sequence: Hermes streams commentary via message.delta first,
+    // then emits message.interim(already_streamed: true) so final.text remains only the final answer.
+    class StreamedInterimTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        return incoming(
+          'id: 1\ndata: {"event":"message.delta","delta":"Checking "}\n\n' +
+            'id: 2\ndata: {"event":"message.delta","delta":"repo..."}\n\n' +
             'id: 3\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":true}\n\n' +
             'id: 4\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
             'id: 5\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
@@ -448,16 +488,17 @@ describe('Hermes API Server adapter', () => {
         );
       }
     }
-    const adapter = new HermesAdapter(
+    const streamed = new HermesAdapter(
       'hermes',
       { id: 'hermes', kind: 'hermes', transport: 'local' },
-      new ReasoningAndInterimTransport(),
+      new StreamedInterimTransport(),
     );
-    const events = [];
-    for await (const event of adapter.prompt('session-1', 'check repo')) events.push(event);
-    expect(events).toEqual([
-      { type: 'thought', text: 'Inspect git status first.' },
-      { type: 'text', text: 'Checking repo...', interim: true },
+    const streamedEvents = [];
+    for await (const event of streamed.prompt('session-2', 'check repo')) streamedEvents.push(event);
+    expect(streamedEvents).toEqual([
+      { type: 'text', text: 'Checking ' },
+      { type: 'text', text: 'repo...' },
+      { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true },
       { type: 'tool', phase: 'start', name: 'terminal', requestId: 'call-1', inputPreview: 'git status' },
       { type: 'tool', phase: 'end', name: 'terminal', requestId: 'call-1' },
       { type: 'text', text: 'All clean.' },

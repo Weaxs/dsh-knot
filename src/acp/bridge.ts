@@ -18,6 +18,7 @@ import { createNodeWebSocketUpgradeHandler } from '@agentclientprotocol/sdk/expe
 import { AcpServer } from '@agentclientprotocol/sdk/experimental/server';
 import { WebSocketServer } from 'ws';
 import { createNativeAdapter, createNativeSessionId } from '../adapters/native.js';
+import { stripTrailingText } from '../config.js';
 import { verifyBearerToken } from '../policy/auth.js';
 import type { AgentAdapter, AgentConfig } from '../types.js';
 import { VERSION } from '../version.js';
@@ -182,8 +183,22 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     };
     for await (const event of adapter.prompt(sessionId, text, signal)) {
       if (event.type === 'text' && event.text) {
-        output += event.text;
-        await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+        if (event.interim) {
+          if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
+          // Carry mid-turn commentary on agent_thought_chunk with explicit _meta so generic ACP
+          // readText() callers keep clean final replies while dsh-knot preserves commentary in UI.
+          await notify({
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: event.text },
+            _meta: {
+              'dsh-knot/commentary': true,
+              ...(event.alreadyStreamed ? { 'dsh-knot/alreadyStreamed': true } : {}),
+            },
+          });
+        } else {
+          output += event.text;
+          await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+        }
       } else if (event.type === 'thought' && event.text) {
         await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
       } else if (event.type === 'tool') {

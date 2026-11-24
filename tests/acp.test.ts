@@ -490,4 +490,52 @@ describe('ACP provider and bridge', () => {
     expect(settled.status).toBe('completed');
     expect(settled.text).toBe('turn-2-done');
   });
+
+  it('keeps Hermes interim commentary out of model-facing job.text over the ACP WebSocket bridge', async () => {
+    const { AgentManager } = await import('../src/manager.js');
+    for (const alreadyStreamed of [false, true]) {
+      const native: AgentAdapter = {
+        id: 'hermes-native',
+        kind: 'hermes',
+        async health() {
+          return { ok: true };
+        },
+        async listSessions() {
+          return [];
+        },
+        async *prompt() {
+          if (alreadyStreamed) {
+            yield { type: 'text', text: 'Checking repo...' };
+            yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
+          } else {
+            yield { type: 'text', text: 'Checking repo...', interim: true };
+          }
+          yield { type: 'tool', phase: 'start', requestId: 'call-1', name: 'terminal', inputPreview: 'git status' };
+          yield { type: 'tool', phase: 'end', requestId: 'call-1', name: 'terminal' };
+          yield { type: 'text', text: 'All clean.' };
+          yield { type: 'final', text: 'All clean.', stopReason: 'run.completed' };
+        },
+        async cancel() {},
+        async close() {},
+      };
+      const bridge = new AcpBridge({ id: 'hermes-native', kind: 'hermes' }, () => native);
+      const { host, port } = await bridge.start({ port: 0, token: 'acp-commentary-token' });
+      const manager = new AgentManager(
+        [{ id: 'bridged', kind: 'acp', transport: 'local', host, port, token: 'acp-commentary-token' }],
+        10_000,
+      );
+      cleanups.push(async () => {
+        await manager.close();
+        await bridge.close();
+      });
+      const done = await manager.wait(manager.start('bridged', 'check repo', undefined).id);
+      expect(done.status).toBe('completed');
+      expect(done.text).toBe('All clean.');
+      expect(done.timeline).toEqual([
+        { kind: 'commentary', text: 'Checking repo...' },
+        { kind: 'tool', toolId: done.tools![0]!.id },
+        { kind: 'text', text: 'All clean.' },
+      ]);
+    }
+  });
 });

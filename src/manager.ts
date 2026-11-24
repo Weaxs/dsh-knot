@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
-import { LocalOnlyAbortError, raceAbort, secret } from './config.js';
+import { LocalOnlyAbortError, normalizeToolCallId, raceAbort, secret, stripTrailingText } from './config.js';
 import type {
   AgentAdapter,
   AgentConfig,
@@ -498,7 +498,12 @@ export class AgentManager {
         }
         if (event.type === 'text' && event.text) {
           if (event.interim) {
-            appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
+            if (event.alreadyStreamed) {
+              job.text = stripTrailingText(job.text, event.text);
+              reclassifyStreamedCommentary(job, event.text);
+            } else {
+              appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
+            }
           } else {
             job.text = (job.text + event.text).slice(-MAX_JOB_TEXT_LENGTH);
             appendTimelineText(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
@@ -573,7 +578,7 @@ export class AgentManager {
 function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   const tools = job.tools ?? [];
   const name = event.name?.trim().slice(0, 120);
-  const callId = event.requestId ? createHash('sha256').update(event.requestId).digest('hex') : undefined;
+  const callId = event.requestId ? normalizeToolCallId(event.requestId) : undefined;
   const index = callId
     ? tools.findIndex((tool) => tool.id === callId)
     : event.phase === 'end'
@@ -653,6 +658,29 @@ function appendTimelineTool(job: AgentJob, toolId: string): void {
   job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind: 'tool', toolId }];
 }
 
+function reclassifyStreamedCommentary(job: AgentJob, commentary: string): void {
+  const timeline = job.timeline ?? [];
+  for (let i = timeline.length - 1; i >= 0; i--) {
+    const entry = timeline[i];
+    if (entry?.kind !== 'text') continue;
+    const remaining = stripTrailingText(entry.text, commentary);
+    if (remaining !== entry.text) {
+      const next = [...timeline];
+      const replacement = remaining
+        ? [
+            { kind: 'text' as const, text: remaining },
+            { kind: 'commentary' as const, text: commentary },
+          ]
+        : [{ kind: 'commentary' as const, text: commentary }];
+      next.splice(i, 1, ...replacement);
+      job.timeline = next.slice(-MAX_JOB_TIMELINE);
+      trimTimelineBudget(job, 'text', MAX_JOB_TEXT_LENGTH);
+      return;
+    }
+    break;
+  }
+}
+
 function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {
   const bounded = finalText.slice(-MAX_JOB_TEXT_LENGTH);
   const timeline = job.timeline ?? [];
@@ -662,17 +690,11 @@ function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {
     return;
   }
   const combined = textEntries.map((entry) => entry.text).join('');
-  const lastEntry = timeline.at(-1);
-  const lastText = textEntries.at(-1)!;
-  if (combined === bounded || lastText.text === bounded || lastText.text.endsWith(bounded)) {
+  if (combined === bounded) {
     return;
   }
   if (bounded.startsWith(combined)) {
     appendTimelineText(job, 'text', bounded.slice(combined.length), MAX_JOB_TEXT_LENGTH);
-    return;
-  }
-  if (lastEntry?.kind === 'text' && bounded.startsWith(lastText.text)) {
-    appendTimelineText(job, 'text', bounded.slice(lastText.text.length), MAX_JOB_TEXT_LENGTH);
     return;
   }
   // Divergent authoritative final replaces stale streamed text while preserving thoughts, tools, and commentary.

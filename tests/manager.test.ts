@@ -795,7 +795,7 @@ describe('AgentManager', () => {
         yield { type: 'tool', requestId: 't2', phase: 'start', name: 'memory' };
         yield { type: 'tool', requestId: 't2', phase: 'end' };
         yield { type: 'text', text: 'All done.' };
-        yield { type: 'final', text: 'All done.' };
+        yield { type: 'final', text: 'Checking repo...All done.' };
       }
     }
     const manager = new AgentManager([config], 10_000, () => new InterleavedAdapter(config.id));
@@ -870,6 +870,53 @@ describe('AgentManager', () => {
       { kind: 'text', text: 'Authoritative reply' },
     ]);
     await divManager.close();
+
+    // 2b. Final matching only the last segment prefix still drops stale earlier draft text
+    class PartialPrefixDivergentAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Draft A' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'text', text: 'Starting B' };
+        yield { type: 'final', text: 'Starting B with corrections' };
+      }
+    }
+    const prefixManager = new AgentManager([config], 10_000, () => new PartialPrefixDivergentAdapter(config.id));
+    const prefixDone = await prefixManager.wait(prefixManager.start(config.id, 'fix', undefined).id);
+    expect(prefixDone.text).toBe('Starting B with corrections');
+    expect(prefixDone.timeline).toEqual([
+      { kind: 'tool', toolId: prefixDone.tools![0]!.id },
+      { kind: 'text', text: 'Starting B with corrections' },
+    ]);
+    await prefixManager.close();
+
+    // 2c. alreadyStreamed interim commentary strips streamed delta from job.text and reclassifies timeline
+    class AlreadyStreamedInterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Checking ' };
+        yield { type: 'text', text: 'repo...' };
+        yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'text', text: 'All clean.' };
+        yield { type: 'final', text: 'All clean.' };
+      }
+    }
+    const streamedInterimManager = new AgentManager(
+      [config],
+      10_000,
+      () => new AlreadyStreamedInterimAdapter(config.id),
+    );
+    const streamedInterimDone = await streamedInterimManager.wait(
+      streamedInterimManager.start(config.id, 'check', undefined).id,
+    );
+    expect(streamedInterimDone.text).toBe('All clean.');
+    expect(streamedInterimDone.timeline).toEqual([
+      { kind: 'commentary', text: 'Checking repo...' },
+      { kind: 'tool', toolId: streamedInterimDone.tools![0]!.id },
+      { kind: 'text', text: 'All clean.' },
+    ]);
+    await streamedInterimManager.close();
 
     // 3. Interim commentary stays in UI timeline without polluting model-facing job.text
     class InterimAdapter extends FakeAdapter {

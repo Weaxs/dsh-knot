@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { AgentConfig, PluginConfig } from './types.js';
 
@@ -152,6 +153,21 @@ export class LocalOnlyAbortError extends Error {
 
 export function shouldSkipRemoteCancel(signal?: AbortSignal): boolean {
   return Boolean((signal?.reason as { skipRemoteCancel?: boolean } | undefined)?.skipRemoteCancel);
+}
+
+export function normalizeToolCallId(rawId: string): string {
+  return createHash('sha256').update(rawId).digest('hex');
+}
+
+export function stripTrailingText(source: string, suffix: string): string {
+  if (!suffix) return source;
+  if (source.endsWith(suffix)) return source.slice(0, -suffix.length);
+  const trimmedSource = source.trimEnd();
+  const trimmedSuffix = suffix.trim();
+  if (trimmedSuffix && trimmedSource.endsWith(trimmedSuffix)) {
+    return trimmedSource.slice(0, -trimmedSuffix.length);
+  }
+  return source;
 }
 
 export async function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

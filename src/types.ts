@@ -61,6 +61,7 @@ export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
   interim?: boolean;
+  alreadyStreamed?: boolean;
   name?: string;
   title?: string;
   phase?: 'pending' | 'start' | 'end';

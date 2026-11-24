@@ -694,7 +694,14 @@ describe('web UI host routes & schemastery Config', () => {
               mcp: { enabled: false, address: null, allowSessions: [], localSessions: [] },
             });
           }
-          if (path === WEB_ROUTES.sessions) return ok({ sessions: [{ id: 'sess-1', title: 'Live session' }] });
+          if (path === WEB_ROUTES.sessions) {
+            return ok({
+              sessions: [
+                { id: 'sess-1', title: 'Live session' },
+                { id: 'sess-2', title: 'Live session 2' },
+              ],
+            });
+          }
           if (path === WEB_ROUTES.sessionMessages) return ok({ messages: historyMessages });
           if (path === WEB_ROUTES.job) return ok(currentJob);
           return ok({});
@@ -721,6 +728,8 @@ describe('web UI host routes & schemastery Config', () => {
         return renderNode(renderMain!());
       };
 
+      // Case A: While the job is running and history still ends on the previous turn,
+      // live activity (prompt, thought, commentary, tool) stays visible.
       const dashboard = await flush();
       const chatBtn = findButton(dashboard, '对话');
       expect(chatBtn).toBeDefined();
@@ -737,21 +746,86 @@ describe('web UI host routes & schemastery Config', () => {
       expect(liveText).toContain('Checking live state...');
       expect(liveText).toContain('ls -la');
 
-      // Once the job completes and history persists only the final reply + 1st tool (not the commentary or 2nd tool),
-      // already-persisted segments are not duplicated while unpersisted live segments remain visible.
+      // Case B: If the job settles with the SAME prompt and reply as the previous turn
+      // while history row IDs are still unchanged (m1/m2), do NOT hide the newly completed turn!
+      currentJob = {
+        ...currentJob,
+        prompt: 'previous prompt',
+        status: 'completed',
+        updatedAt: 3000,
+        text: 'previous reply',
+        thought: 'second run thought',
+        tools: [{ id: 't-live-2', name: 'terminal', status: 'completed', inputPreview: 'whoami' }],
+        timeline: [
+          { kind: 'thought', text: 'second run thought' },
+          { kind: 'tool', toolId: 't-live-2' },
+          { kind: 'text', text: 'previous reply' },
+        ],
+      };
+      // Trigger poll update in-place by flushing timers (polling interval is 400ms; simulate fast by waiting)
+      await new Promise((r) => setTimeout(r, 450));
+      const unchangedHistoryTree = await flush();
+      const unchangedTexts = collectText(unchangedHistoryTree);
+      expect(unchangedTexts.filter((t) => t === 'previous prompt')).toHaveLength(2);
+      expect(unchangedTexts.filter((t) => t === 'previous reply')).toHaveLength(2);
+      expect(unchangedTexts).toContain('second run thought');
+      expect(unchangedTexts).toContain('whoami');
+
+      // Case C: Open a second session ('sess-2') with a running job containing two same-name `terminal`
+      // calls (A and B) + commentary; when the job completes in-place and history advances to m3/m4
+      // persisting ONLY call B (by normalized ID) + final answer (not commentary or call A), verify:
+      // (1) call A is kept, call B is NOT duplicated, (2) merged turn renders in exact chronological
+      // order: thought -> commentary -> call A -> call B -> final answer!
+      const toolAId = 'a'.repeat(64);
+      const toolBId = 'b'.repeat(64);
+      currentJob = {
+        id: 'job-3',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-2',
+        prompt: 'current prompt',
+        status: 'running',
+        createdAt: 4000,
+        updatedAt: 4000,
+        text: '',
+        thought: 'live turn thought',
+        tools: [{ id: toolAId, name: 'terminal', status: 'running', inputPreview: 'cmd-A' }],
+        timeline: [
+          { kind: 'thought', text: 'live turn thought' },
+          { kind: 'commentary', text: 'Checking live state...' },
+          { kind: 'tool', toolId: toolAId },
+        ],
+      };
+      historyMessages = [
+        { id: 'm1', role: 'user', text: 'older prompt' },
+        { id: 'm2', role: 'assistant', text: 'older reply' },
+      ];
+      // Switch to sess-2 while job-3 is running (captures baseline m1/m2)
+      const backBtn = findButton(unchangedHistoryTree, '助手设置');
+      expect(backBtn).toBeDefined();
+      (backBtn!.props.onClick as () => void)();
+      const backDash = await flush();
+      (findButton(backDash, '对话')!.props.onClick as () => void)();
+      const reopened = await flush();
+      const session2Btn = findButton(reopened, 'Live session 2');
+      expect(session2Btn).toBeDefined();
+      (session2Btn!.props.onClick as () => void)();
+      await flush();
+
+      // Now job-3 completes with both tool A and tool B, and history advances to m3/m4 with only tool B persisted
       currentJob = {
         ...currentJob,
         status: 'completed',
+        updatedAt: 5000,
         text: 'final answer',
         tools: [
-          { id: 't-live', name: 'terminal', status: 'completed', inputPreview: 'ls -la' },
-          { id: 't-extra', name: 'memory', status: 'completed', inputPreview: 'save note' },
+          { id: toolAId, name: 'terminal', status: 'completed', inputPreview: 'cmd-A' },
+          { id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B' },
         ],
         timeline: [
           { kind: 'thought', text: 'live turn thought' },
           { kind: 'commentary', text: 'Checking live state...' },
-          { kind: 'tool', toolId: 't-live' },
-          { kind: 'tool', toolId: 't-extra' },
+          { kind: 'tool', toolId: toolAId },
+          { kind: 'tool', toolId: toolBId },
           { kind: 'text', text: 'final answer' },
         ],
       };
@@ -763,24 +837,29 @@ describe('web UI host routes & schemastery Config', () => {
           role: 'assistant',
           text: 'final answer',
           thought: 'live turn thought',
-          tools: [{ id: 't-live', name: 'terminal', status: 'completed', inputPreview: 'ls -la' }],
+          tools: [{ id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B' }],
         },
       ];
-      // Re-open session to load the updated history and completed job
-      const backBtn = findButton(liveTree, '助手设置');
-      expect(backBtn).toBeDefined();
-      (backBtn!.props.onClick as () => void)();
-      const backDash = await flush();
-      (findButton(backDash, '对话')!.props.onClick as () => void)();
-      const reopened = await flush();
-      (findButton(reopened, 'Live session')!.props.onClick as () => void)();
+      await new Promise((r) => setTimeout(r, 450));
       const settledTree = await flush();
       const settledTexts = collectText(settledTree);
+      expect(settledTexts.filter((t) => t === 'current prompt')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'final answer')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'live turn thought')).toHaveLength(1);
-      expect(settledTexts.filter((t) => t === 'ls -la')).toHaveLength(1);
-      expect(settledTexts).toContain('Checking live state...');
-      expect(settledTexts).toContain('save note');
+      expect(settledTexts.filter((t) => t === 'cmd-A')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'cmd-B')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'Checking live state...')).toHaveLength(1);
+      // Assert strict chronological rendering order inside the merged turn
+      const idxThought = settledTexts.indexOf('live turn thought');
+      const idxCommentary = settledTexts.indexOf('Checking live state...');
+      const idxCmdA = settledTexts.indexOf('cmd-A');
+      const idxCmdB = settledTexts.indexOf('cmd-B');
+      const idxFinal = settledTexts.indexOf('final answer');
+      expect(idxThought).toBeGreaterThan(-1);
+      expect(idxThought).toBeLessThan(idxCommentary);
+      expect(idxCommentary).toBeLessThan(idxCmdA);
+      expect(idxCmdA).toBeLessThan(idxCmdB);
+      expect(idxCmdB).toBeLessThan(idxFinal);
 
       for (const cleanup of cleanups) cleanup();
       await fiber.dispose();

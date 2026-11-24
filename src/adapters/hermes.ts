@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { raceAbort, secret, shouldSkipRemoteCancel } from '../config.js';
+import { normalizeToolCallId, raceAbort, secret, shouldSkipRemoteCancel, stripTrailingText } from '../config.js';
 import { toolInputPreview } from '../policy/redact.js';
 import { transportFor } from '../transports/http.js';
 import type {
@@ -205,9 +205,14 @@ export class HermesAdapter implements AgentAdapter {
         }
         if (type === 'message.interim') {
           // Mid-turn commentary belongs in the UI timeline only; keep `output` aligned with the final reply.
-          if (event.already_streamed !== true) {
-            const interim = textOf(event.text ?? event.content ?? event.delta);
-            if (interim) yield { type: 'text', text: interim, interim: true };
+          const interim = textOf(event.text ?? event.content ?? event.delta);
+          if (event.already_streamed === true) {
+            if (interim) {
+              output = stripTrailingText(output, interim);
+              yield { type: 'text', text: interim, interim: true, alreadyStreamed: true };
+            }
+          } else if (interim) {
+            yield { type: 'text', text: interim, interim: true };
           }
           continue;
         }
@@ -469,7 +474,9 @@ function transcriptTools(rawToolCalls: unknown, rowIndex: number, token?: string
     const rawArgs = fn?.arguments ?? item.arguments ?? item.input;
     const parsedArgs = parseToolArguments(rawArgs);
     const inputPreview = toolInputPreview(parsedArgs, token);
-    const callId = firstNonEmptyString(item.id, item.tool_call_id) || `row:${rowIndex}:tool:${i}`;
+    const rawCallId = firstNonEmptyString(item.id, item.tool_call_id);
+    // Match AgentManager's SHA-256 live tool call ID normalization so history and live calls deduplicate by identity.
+    const callId = rawCallId ? normalizeToolCallId(rawCallId) : `row:${rowIndex}:tool:${i}`;
     tools.push({
       id: callId,
       name,

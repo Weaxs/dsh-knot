@@ -163,6 +163,7 @@ Task steps:
          - Otherwise, pause and ask me to enter the secret directly in **Remote Agents → + Add Agent / Edit** (saved to `$DSH_HOME/knot/agents.json` with `0600` permissions), referencing `credential_reference` so I know which secret to copy.
      - **Env-only declarative config path (optional)**:
        - If I prefer not to store the token in `$DSH_HOME/knot/agents.json`, configure the agent declaratively in plugin settings with `tokenEnv` (for example `tokenEnv: HERMES_API_KEY`) and omit `token`, ensure that env var is present in the running `dsh` process environment, and reload/restart `dsh` for the declarative config to take effect (do not overwrite it with an empty-token save through Remote Agents).
+       - **Important when switching an existing `agent_id` to `tokenEnv`**: entries already stored in `$DSH_HOME/knot/agents.json` (`agents`) override declarative plugin config entries with the same ID on reload, and previously deleted IDs (`deletedIds`) suppress them. To move an existing gateway ID to declarative `tokenEnv`, either choose a fresh `agent_id`, or remove the matching entry from `agents` and `deletedIds` in `$DSH_HOME/knot/agents.json` before reloading `dsh`.
    - Save or update the agent in **Remote Agents** (using the active `dsh` instance's Remote Agents state/API so it appears immediately in the **Remote Agents / 远端助手** panel, unless using the declarative `tokenEnv` path above).
 
 5. Run connection diagnostics:
