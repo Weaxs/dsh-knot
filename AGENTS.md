@@ -1,113 +1,39 @@
-# dsh-knot — Agent Guidelines
-
-Read this file and the relevant design doc before changing code.
-
-## Single sources of truth
-
-Read the authoritative doc before modifying its subsystem; keep docs minimal with pointers instead of duplicating rules:
-
-- Architecture, protocol contracts, and security boundaries: [docs/DESIGN.md](docs/DESIGN.md)
-- Real model-backed 18-job E2E matrix and required secrets: [docs/E2E.md](docs/E2E.md)
-- Installation, configuration, tools, MCP, and release usage: [README.md](README.md)
-
-## Architecture & ownership
-
-`dsh-knot` connects DeepSeek Harness (dsh) with Hermes, OpenClaw, and remote dsh instances via ACP v1 or native gateway interfaces, and exports allow-listed local dsh sessions over a read-only MCP listener.
-
-Keep module boundaries strict — never mix protocol logic into transports or transport branches into adapters:
-
-- `src/adapters/` — gateway protocols and event normalization (`acp.ts` is the single ACP v1 provider; `hermes.ts`, `openclaw.ts`, `openclaw-identity.ts`, `dsh.ts`, `sse.ts`, `gateway-ws.ts` are native drivers).
-- `src/transports/` — HTTP connectivity and request lifecycles (`http.ts`).
-- `src/manager.ts` — local jobs, bounded output, timeouts, cancellation, and completion notifications.
-- `src/tools.ts` — model-facing dsh tool contract.
-- `src/acp/` — reusable ACP v1 bridge and CLI (`bridge.ts`, `cli.ts`); native adapters stay behind this boundary.
-- `src/mcp/` — separate read-only MCP listener (`server.ts`, `session-service.ts`).
-- `src/policy/` — recursive redaction and constant-time bearer verification (`redact.ts`, `auth.ts`).
-- `src/version.ts` — single runtime version constant synced with `package.json` by `scripts/sync-version.mjs`.
-
-Prefer the shared ACP provider for compatible platforms; a new native-only platform gets a native adapter behind the bridge, and a new network path gets a new transport.
+# dsh-knot agent guide
 
 ## Workflow
 
-1. **Scope & read first**: Read the relevant design doc, source module, and existing tests before editing. Do not guess dsh runtime APIs — verify `sessionController` (`list`, `events`, `follow`) and `defineTool` signatures against the installed `@deepseek-ai/*` types.
-2. **Smallest surgical change**: Write the minimal change that fully solves the problem. Avoid over-engineering, zero-value wrappers, and code duplication. Delete dead code and obsolete tests instead of keeping fallbacks.
-3. **Verify before reporting**: Run the narrowest targeted test first, then run the full quality gate before committing. Never claim a mock test proves live gateway compatibility.
+1. **Scope.** Read the applicable references before editing or reviewing. For code, trace the existing entry point and its tests so you know which contracts the diff touches.
+2. **Change.** Make the smallest change that fixes the behavior at its owning layer. Reuse existing helpers and tests. Update affected callers, tests, and user documentation when a public contract changes.
+3. **Verify.** For code, start with the narrowest check (`npx vitest run tests/<file>.test.ts -t '<case>'`) and exercise the affected entry point and failure paths. For docs, verify the changed links, commands, and claims against their sources. Review your full diff, fix confirmed issues in scope, then rerun affected checks and review the updated diff until no actionable issue remains. Report any blocked check.
 
-## Invariants
+## Read by task
 
-1. **No relays**: Never introduce a hosted relay, cloud broker, or mandatory remote plugin without an explicit user request.
-2. **Deny-by-default MCP**: Only explicitly allow-listed dsh sessions are exposed; an empty `allowSessions` shares nothing. Check allow-list before reading session data.
-3. **Read-only MCP**: MCP remains read-only until a separate write-token, per-session write permission, origin marker, and loop-prevention design is implemented.
-4. **Fail closed & loopback/tailnet only**: MCP fails closed without a bearer token and refuses `0.0.0.0` / `::`. Non-loopback ACP bridges require `DSH_KNOT_ACP_TOKEN`. Compare bearer tokens in constant time (`verifyBearerToken`).
-5. **No secret leakage**: Tokens, cookies, private keys, full remote configs, and session contents are never logged. Redact recursively (with circular-reference protection) before returning MCP payloads.
-6. **Honest errors & approvals**: Surface gateway failures as structured errors; never fabricate success or hide partial output. Surface remote approvals to the user; never auto-approve.
-7. **Normalized events**: Adapter-specific payloads stop at `src/adapters/`. Tools and jobs consume normalized `AgentEvent` only.
-8. **Package parity**: `@weaxs/dsh-knot` and `dsh-knot` carry identical behavior; `cordis.patch.yml` must name the package being published.
+- For **protocol, transport, job, or MCP changes**, read the matching sections of [DESIGN.md](docs/DESIGN.md). Adapters own protocol messages and emit normalized `AgentEvent`s. Transports own connectivity. Use the shared ACP v1 provider for compatible endpoints. The ACP bridge reuses native adapters through normalized events.
+- For **protocol verification**, exercise the affected transport. Use the [OpenClaw WebSocket tests](tests/gateway-ws.test.ts) for OpenClaw wire changes. Exercise both WebSocket and stdio in the [ACP tests](tests/acp.test.ts) when the change affects both.
+- For **dsh host integration**, start with the [plugin entry](src/index.ts) and the affected host call, such as [model tool registration](src/tools.ts). Verify changed calls against installed `@deepseek-ai/*` types or matching host source, including `defineTool` and `sessionController` methods `list`, `events`, and `follow` as applicable.
+- For **native DSH authentication changes**, read the [native RPC contract](docs/DESIGN.md#remote-dsh). Exercise the launch-token exchange and the retry after a rejected API cookie.
+- For **Remote Agents UI**, read the [dashboard behavior](README.md#web-ui-dashboard), then trace the affected operation through the [client](src/client/index.ts) and [Web routes](src/web/routes.ts). Use the [job and transcript semantics](docs/DESIGN.md#jobs-and-model-tools) for chat state changes. Start with the [UI and route tests](tests/web-routes.test.ts) and exercise the changed interaction in `dsh web` when available.
+- For **installation**, read the [install guide](README.md#install). For **configuration**, use the guide for [remote agents](README.md#quick-start) or [MCP sharing](README.md#reverse-read-only-mcp-sharing). For **two-agent setup**, use the [two-prompt setup guide](docs/TWO_PROMPT_SETUP.md).
+- For **E2E workflow or harness changes** and **live gateway validation**, read [E2E.md](docs/E2E.md) for the model-backed matrix, credential requirements, and pass criteria. During live validation, verify model output and same-session continuation. Report which live cases ran and which were skipped.
+- For **packaging or release**, read [Development & Release](README.md#development--release) and the [release workflow](.github/workflows/release.yml).
 
-## dsh integration rules
+## Code conventions
 
-- Register tools via `defineTool` from `@deepseek-ai/dsh-tools`. Keep names `agent_list`, `agent_ask`, `agent_continue`, `agent_status`, `agent_cancel`, `agent_respond`, and `knot_doctor` unless a deliberate migration is designed.
-- Keep tool output JSON-serializable and rendered as a single text block containing that JSON.
-- Forward `exec.signal` into all network calls, waits, doctor checks, and remote cancellations.
-- Call `Agent.followup()` only when present; notification failures must never fail a remote job.
-- Register teardown via `ctx.effect()` to close MCP listeners, sockets, WebSockets, child processes, and abort active job controllers on unload.
-- Keep `@deepseek-ai/*` as `peerDependencies`; never bundle a second dsh runtime.
+- Use English for code, comments, test descriptions, documentation, commits, and PRs. Keep translated UI strings in their target language.
+- Follow the TypeScript settings and explicit `.js` import convention. Add dependencies only when they remove substantial protocol or security complexity. Reserve comments for protocol and lifecycle behavior that needs explanation.
 
-## Coding, memory & performance standards
+## Guardrails
 
-- English only for code, tests, docs, commits, and PRs.
-- TypeScript strict mode, ESM, `NodeNext` resolution, explicit `.js` import extensions.
-- Prefer Node.js standard library; add dependencies only when they remove substantial protocol or security complexity.
-- Comments explain non-obvious protocol invariants or lifecycle hazards only; remove narration that repeats the code.
-- **Long-running hygiene**: Strictly prevent memory leaks, dangling listeners, and unbounded state growth:
-  - Bound all in-memory maps/queues/buffers (`jobs`, `runs`, `cursors`, `sessionIds`, response/SSE/batch sizes) and evict finished entries.
-  - Always `removeEventListener('abort', ...)` and `clearTimeout(...)` in `finally` blocks.
-  - Always `destroy()` HTTP streams and `kill()` child processes in `finally` / `close()`.
-  - Do not silently swallow errors except during best-effort cleanup or notification delivery (comment that boundary explicitly).
+- Keep connections direct and private. A relay, cloud broker, or mandatory remote plugin requires an explicit request. Preserve [credential transport](docs/DESIGN.md#transports) and [ACP bridge authentication](docs/DESIGN.md#acp-v1-provider-and-bridge).
+- Keep MCP on a [separate, read-only listener](docs/DESIGN.md#reverse-mcp-endpoint). Fail closed on a missing bearer token, reject wildcard binds, and check the session allow-list before reading data. An empty list shares nothing. Use `verifyBearerToken` for constant-time comparison. Redact MCP payloads recursively before returning them, with circular-reference protection. Keep credentials, full remote configs, and session contents out of logs.
+- Surface structured gateway errors, partial output, and approval requests. Wait for the user's decision on remote approvals and scope pending permissions by session. Use documented fallbacks for the failures they cover. Limit ignored errors to best-effort cleanup and notification delivery, and explain those exceptions at the error handler.
+- Register dsh tools with `defineTool`. Preserve tool names and the single JSON text block unless changing the public contract deliberately. Forward `exec.signal` to tool-initiated network calls, waits, diagnostics, and cancellation. Keep `Agent.followup()` optional and best-effort. Use `ctx.effect()` to abort active jobs and release plugin resources on unload. Keep dsh host dependencies as peers.
+- Bound retained jobs, runs, cursors, session maps, queues, and payloads. Evict finished entries. Use `finally` to remove abort listeners, clear timers, and destroy HTTP streams owned by the operation. Close shared sockets and stop child processes during teardown.
+- When an `AsyncQueue.next()` read loses a `Promise.race`, abort it through its signal or reuse the pending read. Decode split UTF-8 with `StringDecoder` or concatenate bytes before decoding. Attach an error handler to HTTP error responses. Yield fallback events after the loop inside `try`. Reserve `finally` for cleanup.
+- Cancel the local job. If it owns a remote turn, request a stop for that turn and preserve any stream needed for terminal confirmation. Keep unconfirmed stops distinct from confirmed stops, and prevent late completion or retry from overwriting cancellation or stopping a newer turn.
 
-## Known pitfalls & durable lessons
+## Before commit or release
 
-Check every change against these recurring failure modes:
-
-- **`Promise.race` + `AsyncQueue` waiter leaks**: Never call `queue.next()` inside a `Promise.race` loop without an `AbortSignal` cleanup or reusing the pending promise — abandoned waiters silently steal subsequent events from the queue.
-- **Multi-byte UTF-8 chunk splitting**: Never call `chunk.toString('utf8')` per TCP chunk on streaming text (SSE, HTTP bodies, stderr). Use `StringDecoder('utf8')` or `Buffer.concat`.
-- **HTTP stream errors**: Always attach `response.on('error', reject)` on HTTP error-status streams.
-- **Cancel vs. completion races**: `manager.cancel()` must abort the job's local `AbortController` as well as calling `adapter.cancel()`, and `run()` must not overwrite `'cancelled'` back to `'completed'` or `'failed'`.
-- **Yielding in `finally`**: Avoid `yield` inside `finally` blocks of async generators; run stream-end fallbacks after the `for await` loop inside `try` so real stream errors are not masked.
-- **Cross-session permission isolation**: Scope pending approval/permission maps by `sessionId` so cancelling one session never cancels another session's approval.
-- **Release YAML quote drift**: When rewriting `cordis.patch.yml` in `.github/workflows/release.yml`, verify against the actual quote style used in `cordis.patch.yml` and keep `src/version.ts` synced with `package.json`.
-
-## Verification gates
-
-Run the narrowest relevant test first:
-
-```bash
-npx vitest run tests/<name>.test.ts -t "<case>"
-```
-
-Before every commit:
-
-```bash
-npm run lint
-npm run typecheck
-npm test
-npm run build
-```
-
-Before a release or substantial change:
-
-```bash
-npm run check
-```
-
-Behavioral test requirements:
-
-- Cover behavior, not just types. Exercise Hermes runs, SSE, fallback, cancellation, and approvals. Check OpenClaw handshake, RPC, and continuation over real WebSocket, DSH native RPC and cookie refresh, and ACP WebSocket and stdio prompt, continuation, tool, permission, and cancel flows. Cover diagnostics, MCP authentication, allow-listing, redaction, read, watch, and limits, plugin entry, tools, and job lifecycle.
-- Real model-backed E2E lives in `.github/e2e/` and `.github/workflows/e2e.yml` (18-job matrix). Never replace real services with mocks, silently skip missing credentials, or treat `/health` as E2E.
-
-## Commit & release hygiene
-
-- Stage only intentional files (never blanket `git add -A`); review the full diff before committing.
-- Never commit `dist/`, `node_modules/`, `coverage/`, tarballs, `.tmp/`, credentials, device keys, or `.env` files.
-- Releases are tag-triggered (`v<semver>`) via GitHub Actions with `secrets.NPM_TOKEN`; never publish from a workstation.
-- Report unit test results, build results, live-host validation limits, and any remaining protocol assumptions separately.
+- Run `npm run check` for substantial changes and releases. For other commits, run `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`. Stage only reviewed files and exclude generated output, temporary files, and credentials.
+- Publish through GitHub Actions. Keep both npm packages behaviorally identical. When changing packaging, verify the package identity in each packed Cordis patch and client bundle. Verify tag, package, and runtime version alignment before releasing.
+- Report unit and protocol tests, build, live-host validation, and remaining protocol assumptions separately. Count only model-backed runs through real gateways as live E2E.
