@@ -1159,6 +1159,7 @@ describe('web UI host routes & schemastery Config', () => {
     let localJobSubmitted = false;
     let fixtureAgentKind: AgentConfig['kind'] = 'hermes';
     let localReleaseRequests = 0;
+    let confirmedStopJobReads = 0;
     const settledJobs: Array<typeof currentJob> = [];
     const transcriptBySession = new Map<string, AgentTranscriptMessage[]>([
       [
@@ -1229,6 +1230,7 @@ describe('web UI host routes & schemastery Config', () => {
                 { id: 'sess-4', title: 'Live session 4' },
                 { id: 'sess-5', title: 'Live session 5' },
                 { id: 'sess-release', title: 'Unconfirmed ACP session' },
+                { id: 'sess-stop', title: 'Externally stopped ACP session' },
               ],
             });
           }
@@ -1246,13 +1248,14 @@ describe('web UI host routes & schemastery Config', () => {
           }
           if (path === WEB_ROUTES.job) {
             const jobId = requestField(init, 'jobId');
+            if (jobId === 'confirmed-stop-job') confirmedStopJobReads++;
             if (jobId === localJob?.id) return ok(localJob);
             if (jobId === currentJob.id) return ok(currentJob);
             throw new Error(`Unexpected job ${jobId}`);
           }
           if (path === WEB_ROUTES.cancel) {
-            expect(JSON.parse(String(init?.body))).toEqual({ jobId: currentJob.id, releaseUnconfirmed: true });
             localReleaseRequests++;
+            expect(JSON.parse(String(init?.body))).toEqual({ jobId: currentJob.id, releaseUnconfirmed: true });
             currentJob = { ...currentJob, remoteStop: 'unconfirmed-released', updatedAt: currentJob.updatedAt + 1 };
             return ok(currentJob);
           }
@@ -1778,6 +1781,32 @@ describe('web UI host routes & schemastery Config', () => {
       expect(findButton(released, '停止')).toBeUndefined();
       expect(findButton(released, '释放本地会话')).toBeUndefined();
       expect(sendButton(released)?.props.disabled).toBe(false);
+
+      currentJob = {
+        ...currentJob,
+        id: 'confirmed-stop-job',
+        sessionId: 'sess-stop',
+        remoteStop: 'unconfirmed',
+        updatedAt: currentJob.updatedAt + 1,
+      };
+      (findButton(await flush(), 'Externally stopped ACP session')!.props.onClick as () => void)();
+      const externalUnconfirmed = await flush();
+      const externalInput = findNode(externalUnconfirmed, (vnode) => vnode.type === 'textarea')!;
+      (externalInput.props.onInput as (event: { target: { value: string } }) => void)({
+        target: { value: 'Next prompt after confirmation' },
+      });
+      const externalWithInput = await flush();
+      expect(collectText(externalWithInput)).toContain('尚未确认远端任务已停止');
+      expect(sendButton(externalWithInput)?.props.disabled).toBe(true);
+      currentJob = { ...currentJob, remoteStop: undefined, updatedAt: currentJob.updatedAt + 1 };
+      const confirmed = await flush();
+      expect(collectText(confirmed)).toContain('已停止');
+      expect(collectText(confirmed)).not.toContain('尚未确认远端任务已停止');
+      expect(findButton(confirmed, '释放本地会话')).toBeUndefined();
+      expect(findButton(confirmed, 'Externally stopped ACP session')?.props['aria-current']).toBe('true');
+      expect(sendButton(confirmed)?.props.disabled).toBe(false);
+      expect(confirmedStopJobReads).toBe(0);
+      expect(localReleaseRequests).toBe(1);
     } finally {
       try {
         try {

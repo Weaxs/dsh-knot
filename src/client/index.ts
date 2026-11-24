@@ -1479,8 +1479,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
 
     React.useEffect(() => {
       if (activeJob?.remoteStop !== 'unconfirmed') return;
-      const released = jobs.find((job) => job.id === activeJob.id && job.remoteStop === 'unconfirmed-released');
-      if (released) applyProgress(released, released.id === ownActiveId);
+      const settled = jobs.find((job) => job.id === activeJob.id && !isRunning(job));
+      if (settled) applyProgress(settled, settled.id === ownActiveId);
     }, [activeJob, jobs, ownActiveId, applyProgress]);
 
     React.useEffect(() => {
