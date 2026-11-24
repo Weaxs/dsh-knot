@@ -165,7 +165,7 @@ function plain(value: unknown): any {
   return JSON.parse(JSON.stringify(value));
 }
 
-function modelJob({ thought: _thought, tools, ...job }: AgentJob): AgentJob {
+function modelJob({ thought: _thought, timeline: _timeline, tools, ...job }: AgentJob): AgentJob {
   return { ...job, ...(tools ? { tools: tools.map(({ id, name, status }) => ({ id, name, status })) } : {}) };
 }
 

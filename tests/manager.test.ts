@@ -781,4 +781,51 @@ describe('AgentManager', () => {
     await rmManager.wait(rmJob.id);
     await dshManager.close();
   });
+
+  it('preserves chronological timeline interleaving across thoughts, tools, and text', async () => {
+    class InterleavedAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'thought', text: 'Step 1 ' };
+        yield { type: 'thought', text: 'plan.' };
+        yield { type: 'text', text: 'Checking ' };
+        yield { type: 'text', text: 'repo...' };
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal', inputPreview: 'git status' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'thought', text: 'Step 2 plan.' };
+        yield { type: 'tool', requestId: 't2', phase: 'start', name: 'memory' };
+        yield { type: 'tool', requestId: 't2', phase: 'end' };
+        yield { type: 'text', text: 'All done.' };
+        yield { type: 'final', text: 'All done.' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new InterleavedAdapter(config.id));
+    const job = manager.start(config.id, 'sync', undefined);
+    const done = await manager.wait(job.id);
+    expect(done.tools).toHaveLength(2);
+    expect(done.timeline).toEqual([
+      { kind: 'thought', text: 'Step 1 plan.' },
+      { kind: 'text', text: 'Checking repo...' },
+      { kind: 'tool', toolId: done.tools![0]!.id },
+      { kind: 'thought', text: 'Step 2 plan.' },
+      { kind: 'tool', toolId: done.tools![1]!.id },
+      { kind: 'text', text: 'All done.' },
+    ]);
+    await manager.close();
+
+    // Non-streamed final reply still lands after earlier tools in the timeline
+    class FinalAfterToolAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'tool', requestId: 't1', phase: 'start', name: 'terminal' };
+        yield { type: 'tool', requestId: 't1', phase: 'end' };
+        yield { type: 'final', text: 'Final summary' };
+      }
+    }
+    const finalManager = new AgentManager([config], 10_000, () => new FinalAfterToolAdapter(config.id));
+    const finalDone = await finalManager.wait(finalManager.start(config.id, 'run', undefined).id);
+    expect(finalDone.timeline).toEqual([
+      { kind: 'tool', toolId: finalDone.tools![0]!.id },
+      { kind: 'text', text: 'Final summary' },
+    ]);
+    await finalManager.close();
+  });
 });

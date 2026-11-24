@@ -86,6 +86,19 @@ interface AgentFormState {
 
 type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
 
+interface ToolActivitySummary {
+  id: string;
+  name: string;
+  title?: string;
+  status: ToolStatus;
+  inputPreview?: string;
+}
+
+type TimelineEntry =
+  | { kind: 'thought'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; toolId: string };
+
 interface JobSummary {
   id: string;
   agentId: string;
@@ -99,7 +112,8 @@ interface JobSummary {
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };
-  tools?: Array<{ id: string; name: string; title?: string; status: ToolStatus; inputPreview?: string }>;
+  tools?: ToolActivitySummary[];
+  timeline?: TimelineEntry[];
 }
 
 interface LocalSessionSummary {
@@ -138,6 +152,8 @@ interface TranscriptMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  thought?: string;
+  tools?: ToolActivitySummary[];
 }
 
 const NS = 'dsh-knot';
@@ -147,6 +163,11 @@ const STYLE_ID = 'dsh-knot-client-styles';
 const DICTS: Record<string, Record<string, string>> = {
   'zh-CN': {
     title: '远端助手',
+    subtitle: '直连远端 Hermes、OpenClaw、DSH 与 ACP 网关，无需云端中转。',
+    replyTag: '回复',
+    liveTag: '运行中',
+    youTag: '你',
+    localNode: '本机 dsh',
     checkAll: '检测全部连接',
     checking: '检测中…',
     refresh: '刷新',
@@ -215,7 +236,8 @@ const DICTS: Record<string, Record<string, string>> = {
     chatHeading: '对话',
     chatNewSession: '新建对话',
     chatEmpty: '发条消息开始对话，或从历史中选择一个会话。',
-    chatPlaceholder: '输入消息，按 Enter 发送（Shift+Enter 换行）…',
+    chatPlaceholder: '给远端助手发消息…',
+    chatComposerHint: 'Enter 发送 · Shift+Enter 换行',
     chatSend: '发送',
     chatSending: '发送中…',
     chatFailed: '执行失败',
@@ -237,6 +259,9 @@ const DICTS: Record<string, Record<string, string>> = {
     chatHistoryUnavailable: '该网关未提供历史消息读取',
     chatJobError: '无法读取任务进度',
     chatCopyError: '无法复制续聊指令',
+    copiedShort: '已复制',
+    closeBtn: '关闭',
+    diagHeading: '连接诊断',
     shareHeading: '共享给远端的本地对话',
     shareSub: '独立只读 MCP 端口 · 默认拒绝 · 自动脱敏',
     mcpDisabled: '只读 MCP 尚未开启（可在插件设置中启用 mcp.enabled）',
@@ -248,6 +273,11 @@ const DICTS: Record<string, Record<string, string>> = {
   },
   en: {
     title: 'Remote Agents',
+    subtitle: 'Direct links to Hermes, OpenClaw, remote dsh, and ACP gateways — no cloud relay.',
+    replyTag: 'REPLY',
+    liveTag: 'LIVE',
+    youTag: 'YOU',
+    localNode: 'local dsh',
     checkAll: 'Test all connections',
     checking: 'Testing…',
     refresh: 'Refresh',
@@ -318,7 +348,8 @@ const DICTS: Record<string, Record<string, string>> = {
     chatHeading: 'Chat',
     chatNewSession: 'New chat',
     chatEmpty: 'Send a message to start a conversation, or select one from history.',
-    chatPlaceholder: 'Message remote agent… (Enter to send, Shift+Enter for newline)',
+    chatPlaceholder: 'Message remote agent…',
+    chatComposerHint: 'Enter to send · Shift+Enter for newline',
     chatSend: 'Send',
     chatSending: 'Sending…',
     chatFailed: 'Failed',
@@ -340,6 +371,9 @@ const DICTS: Record<string, Record<string, string>> = {
     chatHistoryUnavailable: 'This gateway does not support reading past messages',
     chatJobError: 'Could not load job progress',
     chatCopyError: 'Could not copy the continuation prompt',
+    copiedShort: 'Copied',
+    closeBtn: 'Close',
+    diagHeading: 'Diagnostics',
     shareHeading: 'Local Chats Shared with Remote',
     shareSub: 'Separate read-only MCP · Deny-by-default · Auto-redacted',
     mcpDisabled: 'Read-only MCP is disabled (enable mcp.enabled in plugin settings)',
@@ -354,73 +388,469 @@ const DICTS: Record<string, Record<string, string>> = {
 const CSS = `
 .dk-sidebar-icon { color: #695777; }
 body[data-ds-dark-theme] .dk-sidebar-icon { color: #b6a1c4; }
-.dk-root { padding: 16px 20px; height: 100%; overflow-y: auto; box-sizing: border-box; background: var(--dsw-static-neutral-bluish-75, var(--dsw-alias-bg-layer-0, #f5f6f8)); color: var(--dsw-alias-label-primary, #111827); font-size: 13px; }
-body[data-ds-dark-theme] .dk-root { background: var(--dsw-alias-bg-layer-0, #0e1015); color: var(--dsw-alias-label-primary, #eef1f6); }
-.dk-wrap { max-width: 1240px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
-.dk-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
-.dk-header-left, .dk-header-right { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.dk-title { font-size: 16px; font-weight: 600; margin: 0 4px 0 0; }
-.dk-capsule { display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border-radius: 999px; font-size: 12px; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.1)); color: var(--dsw-alias-label-secondary, #52525b); cursor: pointer; }
-.dk-capsule:hover { color: var(--dsw-alias-label-primary, #111827); }
-.dk-capsule-static { cursor: default; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dk-card { background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
-.dk-card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 10px; margin-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.07)); }
-.dk-card-title { font-size: 13.5px; font-weight: 600; }
-.dk-muted { font-size: 12px; color: var(--dsw-alias-label-secondary, #6b7280); }
-.dk-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dk-row1 { display: grid; grid-template-columns: 5fr 7fr; gap: 14px; }
-.dk-kpis { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.dk-kpi { text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 14px 10px; }
-.dk-kpi-num { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 4px 0 2px; }
-.dk-agents-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.dk-subbox { background: var(--dsw-alias-bg-layer-2, #f8f9fb); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); border-radius: 10px; padding: 12px; }
-.dk-warnbox { background: color-mix(in srgb, #f59e0b 9%, var(--dsw-alias-bg-layer-2, #f8f9fb)); border: 1px solid color-mix(in srgb, #f59e0b 35%, var(--dsw-alias-border-l2, rgba(0,0,0,0.1))); border-radius: 10px; padding: 12px; }
-.dk-btn { border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); background: var(--dsw-alias-bg-layer-1, #ffffff); color: inherit; border-radius: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
-.dk-btn-primary { background: var(--dsw-alias-label-primary, #111827); color: var(--dsw-alias-bg-layer-1, #ffffff); border-color: transparent; font-weight: 500; }
-.dk-btn-danger { color: #dc2626; border-color: transparent; background: transparent; }
-.dk-btn-link { border: 0; background: transparent; color: var(--dsw-alias-brand-primary, #2563eb); padding: 2px 4px; font-size: 12px; font-weight: 500; cursor: pointer; }
-.dk-pill-ok { background: color-mix(in srgb, #16a34a 14%, transparent); color: #15803d; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 500; }
-.dk-pill-err { background: color-mix(in srgb, #dc2626 14%, transparent); color: #dc2626; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 500; }
-.dk-pill-off { background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); color: var(--dsw-alias-label-secondary, #6b7280); padding: 2px 8px; border-radius: 999px; font-size: 11.5px; }
-.dk-errbox { background: color-mix(in srgb, #dc2626 8%, var(--dsw-alias-bg-layer-2, #f8f9fb)); border: 1px solid color-mix(in srgb, #dc2626 32%, var(--dsw-alias-border-l2, rgba(0,0,0,0.1))); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
-.dk-pre { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.08)); font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
-.dk-input { padding: 5px 10px; border-radius: 8px; font-size: 12px; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); background: var(--dsw-alias-bg-layer-2, #f8f9fb); color: inherit; outline: none; }
-.dk-textarea { width: 100%; box-sizing: border-box; min-height: 64px; max-height: 180px; resize: vertical; padding: 8px 10px; border-radius: 8px; font-size: 12.5px; font-family: inherit; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); background: var(--dsw-alias-bg-layer-2, #f8f9fb); color: inherit; outline: none; }
-.dk-chat-page { display: grid; grid-template-columns: minmax(150px, 235px) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 12px 20px; overflow: hidden; }
-.dk-chat-header { grid-column: 1 / -1; padding-bottom: 12px; border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.1)); }
-.dk-chat-sessions { min-height: 0; overflow-y: auto; padding-right: 12px; border-right: 1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.1)); }
-.dk-chat-sessions h2 { font-size: 13px; margin: 4px 0 12px; }
-.dk-chat-sessions input { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
-.dk-chat-session { display: block; width: 100%; text-align: left; padding: 8px; margin: 2px 0; border: 0; background: transparent; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dk-chat-session:hover, .dk-chat-session[aria-current] { background: var(--dsw-alias-bg-layer-2, #e8eaf0); }
-.dk-chat-thread { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
-.dk-chat-thread-header { padding-bottom: 8px; }
-.dk-chat-thread-header h2 { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
-.dk-chat-log { min-height: 0; overflow-y: auto; }
-.dk-chat-messages { display: flex; flex-direction: column; gap: 16px; max-width: 760px; margin-inline: auto; padding: 16px 8px 20px; box-sizing: border-box; }
-.dk-chat-user { align-self: flex-end; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
-.dk-chat-turn { display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow-wrap: anywhere; }
-.dk-chat-activity { color: var(--dsw-alias-label-secondary, #6b7280); font-size: 12px; }
-.dk-chat-activity summary { cursor: pointer; }
-.dk-chat-thought { padding-inline-start: 12px; margin: 6px 0 0 4px; border-inline-start: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); }
-.dk-chat-activity ul { list-style: none; margin: 6px 0 0 15px; padding: 0; }
-.dk-chat-activity li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 4px 12px; padding-block: 3px; }
-.dk-chat-activity-name { color: var(--dsw-alias-label-primary, #111827); }
-.dk-chat-activity-input { grid-column: 1 / -1; min-width: 0; }
-.dk-chat-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
-.dk-chat-form { width: min(100%, 760px); box-sizing: border-box; margin-inline: auto; padding-top: 10px; }
-.dk-chat-composer { display: flex; gap: 8px; align-items: end; }
-.dk-chat-composer textarea { flex: 1; min-width: 0; }
-.dk-chat-composer button { flex-shrink: 0; }
-.dk-toast { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 9999; padding: 7px 14px; border-radius: 999px; font-size: 12px; background: var(--dsw-alias-label-primary, #111827); color: var(--dsw-alias-bg-layer-1, #ffffff); box-shadow: 0 4px 16px rgba(0,0,0,0.2); }
-.dk-modal-bg { position: fixed; inset: 0; z-index: 9990; background: rgba(0,0,0,0.38); display: flex; align-items: center; justify-content: center; padding: 16px; }
-.dk-modal { width: 100%; max-width: 540px; max-height: 90vh; overflow-y: auto; background: var(--dsw-alias-bg-layer-1, #ffffff); border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12)); border-radius: 14px; padding: 18px 20px; box-shadow: 0 12px 36px rgba(0,0,0,0.22); display: flex; flex-direction: column; gap: 12px; }
-.dk-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+
+.dk-root {
+  --dk-canvas: var(--dsw-static-neutral-bluish-75, var(--dsw-alias-bg-layer-0, #f5f6f8));
+  --dk-surface: var(--dsw-alias-bg-layer-1, #ffffff);
+  --dk-fill: var(--dsw-alias-bg-layer-2, #f1f2f5);
+  --dk-hover: var(--dsw-alias-interactive-bg-hover, rgba(15, 23, 42, 0.05));
+  --dk-active: rgba(15, 23, 42, 0.075);
+  --dk-line: var(--dsw-alias-border-l2, rgba(15, 23, 42, 0.08));
+  --dk-line-fine: var(--dsw-alias-border-l3, rgba(15, 23, 42, 0.055));
+  --dk-text: var(--dsw-alias-label-primary, #111827);
+  --dk-text-2: var(--dsw-alias-label-secondary, #6b7280);
+  --dk-text-3: var(--dsw-alias-label-tertiary, #9ca3af);
+  --dk-btn-fill: var(--dsw-alias-button-primary-fill, #111827);
+  --dk-btn-ink: var(--dsw-alias-label-primary-foreground, #ffffff);
+  --dk-ok: #16a34a;
+  --dk-warn: #d97706;
+  --dk-err: #dc2626;
+  --dk-shadow: var(--dsw-shadow-lv1, 0 1px 2px rgba(15, 23, 42, 0.04));
+  --dk-shadow-float: 0 2px 14px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --dk-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, monospace;
+
+  height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
+  background: var(--dk-canvas);
+  color: var(--dk-text);
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+body[data-ds-dark-theme] .dk-root {
+  --dk-canvas: var(--dsw-alias-bg-layer-0, #111318);
+  --dk-surface: var(--dsw-alias-bg-layer-1, #181b22);
+  --dk-fill: var(--dsw-alias-bg-layer-2, #222631);
+  --dk-hover: var(--dsw-alias-interactive-bg-hover, rgba(255, 255, 255, 0.06));
+  --dk-active: rgba(255, 255, 255, 0.09);
+  --dk-line: var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.09));
+  --dk-line-fine: var(--dsw-alias-border-l3, rgba(255, 255, 255, 0.055));
+  --dk-text: var(--dsw-alias-label-primary, #eef0f4);
+  --dk-text-2: var(--dsw-alias-label-secondary, #9ca3af);
+  --dk-text-3: var(--dsw-alias-label-tertiary, #6b7280);
+  --dk-btn-fill: var(--dsw-alias-button-primary-fill, #f3f4f6);
+  --dk-btn-ink: var(--dsw-alias-label-primary-foreground, #111827);
+  --dk-ok: #4ade80;
+  --dk-warn: #fbbf24;
+  --dk-err: #f87171;
+  --dk-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --dk-shadow-float: 0 4px 20px rgba(0, 0, 0, 0.35);
+}
+
+.dk-root *, .dk-root *::before, .dk-root *::after { box-sizing: border-box; }
+.dk-root::-webkit-scrollbar, .dk-chat-log::-webkit-scrollbar, .dk-chat-session-list::-webkit-scrollbar { width: 5px; height: 5px; }
+.dk-root::-webkit-scrollbar-thumb, .dk-chat-log::-webkit-scrollbar-thumb, .dk-chat-session-list::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--dk-text) 14%, transparent);
+  border-radius: 999px;
+}
+.dk-root::-webkit-scrollbar-track, .dk-chat-log::-webkit-scrollbar-track, .dk-chat-session-list::-webkit-scrollbar-track { background: transparent; }
+
+.dk-mono { font-family: var(--dk-mono); }
+.dk-muted { font-size: 12px; color: var(--dk-text-2); }
+.dk-icon { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.dk-spin { animation: dk-spin 0.9s linear infinite; }
+@keyframes dk-spin { to { transform: rotate(360deg); } }
+@keyframes dk-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* Status dots */
+.dk-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--dk-text-3); }
+.dk-dot-ok { background: var(--dk-ok); }
+.dk-dot-warn { background: var(--dk-warn); }
+.dk-dot-err { background: var(--dk-err); }
+.dk-dot-live { background: #3b82f6; animation: dk-pulse 1.3s ease-in-out infinite; }
+
+/* Native quiet buttons */
+.dk-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 30px; padding: 0 11px; border-radius: 8px; font-family: inherit;
+  font-size: 12.5px; font-weight: 500; line-height: 1; white-space: nowrap;
+  border: 1px solid var(--dk-line); background: var(--dk-surface); color: var(--dk-text);
+  cursor: pointer; transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+.dk-btn:hover:not(:disabled) { background: var(--dk-hover); }
+.dk-btn:focus-visible { outline: 2px solid color-mix(in srgb, var(--dk-text) 30%, transparent); outline-offset: 1px; }
+.dk-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.dk-btn-sm { height: 27px; padding: 0 9px; font-size: 12px; border-radius: 7px; gap: 5px; }
+.dk-btn-icon { width: 28px; height: 28px; padding: 0; border-radius: 7px; }
+.dk-btn-primary {
+  background: var(--dk-btn-fill); color: var(--dk-btn-ink); border-color: transparent;
+}
+.dk-btn-primary:hover:not(:disabled) { opacity: 0.88; background: var(--dk-btn-fill); }
+.dk-btn-ghost { border-color: transparent; background: transparent; color: var(--dk-text-2); }
+.dk-btn-ghost:hover:not(:disabled) { background: var(--dk-hover); color: var(--dk-text); }
+.dk-btn-danger { border-color: transparent; background: transparent; color: var(--dk-text-3); }
+.dk-btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--dk-err) 10%, transparent); color: var(--dk-err); }
+.dk-btn-danger-armed {
+  background: color-mix(in srgb, var(--dk-err) 12%, transparent);
+  border-color: color-mix(in srgb, var(--dk-err) 30%, transparent);
+  color: var(--dk-err);
+}
+
+/* ==================== DASHBOARD (CALM GROUPED SETTINGS) ==================== */
+.dk-page { padding: 28px 32px 48px; }
+.dk-wrap { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+
+.dk-topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+}
+.dk-topbar-left { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.dk-title { font-size: 18px; font-weight: 600; letter-spacing: -0.015em; margin: 0; color: var(--dk-text); }
+.dk-summary-inline {
+  display: inline-flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--dk-text-2);
+}
+.dk-summary-item { display: inline-flex; align-items: center; gap: 5px; }
+.dk-summary-warn { color: var(--dk-warn); font-weight: 500; }
+.dk-topbar-right { display: flex; align-items: center; gap: 6px; }
+
+.dk-group-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 0 4px 8px;
+}
+.dk-group-label { font-size: 12px; font-weight: 500; color: var(--dk-text-2); }
+
+/* Grouped List Surface */
+.dk-list {
+  background: var(--dk-surface);
+  border: 1px solid var(--dk-line);
+  border-radius: 12px;
+  box-shadow: var(--dk-shadow);
+  overflow: hidden;
+}
+.dk-agent-row {
+  border-bottom: 1px solid var(--dk-line-fine);
+  transition: background-color 0.12s ease;
+}
+.dk-agent-row:last-child { border-bottom: 0; }
+.dk-agent-main {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 15px 18px;
+}
+.dk-agent-left { display: flex; align-items: flex-start; gap: 12px; min-width: 0; flex: 1; }
+.dk-agent-dot-wrap { display: inline-flex; align-items: center; padding-top: 7px; flex-shrink: 0; }
+.dk-agent-info { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.dk-agent-title-line { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.dk-agent-name { font-size: 14px; font-weight: 600; color: var(--dk-text); }
+.dk-agent-kind {
+  font-size: 11px; color: var(--dk-text-2); background: var(--dk-fill);
+  padding: 1px 6px; border-radius: 5px;
+}
+.dk-agent-key { display: inline-flex; align-items: center; color: var(--dk-text-3); }
+.dk-agent-sub {
+  font-size: 12px; color: var(--dk-text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dk-agent-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.dk-agent-actions .dk-btn-chat-go { margin-left: 6px; }
+
+/* Inline expanded diagnostics */
+.dk-diag {
+  padding: 10px 18px 14px 37px;
+  border-top: 1px solid var(--dk-line-fine);
+  background: color-mix(in srgb, var(--dk-fill) 45%, var(--dk-surface));
+  display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 18px; align-items: baseline;
+}
+.dk-diag-step {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font-size: 12px; font-weight: 500;
+}
+.dk-diag-ok { color: var(--dk-ok); }
+.dk-diag-err { color: var(--dk-err); }
+.dk-diag-detail { font-size: 12px; color: var(--dk-text-2); overflow-wrap: anywhere; }
+.dk-diag-hint { grid-column: 1 / -1; padding-left: 19px; font-size: 11.5px; color: var(--dk-text-2); }
+
+.dk-row-err {
+  margin: 0 18px 14px 37px; padding: 8px 11px; border-radius: 8px; font-size: 12px;
+  background: color-mix(in srgb, var(--dk-err) 7%, transparent);
+  color: var(--dk-err); display: flex; flex-direction: column; gap: 3px;
+}
+
+/* Active jobs / approvals */
+.dk-job-row {
+  padding: 13px 18px; border-bottom: 1px solid var(--dk-line-fine);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.dk-job-row:last-child { border-bottom: 0; }
+.dk-job-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.dk-pre {
+  margin: 0; padding: 9px 11px; border-radius: 8px;
+  background: var(--dk-fill); font-size: 12px; color: var(--dk-text);
+  overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+}
+
+/* MCP Share */
+.dk-mcp-footnote {
+  display: flex; align-items: center; gap: 8px; padding: 2px 4px;
+  font-size: 12px; color: var(--dk-text-3);
+}
+.dk-mcp-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 18px; border-bottom: 1px solid var(--dk-line-fine);
+}
+.dk-mcp-row:last-child { border-bottom: 0; }
+.dk-switch {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 500; border: 0; cursor: pointer; font-family: inherit;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+.dk-switch.is-on { background: color-mix(in srgb, var(--dk-ok) 13%, transparent); color: var(--dk-ok); }
+.dk-switch.is-off { background: var(--dk-fill); color: var(--dk-text-2); }
+
+.dk-empty {
+  padding: 40px 24px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 12px;
+  color: var(--dk-text-2); font-size: 13px;
+}
+
+.dk-errbox {
+  background: color-mix(in srgb, var(--dk-err) 8%, var(--dk-surface));
+  border: 1px solid color-mix(in srgb, var(--dk-err) 22%, transparent);
+  border-radius: 10px; padding: 10px 13px; color: var(--dk-err); font-size: 12.5px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.dk-warnbox {
+  background: color-mix(in srgb, var(--dk-warn) 8%, var(--dk-surface));
+  border: 1px solid color-mix(in srgb, var(--dk-warn) 26%, transparent);
+  border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px;
+}
+.dk-infobox {
+  background: var(--dk-fill); border-radius: 8px; padding: 9px 12px;
+  font-size: 12px; color: var(--dk-text-2); line-height: 1.5;
+}
+
+/* Inputs & Modal */
+.dk-input {
+  width: 100%; height: 34px; padding: 0 11px; border-radius: 8px; font-size: 13px; font-family: inherit;
+  border: 1px solid var(--dk-line); background: var(--dk-surface); color: var(--dk-text); outline: none;
+  transition: border-color 0.14s ease;
+}
+.dk-input:focus { border-color: color-mix(in srgb, var(--dk-text) 45%, transparent); }
+.dk-input:disabled { opacity: 0.55; background: var(--dk-fill); cursor: not-allowed; }
+.dk-modal-bg {
+  position: fixed; inset: 0; z-index: 9990;
+  background: rgba(0, 0, 0, 0.36); backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.dk-modal {
+  width: 100%; max-width: 500px; max-height: 88vh; overflow-y: auto;
+  background: var(--dk-surface); border: 1px solid var(--dk-line); border-radius: 14px;
+  padding: 20px 22px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+  display: flex; flex-direction: column; gap: 14px;
+}
+.dk-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.dk-modal-title { font-size: 15px; font-weight: 600; margin: 0; }
+.dk-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding-top: 6px; }
+.dk-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 500; color: var(--dk-text-2); }
 .dk-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-@media (max-width: 960px) { .dk-row1, .dk-agents-grid { grid-template-columns: 1fr; } }
-@media (max-width: 680px) {
-  .dk-chat-page { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); gap: 8px; }
-  .dk-chat-sessions { max-height: 132px; padding-right: 0; border-right: 0; }
+
+.dk-toast {
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 9999;
+  padding: 7px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 500;
+  background: var(--dk-btn-fill); color: var(--dk-btn-ink); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+/* ==================== NATIVE TWO-PANE CHAT ==================== */
+.dk-chat-page {
+  display: grid;
+  grid-template-columns: 256px minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+  background: var(--dk-surface);
+}
+
+/* Left Rail */
+.dk-chat-rail {
+  min-height: 0;
+  background: var(--dk-canvas);
+  border-right: 1px solid var(--dk-line);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.dk-rail-top {
+  height: 48px; padding: 0 10px;
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  flex-shrink: 0;
+}
+.dk-rail-controls {
+  padding: 0 10px 10px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;
+}
+.dk-agent-pick {
+  display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px;
+  border-radius: 8px; background: var(--dk-surface); border: 1px solid var(--dk-line);
+}
+.dk-agent-pick select {
+  flex: 1; min-width: 0; border: 0; background: transparent; color: var(--dk-text);
+  font-size: 12.5px; font-weight: 600; font-family: inherit; outline: none; cursor: pointer;
+}
+.dk-search-row { display: flex; align-items: center; gap: 4px; }
+.dk-search-wrap { position: relative; flex: 1; min-width: 0; display: flex; align-items: center; }
+.dk-search-icon {
+  position: absolute; left: 9px; color: var(--dk-text-3); pointer-events: none;
+  display: inline-flex; align-items: center;
+}
+.dk-search-input {
+  width: 100%; height: 30px; padding: 0 8px 0 28px; border-radius: 8px; font-size: 12px; font-family: inherit;
+  border: 1px solid transparent; background: var(--dk-hover); color: var(--dk-text); outline: none;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+.dk-search-input:focus { background: var(--dk-surface); border-color: var(--dk-line); }
+.dk-search-input::placeholder { color: var(--dk-text-3); }
+
+.dk-chat-session-list {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 2px 8px 12px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.dk-chat-session {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; text-align: left; font-family: inherit;
+  padding: 8px 10px; border-radius: 8px; border: 0;
+  background: transparent; color: var(--dk-text-2); cursor: pointer;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+.dk-chat-session:hover { background: var(--dk-hover); color: var(--dk-text); }
+.dk-chat-session[aria-current="true"] { background: var(--dk-active); color: var(--dk-text); }
+.dk-chat-session-title {
+  font-size: 13px; font-weight: 400; line-height: 1.35; min-width: 0; flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dk-chat-session[aria-current="true"] .dk-chat-session-title { font-weight: 500; }
+.dk-chat-session-time {
+  font-size: 11px; color: var(--dk-text-3); flex-shrink: 0; font-variant-numeric: tabular-nums;
+}
+.dk-sessions-empty { padding: 24px 12px; text-align: center; font-size: 12px; color: var(--dk-text-3); }
+
+/* Right Thread Pane */
+.dk-chat-thread {
+  display: grid; grid-template-rows: 48px minmax(0, 1fr) auto;
+  min-width: 0; min-height: 0; background: var(--dk-surface);
+}
+.dk-chat-thread-header {
+  height: 48px; padding: 0 22px;
+  border-bottom: 1px solid var(--dk-line-fine);
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+}
+.dk-chat-thread-left { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.dk-chat-thread-header h2 {
+  margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 14px; font-weight: 600; color: var(--dk-text);
+}
+.dk-chat-thread-agent { font-size: 12px; color: var(--dk-text-3); flex-shrink: 0; }
+
+.dk-chat-log { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.dk-chat-messages {
+  display: flex; flex-direction: column; gap: 24px;
+  width: 100%; max-width: 720px; margin: 0 auto;
+  padding: 28px 24px 36px; flex: 1;
+}
+.dk-chat-welcome {
+  margin: auto; padding: 40px 20px; text-align: center; max-width: 380px;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.dk-chat-welcome-mark {
+  width: 40px; height: 40px; border-radius: 50%; background: var(--dk-fill);
+  color: var(--dk-text-2); display: inline-flex; align-items: center; justify-content: center;
+  margin-bottom: 4px;
+}
+.dk-chat-welcome-title { font-size: 16px; font-weight: 600; color: var(--dk-text); }
+
+/* Messages: calm, borderless, native */
+.dk-chat-user {
+  align-self: flex-end; max-width: 78%;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 14px; line-height: 1.62;
+  border-radius: 18px !important;
+}
+.dk-chat-turn { display: flex; flex-direction: column; gap: 20px; min-width: 0; overflow-wrap: anywhere; }
+.dk-chat-assistant {
+  display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 12px; align-items: start;
+}
+.dk-chat-mark {
+  width: 24px; height: 24px; border-radius: 50%; margin-top: 1px;
+  background: var(--dk-fill); color: var(--dk-text-2);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.dk-chat-assistant-body {
+  min-width: 0; display: flex; flex-direction: column; gap: 10px;
+  font-size: 14px; line-height: 1.72; color: var(--dk-text);
+}
+.dk-chat-markdown > :first-child { margin-top: 0; }
+.dk-chat-markdown > :last-child { margin-bottom: 0; }
+
+/* Quiet inline Thought & Tool disclosure */
+.dk-chat-activity { font-size: 12.5px; color: var(--dk-text-2); }
+.dk-chat-activity summary {
+  list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 0; user-select: none; color: var(--dk-text-2);
+  transition: color 0.12s ease;
+}
+.dk-chat-activity summary::-webkit-details-marker { display: none; }
+.dk-chat-activity summary:hover { color: var(--dk-text); }
+.dk-chat-activity-chevron { transition: transform 0.14s ease; color: var(--dk-text-3); }
+.dk-chat-activity[open] .dk-chat-activity-chevron { transform: rotate(90deg); }
+.dk-chat-thought {
+  margin: 6px 0 2px 5px; padding-left: 12px;
+  border-left: 1.5px solid var(--dk-line);
+  font-size: 12.5px; line-height: 1.62; color: var(--dk-text-2);
+}
+.dk-chat-activity ul {
+  list-style: none; margin: 6px 0 2px 5px; padding: 0 0 0 12px;
+  border-left: 1.5px solid var(--dk-line);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.dk-chat-activity li {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 4px 12px;
+}
+.dk-chat-activity-name { color: var(--dk-text); font-weight: 500; font-size: 12px; }
+.dk-chat-activity-state { font-size: 11.5px; color: var(--dk-text-3); }
+.dk-chat-activity-state.is-ok { color: var(--dk-ok); }
+.dk-chat-activity-state.is-err { color: var(--dk-err); }
+.dk-chat-activity-state.is-run { color: var(--dk-warn); }
+.dk-chat-activity-input { grid-column: 1 / -1; min-width: 0; }
+
+.dk-chat-status {
+  display: inline-flex; align-items: center; gap: 10px; align-self: flex-start;
+  font-size: 12.5px; color: var(--dk-text-2);
+}
+
+/* Floating Pill/Rounded Composer */
+.dk-chat-form { width: 100%; padding: 4px 24px 18px; background: var(--dk-surface); }
+.dk-chat-form-inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+.dk-chat-composer-box {
+  background: var(--dk-surface);
+  border: 1px solid var(--dk-line);
+  border-radius: 20px;
+  box-shadow: var(--dk-shadow-float);
+  display: flex; flex-direction: column;
+  transition: border-color 0.15s ease;
+}
+.dk-chat-composer-box:focus-within { border-color: color-mix(in srgb, var(--dk-text) 28%, transparent); }
+.dk-chat-textarea {
+  width: 100%; min-height: 44px; max-height: 160px; resize: none;
+  padding: 13px 16px 4px; border: 0; background: transparent; color: var(--dk-text);
+  font-size: 14px; line-height: 1.55; font-family: inherit; outline: none;
+}
+.dk-chat-textarea::placeholder { color: var(--dk-text-3); }
+.dk-chat-composer-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 4px 10px 9px 16px;
+}
+.dk-chat-hint { font-size: 11.5px; color: var(--dk-text-3); }
+.dk-send-circle {
+  width: 30px; height: 30px; border-radius: 50%; border: 0; padding: 0;
+  background: var(--dk-btn-fill); color: var(--dk-btn-ink);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0; transition: opacity 0.14s ease, transform 0.12s ease;
+}
+.dk-send-circle:hover:not(:disabled) { opacity: 0.85; }
+.dk-send-circle:active:not(:disabled) { transform: scale(0.95); }
+.dk-send-circle:disabled { opacity: 0.28; cursor: not-allowed; }
+
+@media (max-width: 760px) {
+  .dk-page { padding: 18px 16px 32px; }
+  .dk-agent-main { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .dk-chat-page { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .dk-chat-rail { max-height: 180px; border-right: 0; border-bottom: 1px solid var(--dk-line); }
+  .dk-chat-messages { padding: 18px 16px 24px; }
+  .dk-chat-form { padding: 4px 14px 14px; }
+  .dk-field-row { grid-template-columns: 1fr; }
 }
 `;
 
@@ -430,11 +860,144 @@ function injectStyles(): () => void {
   if (!el) {
     el = document.createElement('style');
     el.id = STYLE_ID;
-    el.textContent = CSS;
     document.head.appendChild(el);
   }
+  el.textContent = CSS;
   return () => {
     document.getElementById(STYLE_ID)?.remove();
+  };
+}
+
+function formatSessionTime(value: string | number | undefined, lang: Language): string {
+  if (value === undefined || value === null || value === '') return '';
+  let ms = typeof value === 'number' ? value : Number(value);
+  if (Number.isFinite(ms)) {
+    if (ms > 0 && ms < 1e12) ms *= 1000;
+  } else {
+    ms = Date.parse(String(value));
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const diffSec = Math.floor((Date.now() - ms) / 1000);
+  if (diffSec >= 0 && diffSec < 60) return lang === 'zh-CN' ? '刚刚' : 'now';
+  if (diffSec >= 60 && diffSec < 3600) {
+    const mins = Math.floor(diffSec / 60);
+    return lang === 'zh-CN' ? `${mins}分钟前` : `${mins}m`;
+  }
+  if (diffSec >= 3600 && diffSec < 86_400) {
+    const hrs = Math.floor(diffSec / 3600);
+    return lang === 'zh-CN' ? `${hrs}小时前` : `${hrs}h`;
+  }
+  const date = new Date(ms);
+  const now = new Date();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return date.getFullYear() === now.getFullYear() ? `${mm}-${dd}` : `${date.getFullYear()}-${mm}-${dd}`;
+}
+
+function makeIcons(React: ReactModule) {
+  const h = React.createElement;
+  const svg = (paths: unknown[], size = 14, className = '') =>
+    h(
+      'svg',
+      {
+        xmlns: 'http://www.w3.org/2000/svg',
+        width: size,
+        height: size,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: '1.8',
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        className: className ? `dk-icon ${className}` : 'dk-icon',
+        'aria-hidden': true,
+      },
+      ...paths,
+    );
+  return {
+    refresh: (spin = false, size = 13) =>
+      svg(
+        [h('path', { key: 'a', d: 'M21 12a9 9 0 1 1-2.64-6.36' }), h('path', { key: 'b', d: 'M21 3v6h-6' })],
+        size,
+        spin ? 'dk-spin' : '',
+      ),
+    plus: (size = 14) => svg([h('path', { key: 'a', d: 'M12 5v14' }), h('path', { key: 'b', d: 'M5 12h14' })], size),
+    chat: (size = 14) =>
+      svg(
+        [
+          h('path', {
+            key: 'a',
+            d: 'M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z',
+          }),
+        ],
+        size,
+      ),
+    edit: (size = 13) => svg([h('path', { key: 'a', d: 'M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z' })], size),
+    trash: (size = 13) =>
+      svg(
+        [
+          h('path', { key: 'a', d: 'M3 6h18' }),
+          h('path', { key: 'b', d: 'M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6' }),
+          h('path', { key: 'c', d: 'M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2' }),
+        ],
+        size,
+      ),
+    chevronRight: (size = 13, className = '') => svg([h('path', { key: 'a', d: 'm9 18 6-6-6-6' })], size, className),
+    chevronDown: (size = 13, rotated = false) =>
+      svg([h('path', { key: 'a', d: rotated ? 'm18 15-6-6-6 6' : 'm6 9 6 6 6-6' })], size),
+    check: (size = 13) => svg([h('path', { key: 'a', d: 'M20 6 9 17l-5-5' })], size),
+    alert: (size = 13) =>
+      svg(
+        [
+          h('circle', { key: 'a', cx: '12', cy: '12', r: '9' }),
+          h('path', { key: 'b', d: 'M12 8v4' }),
+          h('path', { key: 'c', d: 'M12 16h.01' }),
+        ],
+        size,
+      ),
+    key: (size = 11) =>
+      svg(
+        [
+          h('circle', { key: 'a', cx: '7.5', cy: '15.5', r: '4.5' }),
+          h('path', { key: 'b', d: 'm21 2-9.6 9.6' }),
+          h('path', { key: 'c', d: 'm15.5 7.5 3 3L22 7l-3-3' }),
+        ],
+        size,
+      ),
+    copy: (size = 13) =>
+      svg(
+        [
+          h('rect', { key: 'a', width: '13', height: '13', x: '9', y: '9', rx: '2' }),
+          h('path', { key: 'b', d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' }),
+        ],
+        size,
+      ),
+    search: (size = 13) =>
+      svg([h('circle', { key: 'a', cx: '11', cy: '11', r: '7' }), h('path', { key: 'b', d: 'm20 20-3.5-3.5' })], size),
+    arrowLeft: (size = 14) =>
+      svg([h('path', { key: 'a', d: 'M19 12H5' }), h('path', { key: 'b', d: 'm12 19-7-7 7-7' })], size),
+    arrowUpRight: (size = 13) =>
+      svg([h('path', { key: 'a', d: 'M7 17 17 7' }), h('path', { key: 'b', d: 'M7 7h10v10' })], size),
+    send: (size = 13) =>
+      svg([h('path', { key: 'a', d: 'M12 19V5' }), h('path', { key: 'b', d: 'm5 12 7-7 7 7' })], size),
+    stop: (size = 12) => svg([h('rect', { key: 'a', x: '5', y: '5', width: '14', height: '14', rx: '2' })], size),
+    sparkles: (size = 13) =>
+      svg([h('path', { key: 'a', d: 'M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z' })], size),
+    terminal: (size = 13) =>
+      svg([h('path', { key: 'a', d: 'm4 17 6-6-6-6' }), h('path', { key: 'b', d: 'M12 19h8' })], size),
+    shield: (size = 14) => svg([h('path', { key: 'a', d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' })], size),
+    knot: (size = 13) =>
+      svg(
+        [
+          h('path', {
+            key: 'a',
+            d: 'M7.4 13.5H6a3 3 0 0 1-3-3v-2a3 3 0 0 1 3-3h5.5a3 3 0 0 1 3 3v2a3 3 0 0 1-2.9 3M12.4 10.5a3 3 0 0 0-2.9 3v2a3 3 0 0 0 3 3H18a3 3 0 0 0 3-3v-2a3 3 0 0 0-3-3h-1.4',
+          }),
+        ],
+        size,
+      ),
+    close: (size = 15) =>
+      svg([h('path', { key: 'a', d: 'M18 6 6 18' }), h('path', { key: 'b', d: 'm6 6 12 12' })], size),
   };
 }
 
@@ -539,13 +1102,14 @@ interface ChatProps {
 
 function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
+  const icons = makeIcons(React);
   const Thread = makeChatThread(React, ctx, primitives);
-  const { Button } = primitives;
   const draftKeys = new Map<string, number>();
   let nextThreadKey = 0;
 
   return function RemoteChat({ agent, agents, jobs, lang, t, onAgentChange, onClose, refreshState }: ChatProps) {
     const [sessions, setSessions] = React.useState<RemoteSessionItem[] | null>(null);
+    const [loadingSessions, setLoadingSessions] = React.useState(false);
     const [sessionError, setSessionError] = React.useState('');
     const [search, setSearch] = React.useState('');
     const [thread, setThread] = React.useState(() => ({ key: draftKeys.get(agent.revision) ?? 0, id: '' }));
@@ -557,6 +1121,7 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
     React.useEffect(() => {
       const controller = new AbortController();
       setSessionError('');
+      setLoadingSessions(true);
       void apiPost<{ sessions: RemoteSessionItem[] }>(
         ctx,
         '/api/dsh-knot/sessions',
@@ -569,6 +1134,9 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
         })
         .catch((error: unknown) => {
           if (!controller.signal.aborted) setSessionError(errorMessage(error));
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setLoadingSessions(false);
         });
       return () => controller.abort();
     }, [agent.id, agent.revision, refreshCount]);
@@ -591,84 +1159,132 @@ function makeRemoteChat(React: ReactModule, ctx: ClientContext, primitives: Chat
       (item) => item.id.toLowerCase().includes(query) || item.title?.toLowerCase().includes(query),
     );
     const title = sessions?.find((item) => item.id === shownSessionId)?.title;
+    const connStatus = agent.connection?.status ?? 'unverified';
+    const dotClass =
+      connStatus === 'connected' ? 'dk-dot dk-dot-ok' : connStatus === 'error' ? 'dk-dot dk-dot-err' : 'dk-dot';
 
     return h(
       'div',
       { className: 'dk-root dk-chat-page' },
       h(
-        'header',
-        { className: 'dk-header dk-chat-header' },
+        'aside',
+        { className: 'dk-chat-rail', 'aria-label': t('historyHeading') },
         h(
           'div',
-          { className: 'dk-header-left' },
-          h('h1', { className: 'dk-title' }, t('chatHeading')),
+          { className: 'dk-rail-top' },
           h(
-            'select',
+            'button',
+            { type: 'button', className: 'dk-btn dk-btn-sm dk-btn-ghost', onClick: onClose },
+            icons.arrowLeft(14),
+            t('chatBack'),
+          ),
+          h(
+            'button',
             {
-              className: 'dk-input',
-              'aria-label': t('agentsHeading'),
-              value: agent.id,
-              onChange: (event: { target: HTMLSelectElement }) => onAgentChange(event.target.value),
+              type: 'button',
+              className: 'dk-btn dk-btn-icon dk-btn-ghost',
+              title: t('chatNewSession'),
+              'aria-label': t('chatNewSession'),
+              onClick: () => openThread(),
             },
-            agents.map((item) => h('option', { key: item.id, value: item.id }, item.id)),
+            icons.plus(15),
           ),
         ),
         h(
           'div',
-          { className: 'dk-header-right' },
-          h(Button, { variant: 'outline', onClick: onClose }, t('chatBack')),
-          h(Button, { variant: 'primary', onClick: () => openThread() }, t('chatNewSession')),
+          { className: 'dk-rail-controls' },
+          h(
+            'div',
+            { className: 'dk-agent-pick' },
+            h('span', { className: dotClass, 'aria-hidden': true }),
+            h(
+              'select',
+              {
+                'aria-label': t('agentsHeading'),
+                value: agent.id,
+                onChange: (event: { target: HTMLSelectElement }) => onAgentChange(event.target.value),
+              },
+              agents.map((item) => h('option', { key: item.id, value: item.id }, item.id)),
+            ),
+            h('span', { className: 'dk-agent-kind dk-mono' }, agent.kind),
+          ),
+          h(
+            'div',
+            { className: 'dk-search-row' },
+            h(
+              'div',
+              { className: 'dk-search-wrap' },
+              h('span', { className: 'dk-search-icon' }, icons.search(13)),
+              h('input', {
+                className: 'dk-search-input',
+                type: 'search',
+                'aria-label': t('searchPlaceholder'),
+                value: search,
+                placeholder: t('searchPlaceholder'),
+                onInput: (event: { target: HTMLInputElement }) => setSearch(event.target.value),
+              }),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dk-btn dk-btn-icon dk-btn-ghost',
+                title: t('refresh'),
+                'aria-label': t('refresh'),
+                disabled: loadingSessions,
+                onClick: reloadSessions,
+              },
+              icons.refresh(loadingSessions, 12),
+            ),
+          ),
         ),
-      ),
-      h(
-        'aside',
-        { className: 'dk-chat-sessions', 'aria-label': t('historyHeading') },
         h(
           'div',
-          { className: 'dk-header' },
-          h('h2', null, t('historyHeading')),
-          h(Button, { size: 'sm', onClick: reloadSessions }, t('refresh')),
-        ),
-        h('input', {
-          className: 'dk-input',
-          type: 'search',
-          'aria-label': t('searchPlaceholder'),
-          value: search,
-          placeholder: t('searchPlaceholder'),
-          onInput: (event: { target: HTMLInputElement }) => setSearch(event.target.value),
-        }),
-        sessionError
-          ? h(
-              'div',
-              { className: 'dk-errbox', role: 'alert' },
-              h('span', null, `${t('historyErrorTitle')}: ${sessionError}`),
-              h(Button, { size: 'sm', onClick: reloadSessions }, t('retry')),
-            )
-          : null,
-        matches?.length
-          ? matches.map((item) =>
-              h(
-                'button',
-                {
-                  key: item.id,
-                  type: 'button',
-                  className: 'dk-btn dk-chat-session',
-                  'aria-current': shownSessionId === item.id ? 'true' : undefined,
-                  title: item.title || item.id,
-                  onClick: () => {
-                    if (shownSessionId !== item.id) openThread(item.id);
-                  },
-                },
-                item.title || item.id,
-              ),
-            )
-          : !sessionError
+          { className: 'dk-chat-session-list' },
+          sessionError
             ? h(
                 'div',
-                { className: 'dk-muted', role: 'status' },
-                t(!sessions ? 'loadingHistory' : query ? 'noHistoryMatch' : 'noHistory'),
+                { className: 'dk-errbox', role: 'alert', style: { margin: '4px 2px 8px' } },
+                h('span', null, `${t('historyErrorTitle')}: ${sessionError}`),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dk-btn dk-btn-sm',
+                    style: { alignSelf: 'flex-start' },
+                    onClick: reloadSessions,
+                  },
+                  t('retry'),
+                ),
               )
             : null,
+          matches?.length
+            ? matches.map((item) => {
+                const relTime = formatSessionTime(item.updatedAt, lang);
+                return h(
+                  'button',
+                  {
+                    key: item.id,
+                    type: 'button',
+                    className: 'dk-chat-session',
+                    'aria-current': shownSessionId === item.id ? 'true' : undefined,
+                    title: item.title ? `${item.title} (${item.id})` : item.id,
+                    onClick: () => {
+                      if (shownSessionId !== item.id) openThread(item.id);
+                    },
+                  },
+                  h('span', { className: 'dk-chat-session-title' }, item.title || item.id),
+                  relTime ? h('span', { className: 'dk-chat-session-time' }, relTime) : null,
+                );
+              })
+            : !sessionError
+              ? h(
+                  'div',
+                  { className: 'dk-sessions-empty', role: 'status' },
+                  t(!sessions ? 'loadingHistory' : query ? 'noHistoryMatch' : 'noHistory'),
+                )
+              : null,
+        ),
       ),
       h(Thread, {
         key: thread.key,
@@ -702,7 +1318,8 @@ interface ThreadProps {
 
 function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
-  const { Button, CommandText, MarkdownText, UserMessageBubble } = primitives;
+  const icons = makeIcons(React);
+  const { CommandText, MarkdownText, UserMessageBubble } = primitives;
   const submissions = new Map<string, { message: string; sessionId: string; id: string }>();
 
   return function ChatThread({
@@ -737,10 +1354,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const [historyJobId, setHistoryJobId] = React.useState(initialJob?.id);
     const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
     const [copyStatus, setCopyStatus] = React.useState('');
+    const [copiedOk, setCopiedOk] = React.useState(false);
+    const copyTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const alive = React.useRef(false);
     const sendLock = React.useRef(false);
     const actionLock = React.useRef(false);
     const log = React.useRef<HTMLDivElement | null>(null);
+    const composerRef = React.useRef<HTMLTextAreaElement | null>(null);
     const followTail = React.useRef(true);
     const canReadHistory = Boolean(agent.supportsSessionMessages && session);
     const isAvailableAndRunning = (job?: JobSummary) => job?.id !== unavailableJobId && isRunning(job);
@@ -752,8 +1372,16 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       alive.current = true;
       return () => {
         alive.current = false;
+        if (copyTimer.current) clearTimeout(copyTimer.current);
       };
     }, []);
+
+    React.useEffect(() => {
+      const el = composerRef.current;
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    }, [input]);
 
     React.useEffect(() => {
       if (!canReadHistory) return;
@@ -937,30 +1565,139 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     };
 
     const copyPrompt = async () => {
+      if (copyTimer.current) clearTimeout(copyTimer.current);
       try {
         await navigator.clipboard.writeText(
           `Use agent_continue on agent "${agent.id}" session "${sessionId}" to continue our previous discussion.`,
         );
-        if (alive.current) setCopyStatus(t('copiedContinue'));
+        if (!alive.current) return;
+        setCopiedOk(true);
+        setCopyStatus(t('copiedContinue'));
       } catch {
-        if (alive.current) setCopyStatus(t('chatCopyError'));
+        if (!alive.current) return;
+        setCopiedOk(false);
+        setCopyStatus(t('chatCopyError'));
       }
+      copyTimer.current = setTimeout(() => {
+        copyTimer.current = null;
+        if (!alive.current) return;
+        setCopiedOk(false);
+        setCopyStatus('');
+      }, 2600);
     };
+
+    const toolStateClass = (toolStatus: ToolStatus): string =>
+      toolStatus === 'completed'
+        ? 'dk-chat-activity-state is-ok'
+        : toolStatus === 'failed'
+          ? 'dk-chat-activity-state is-err'
+          : toolStatus === 'running'
+            ? 'dk-chat-activity-state is-run'
+            : 'dk-chat-activity-state';
+
+    const renderAssistant = (key: string | undefined, children: unknown[]) =>
+      h(
+        'div',
+        { ...(key ? { key } : {}), className: 'dk-chat-assistant' },
+        h('span', { className: 'dk-chat-mark', 'aria-hidden': true }, icons.knot(13)),
+        h('div', { className: 'dk-chat-assistant-body' }, ...children),
+      );
+
+    const renderThoughtBlock = (key: string, text: string, streaming = false) =>
+      h(
+        'details',
+        { key, className: 'dk-chat-activity' },
+        h('summary', null, icons.chevronRight(13, 'dk-chat-activity-chevron'), h('span', null, t('chatThought'))),
+        h(MarkdownText, {
+          className: 'dk-chat-thought',
+          text,
+          streaming,
+          labels: MARKDOWN_LABELS[lang],
+          variant: 'compact',
+          omitHtml: true,
+        }),
+      );
+
+    const renderToolGroup = (key: string, toolItems: ToolActivitySummary[]) => {
+      const running = toolItems.filter((tool) => tool.status === 'running');
+      const single = toolItems.length === 1 ? toolItems[0] : undefined;
+      return h(
+        'details',
+        { key, className: 'dk-chat-activity' },
+        h(
+          'summary',
+          null,
+          icons.chevronRight(13, 'dk-chat-activity-chevron'),
+          h('span', null, `${t('chatToolActivity')} · ${toolItems.length}`),
+          running.length
+            ? h(
+                'span',
+                { className: 'dk-chat-activity-state is-run', role: 'status' },
+                `· ${t('chatToolRunning')} ${running.map(({ name, title }) => title ?? name).join(', ')}`,
+              )
+            : single
+              ? h('span', { className: 'dk-chat-activity-name dk-mono' }, `· ${single.title ?? single.name}`)
+              : null,
+        ),
+        h(
+          'ul',
+          null,
+          toolItems.map((tool) =>
+            h(
+              'li',
+              { key: tool.id },
+              h('span', { className: 'dk-chat-activity-name dk-mono' }, tool.title ?? tool.name),
+              h('span', { className: toolStateClass(tool.status) }, t(TOOL_STATUS_LABEL[tool.status])),
+              tool.inputPreview
+                ? h(CommandText, {
+                    className: 'dk-chat-activity-input',
+                    text: tool.inputPreview,
+                    label: t('chatToolInput'),
+                  })
+                : null,
+            ),
+          ),
+        ),
+      );
+    };
+
+    const renderTextBlock = (key: string, text: string, streaming = false) =>
+      h(
+        'div',
+        { key, className: 'dk-chat-markdown' },
+        h(MarkdownText, { text, streaming, labels: MARKDOWN_LABELS[lang], omitHtml: true }),
+      );
 
     const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
     const loadedObservedJob = Boolean(history && liveJob?.id === historyJobId);
     const persistedPrompt = loadedObservedJob && lastUserText === liveJob?.prompt;
-    const persistedReply = loadedObservedJob && lastMessage?.role === 'assistant' && lastMessage.text === liveJob?.text;
+    let lastUserIndex = -1;
+    if (history) {
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]?.role === 'user') {
+          lastUserIndex = i;
+          break;
+        }
+      }
+    }
+    const lastTurnHistory = history && lastUserIndex >= 0 ? history.slice(lastUserIndex + 1) : (history ?? []);
+    const persistedThought =
+      loadedObservedJob && lastTurnHistory.some((item) => item.role === 'assistant' && Boolean(item.thought));
+    const persistedTools =
+      loadedObservedJob && lastTurnHistory.some((item) => item.role === 'assistant' && Boolean(item.tools?.length));
+    const persistedReply =
+      loadedObservedJob &&
+      lastMessage?.role === 'assistant' &&
+      (lastMessage.text === liveJob?.text || Boolean(lastMessage.text && liveJob?.text.endsWith(lastMessage.text)));
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(
             (job) => belongsToSession(job) && !turns.some(({ id }) => id === job.id) && job.id !== liveJob?.id,
           )
         : [];
-    const renderJob = (job: JobSummary, showPrompt = true, showText = true) => {
+    const renderJob = (job: JobSummary, showPrompt = true, showText = true, showThought = true, showTools = true) => {
       const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
-      const runningTools = job.tools?.filter((tool) => tool.status === 'running') ?? [];
       const status =
         job.remoteStop === 'pending'
           ? 'chatStopping'
@@ -969,78 +1706,55 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             : approval
               ? 'wantsApproval'
               : 'chatPreparing';
-      return h(
-        'div',
-        { key: job.id, className: 'dk-chat-turn' },
-        showPrompt && job.prompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
-        job.thought
-          ? h(
-              'details',
-              { className: 'dk-chat-activity' },
-              h('summary', null, t('chatThought')),
-              h(MarkdownText, {
-                className: 'dk-chat-thought',
-                text: job.thought,
-                streaming: active,
-                labels: MARKDOWN_LABELS[lang],
-                variant: 'compact',
-                omitHtml: true,
-              }),
-            )
-          : null,
-        job.tools?.length
-          ? h(
-              'details',
-              { className: 'dk-chat-activity' },
-              h(
-                'summary',
-                null,
-                t('chatToolActivity'),
-                runningTools.length
-                  ? h(
-                      'span',
-                      { role: 'status' },
-                      ` · ${t('chatToolRunning')} ${runningTools.map(({ name, title }) => title ?? name).join(', ')}`,
-                    )
-                  : null,
-              ),
-              h(
-                'ul',
-                null,
-                job.tools.map((tool) =>
-                  h(
-                    'li',
-                    { key: tool.id },
-                    h('span', { className: 'dk-chat-activity-name' }, tool.title ?? tool.name),
-                    h('span', null, t(TOOL_STATUS_LABEL[tool.status])),
-                    tool.inputPreview
-                      ? h(CommandText, {
-                          className: 'dk-chat-activity-input',
-                          text: tool.inputPreview,
-                          label: t('chatToolInput'),
-                        })
-                      : null,
-                  ),
-                ),
-              ),
-            )
-          : null,
-        showText && job.text
-          ? h(MarkdownText, { text: job.text, streaming: active, labels: MARKDOWN_LABELS[lang], omitHtml: true })
-          : null,
+      const terminalNotice = job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop);
+      const contentParts: unknown[] = [];
+      if (job.timeline?.length) {
+        const toolById = new Map((job.tools ?? []).map((tool) => [tool.id, tool]));
+        let pendingTools: ToolActivitySummary[] = [];
+        const flushTools = (suffix: number) => {
+          if (pendingTools.length > 0) {
+            contentParts.push(renderToolGroup(`tools-${suffix}`, pendingTools));
+            pendingTools = [];
+          }
+        };
+        job.timeline.forEach((entry, index) => {
+          if (entry.kind === 'tool') {
+            if (!showTools) return;
+            const tool = toolById.get(entry.toolId);
+            if (tool) pendingTools.push(tool);
+            return;
+          }
+          flushTools(index);
+          if (entry.kind === 'thought' && showThought && entry.text) {
+            contentParts.push(renderThoughtBlock(`thought-${index}`, entry.text, active));
+          } else if (entry.kind === 'text' && showText && entry.text) {
+            contentParts.push(renderTextBlock(`text-${index}`, entry.text, active));
+          }
+        });
+        flushTools(job.timeline.length);
+      } else {
+        if (showThought && job.thought) contentParts.push(renderThoughtBlock('thought', job.thought, active));
+        if (showTools && job.tools?.length) contentParts.push(renderToolGroup('tools', job.tools));
+        if (showText && job.text) contentParts.push(renderTextBlock('text', job.text, active));
+      }
+      const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice);
+      const assistantParts = [
+        ...contentParts,
         active
           ? h(
               'div',
-              { className: 'dk-chat-status' },
-              h('span', { className: 'dk-muted', role: 'status' }, t(status)),
+              { key: 'status', className: 'dk-chat-status' },
+              h('span', { className: 'dk-dot dk-dot-live', 'aria-hidden': true }),
+              h('span', { role: 'status' }, t(status)),
               h(
-                Button,
+                'button',
                 {
-                  size: 'sm',
-                  variant: 'outline',
+                  type: 'button',
+                  className: 'dk-btn dk-btn-sm',
                   disabled: acting || job.remoteStop === 'pending',
                   onClick: () => void actOnJob('cancel', job),
                 },
+                icons.stop(11),
                 t('stopTask'),
               ),
             )
@@ -1048,44 +1762,107 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         approval
           ? h(
               'div',
-              { className: 'dk-warnbox' },
-              h('p', null, approval.text ?? approval.requestId),
-              agent.supportsRespond !== false && approval.choices.length
-                ? approval.choices.map((choice) =>
-                    h(
-                      Button,
-                      {
-                        key: choice,
-                        variant: 'outline',
-                        size: 'sm',
-                        disabled: acting,
-                        onClick: () => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
-                      },
-                      choice,
-                    ),
-                  )
-                : h('div', { className: 'dk-muted' }, t('approveRemotely')),
+              { key: 'approval', className: 'dk-warnbox' },
+              h('div', { style: { fontWeight: 600, fontSize: '12.5px' } }, t('wantsApproval')),
+              h('pre', { className: 'dk-pre dk-mono' }, approval.text ?? approval.requestId),
+              h(
+                'div',
+                { style: { display: 'flex', flexWrap: 'wrap', gap: '6px' } },
+                agent.supportsRespond !== false && approval.choices.length
+                  ? approval.choices.map((choice) =>
+                      h(
+                        'button',
+                        {
+                          key: choice,
+                          type: 'button',
+                          className: /deny|reject|no/i.test(choice)
+                            ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
+                            : 'dk-btn dk-btn-sm dk-btn-primary',
+                          disabled: acting,
+                          onClick: () => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
+                        },
+                        choice,
+                      ),
+                    )
+                  : h('div', { className: 'dk-muted' }, t('approveRemotely')),
+              ),
             )
           : null,
-        job.status === 'failed' || (job.status === 'cancelled' && !job.remoteStop)
+        terminalNotice
           ? h(
               'div',
-              { className: job.status === 'failed' ? 'dk-errbox' : 'dk-muted', role: 'status' },
+              {
+                key: 'terminal',
+                className: job.status === 'failed' ? 'dk-errbox' : 'dk-muted',
+                role: 'status',
+              },
               t(job.status === 'failed' ? 'chatFailed' : 'chatCancelled'),
               job.error ? ` · ${job.error}` : '',
             )
           : null,
+      ];
+      return h(
+        'div',
+        { key: job.id, className: 'dk-chat-turn' },
+        showPrompt && job.prompt ? h(UserMessageBubble, { className: 'dk-chat-user' }, job.prompt) : null,
+        hasAssistantContent ? renderAssistant(undefined, assistantParts) : null,
       );
     };
+
+    const renderHistoryItems = () => {
+      if (!history?.length) return null;
+      const items: unknown[] = [];
+      let assistantBatch: TranscriptMessage[] = [];
+      const flushAssistantBatch = () => {
+        if (!assistantBatch.length) return;
+        const first = assistantBatch[0]!;
+        const parts: unknown[] = [];
+        for (const msg of assistantBatch) {
+          if (msg.thought) parts.push(renderThoughtBlock(`${msg.id}-thought`, msg.thought));
+          if (msg.tools?.length) parts.push(renderToolGroup(`${msg.id}-tools`, msg.tools));
+          if (msg.text.trim()) parts.push(renderTextBlock(`${msg.id}-text`, msg.text));
+        }
+        if (parts.length) items.push(renderAssistant(first.id, parts));
+        assistantBatch = [];
+      };
+      for (const message of history) {
+        if (message.role === 'user') {
+          flushAssistantBatch();
+          items.push(h(UserMessageBubble, { key: message.id, className: 'dk-chat-user' }, message.text));
+        } else {
+          assistantBatch.push(message);
+        }
+      }
+      flushAssistantBatch();
+      return items;
+    };
+
+    const endpoint = agent.acpTransport === 'stdio' ? 'Local stdio' : formatDirectEndpoint(agent);
 
     return h(
       'section',
       { className: 'dk-chat-thread', 'aria-label': title || t('chatHeading') },
       h(
         'div',
-        { className: 'dk-header dk-chat-thread-header' },
-        h('h2', { title: title || sessionId }, title || sessionId || t('chatNewSession')),
-        sessionId ? h(Button, { size: 'sm', onClick: () => void copyPrompt() }, t('continuePrompt')) : null,
+        { className: 'dk-chat-thread-header' },
+        h(
+          'div',
+          { className: 'dk-chat-thread-left' },
+          h('h2', { title: title || sessionId }, title || sessionId || t('chatNewSession')),
+          h('span', { className: 'dk-chat-thread-agent' }, `${agent.id} · ${agent.kind}`),
+        ),
+        sessionId
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'dk-btn dk-btn-sm dk-btn-ghost',
+                onClick: () => void copyPrompt(),
+              },
+              copiedOk ? icons.check(13) : icons.copy(13),
+              copiedOk ? t('copiedShort') : t('continuePrompt'),
+            )
+          : null,
       ),
       h(
         'div',
@@ -1104,11 +1881,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             ? h(
                 'div',
                 { className: 'dk-errbox', role: 'alert' },
-                `${t('chatHistoryError')}: ${historyError}`,
+                h('span', null, `${t('chatHistoryError')}: ${historyError}`),
                 h(
-                  Button,
+                  'button',
                   {
-                    size: 'sm',
+                    type: 'button',
+                    className: 'dk-btn dk-btn-sm',
+                    style: { alignSelf: 'flex-start' },
                     disabled: Boolean(activeId || turns.length || sending),
                     onClick: () => setHistoryAttempts((attempts) => attempts + 1),
                   },
@@ -1117,14 +1896,19 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
               )
             : null,
           session && !agent.supportsSessionMessages
-            ? h('div', { className: 'dk-muted' }, t('chatHistoryUnavailable'))
+            ? h('div', { className: 'dk-infobox' }, t('chatHistoryUnavailable'))
             : null,
-          !sessionId && !turns.length ? h('div', { className: 'dk-muted' }, t('chatEmpty')) : null,
-          history?.map((message) =>
-            message.role === 'user'
-              ? h(UserMessageBubble, { key: message.id, className: 'dk-chat-user' }, message.text)
-              : h(MarkdownText, { key: message.id, text: message.text, labels: MARKDOWN_LABELS[lang], omitHtml: true }),
-          ),
+          !sessionId && !turns.length
+            ? h(
+                'div',
+                { className: 'dk-chat-welcome' },
+                h('span', { className: 'dk-chat-welcome-mark', 'aria-hidden': true }, icons.knot(18)),
+                h('div', { className: 'dk-chat-welcome-title' }, agent.id),
+                h('div', { className: 'dk-muted dk-mono' }, endpoint),
+                h('div', { className: 'dk-muted', style: { marginTop: '4px' } }, t('chatEmpty')),
+              )
+            : null,
+          renderHistoryItems(),
           fallbackJobs
             .sort((a, b) => a.createdAt - b.createdAt)
             .slice(-20)
@@ -1133,11 +1917,11 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             !turns.some(({ id }) => id === liveJob.id) &&
             (!loadedObservedJob ||
               liveJob.status !== 'completed' ||
-              liveJob.thought ||
-              liveJob.tools?.length ||
+              (!persistedThought && liveJob.thought) ||
+              (!persistedTools && liveJob.tools?.length) ||
               (!persistedPrompt && liveJob.prompt) ||
               (!persistedReply && liveJob.text))
-            ? renderJob(liveJob, !persistedPrompt, !persistedReply)
+            ? renderJob(liveJob, !persistedPrompt, !persistedReply, !persistedThought, !persistedTools)
             : null,
           turns.map((job) => renderJob(job)),
         ),
@@ -1151,45 +1935,60 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             void send();
           },
         },
-        copyStatus ? h('div', { className: 'dk-muted', role: 'status' }, copyStatus) : null,
-        error || jobError
-          ? h('div', { className: 'dk-errbox', role: 'alert' }, error || `${t('chatJobError')}: ${jobError}`)
-          : null,
         h(
           'div',
-          { className: 'dk-chat-composer' },
-          h('textarea', {
-            className: 'dk-textarea',
-            'aria-label': t('chatPlaceholder'),
-            placeholder: t('chatPlaceholder'),
-            value: input,
-            readOnly: sending,
-            onInput: (event: { target: HTMLTextAreaElement }) => setInput(event.target.value),
-            onKeyDown: (event: {
-              key: string;
-              shiftKey: boolean;
-              nativeEvent: KeyboardEvent;
-              preventDefault(): void;
-            }) => {
-              if (
-                event.key === 'Enter' &&
-                !event.shiftKey &&
-                !event.nativeEvent.isComposing &&
-                event.nativeEvent.keyCode !== 229
-              ) {
-                event.preventDefault();
-                void send();
-              }
-            },
-          }),
+          { className: 'dk-chat-form-inner' },
+          copyStatus
+            ? h('div', { className: 'dk-muted', role: 'status', style: { paddingLeft: '6px' } }, copyStatus)
+            : null,
+          error || jobError
+            ? h('div', { className: 'dk-errbox', role: 'alert' }, error || `${t('chatJobError')}: ${jobError}`)
+            : null,
           h(
-            Button,
-            {
-              type: 'submit',
-              variant: 'primary',
-              disabled: Boolean(sending || acting || activeId || historyPending || !input.trim()),
-            },
-            t(sending ? 'chatSending' : 'chatSend'),
+            'div',
+            { className: 'dk-chat-composer-box' },
+            h('textarea', {
+              ref: composerRef,
+              className: 'dk-chat-textarea',
+              rows: 1,
+              'aria-label': t('chatPlaceholder'),
+              placeholder: t('chatPlaceholder'),
+              value: input,
+              readOnly: sending,
+              onInput: (event: { target: HTMLTextAreaElement }) => setInput(event.target.value),
+              onKeyDown: (event: {
+                key: string;
+                shiftKey: boolean;
+                nativeEvent: KeyboardEvent;
+                preventDefault(): void;
+              }) => {
+                if (
+                  event.key === 'Enter' &&
+                  !event.shiftKey &&
+                  !event.nativeEvent.isComposing &&
+                  event.nativeEvent.keyCode !== 229
+                ) {
+                  event.preventDefault();
+                  void send();
+                }
+              },
+            }),
+            h(
+              'div',
+              { className: 'dk-chat-composer-bar' },
+              h('span', { className: 'dk-chat-hint' }, t('chatComposerHint')),
+              h(
+                'button',
+                {
+                  type: 'submit',
+                  className: 'dk-send-circle',
+                  title: t(sending ? 'chatSending' : 'chatSend'),
+                  'aria-label': t(sending ? 'chatSending' : 'chatSend'),
+                  disabled: Boolean(sending || acting || activeId || historyPending || !input.trim()),
+                },
+                icons.send(15),
+              ),
+            ),
           ),
         ),
       ),
@@ -1199,6 +1998,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
 
 function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
+  const icons = makeIcons(React);
   const Chat = makeRemoteChat(React, ctx, primitives);
 
   return function KnotDashboard() {
@@ -1445,293 +2245,309 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
       });
     }
 
+    const allConnected = agents.length > 0 && verifiedCount === agents.length;
+
     return h(
       'div',
-      { className: 'dk-root' },
-      toast ? h('div', { className: 'dk-toast' }, toast) : null,
+      { className: 'dk-root dk-page' },
+      toast ? h('div', { className: 'dk-toast', role: 'status' }, toast) : null,
       h(
         'div',
         { className: 'dk-wrap' },
-        // Top Header
+        // Clean Native Topbar
         h(
-          'div',
-          { className: 'dk-header' },
+          'header',
+          { className: 'dk-topbar' },
           h(
             'div',
-            { className: 'dk-header-left' },
+            { className: 'dk-topbar-left' },
             h('h1', { className: 'dk-title' }, t('title')),
             h(
-              'button',
-              { className: 'dk-capsule', disabled: checkingDoctor, onClick: () => void runDoctorAll() },
-              '↻ ',
-              checkingDoctor ? t('checking') : t('checkAll'),
+              'div',
+              { className: 'dk-summary-inline' },
+              h(
+                'span',
+                { className: 'dk-summary-item' },
+                h('span', { className: allConnected ? 'dk-dot dk-dot-ok' : 'dk-dot', 'aria-hidden': true }),
+                `${verifiedCount}/${agents.length} ${t('statusConnected')}`,
+              ),
+              pendingApprovals.length
+                ? h(
+                    'span',
+                    { className: 'dk-summary-item dk-summary-warn' },
+                    h('span', { className: 'dk-dot dk-dot-warn', 'aria-hidden': true }),
+                    `${pendingApprovals.length} ${t('kpiPending')}`,
+                  )
+                : null,
+              runningJobs.length
+                ? h(
+                    'span',
+                    { className: 'dk-summary-item' },
+                    h('span', { className: 'dk-dot dk-dot-live', 'aria-hidden': true }),
+                    `${runningJobs.length} ${t('kpiRunning')}`,
+                  )
+                : null,
+              state?.mcp.enabled && state.mcp.address
+                ? h(
+                    'span',
+                    { className: 'dk-summary-item dk-mono', style: { fontSize: '11.5px' } },
+                    `MCP ${state.mcp.address.host}:${state.mcp.address.port}`,
+                  )
+                : null,
             ),
-            h('button', { className: 'dk-capsule', onClick: () => void refreshState() }, t('refresh')),
-            state?.mcp.enabled && state.mcp.address
-              ? h(
-                  'span',
-                  { className: 'dk-capsule dk-capsule-static' },
-                  `● MCP ${state.mcp.address.host}:${state.mcp.address.port}`,
-                )
-              : null,
           ),
           h(
             'div',
-            { className: 'dk-header-right' },
+            { className: 'dk-topbar-right' },
             h(
               'button',
               {
-                className: 'dk-capsule dk-mono',
+                type: 'button',
+                className: 'dk-btn dk-btn-sm dk-btn-ghost',
+                disabled: checkingDoctor,
+                onClick: () => void runDoctorAll(),
+              },
+              icons.refresh(checkingDoctor, 13),
+              checkingDoctor ? t('checking') : t('checkAll'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dk-btn dk-btn-sm dk-btn-ghost dk-mono',
                 onClick: () => setLang((cur) => (cur === 'zh-CN' ? 'en' : 'zh-CN')),
               },
               lang === 'zh-CN' ? 'EN' : '中',
             ),
+            h(
+              'button',
+              { type: 'button', className: 'dk-btn dk-btn-primary', onClick: openAddForm },
+              icons.plus(13),
+              t('addAgent').replace(/^\+\s*/, ''),
+            ),
           ),
         ),
-        error ? h('div', { className: 'dk-warnbox' }, error) : null,
-        // Row 1: 2x2 KPIs + Needs Attention
+        error ? h('div', { className: 'dk-errbox', role: 'alert' }, error) : null,
+        // Active Approvals & Running Jobs — only shown when something actually needs attention
+        runningJobs.length > 0
+          ? h(
+              'section',
+              null,
+              h('div', { className: 'dk-group-head' }, h('span', { className: 'dk-group-label' }, t('attentionTitle'))),
+              h(
+                'div',
+                { className: 'dk-list' },
+                runningJobs.map((job) =>
+                  job.pendingApproval
+                    ? h(
+                        'div',
+                        { key: job.id, className: 'dk-job-row' },
+                        h(
+                          'div',
+                          { className: 'dk-job-top' },
+                          h(
+                            'div',
+                            { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                            h('span', { className: 'dk-dot dk-dot-warn', 'aria-hidden': true }),
+                            h('strong', { style: { fontSize: '13px' } }, `${job.agentId} · ${t('wantsApproval')}`),
+                          ),
+                          h(
+                            'div',
+                            { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+                            agents.find((a) => a.id === job.agentId)?.supportsRespond === false
+                              ? h('span', { className: 'dk-muted' }, t('approveRemotely'))
+                              : (job.pendingApproval.choices.length
+                                  ? job.pendingApproval.choices
+                                  : ['approve', 'deny']
+                                ).map((choice) =>
+                                  h(
+                                    'button',
+                                    {
+                                      key: choice,
+                                      type: 'button',
+                                      className: /deny|reject|no/i.test(choice)
+                                        ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
+                                        : 'dk-btn dk-btn-sm dk-btn-primary',
+                                      onClick: () =>
+                                        void respondApproval(job.id, job.pendingApproval?.requestId ?? '', choice),
+                                    },
+                                    choice,
+                                  ),
+                                ),
+                          ),
+                        ),
+                        h(
+                          'pre',
+                          { className: 'dk-pre dk-mono' },
+                          job.pendingApproval.text ?? job.pendingApproval.requestId,
+                        ),
+                      )
+                    : h(
+                        'div',
+                        { key: job.id, className: 'dk-job-row' },
+                        h(
+                          'div',
+                          { className: 'dk-job-top' },
+                          h(
+                            'div',
+                            { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+                            h('span', { className: 'dk-dot dk-dot-live', 'aria-hidden': true }),
+                            h('span', { style: { fontWeight: 500 } }, `${job.agentId} · ${t('runningNow')}`),
+                          ),
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dk-btn dk-btn-sm dk-btn-danger-armed',
+                              onClick: () => void cancelJob(job.id),
+                            },
+                            icons.stop(11),
+                            t('stopTask'),
+                          ),
+                        ),
+                        job.text ? h('div', { className: 'dk-muted dk-mono' }, job.text.slice(-180)) : null,
+                      ),
+                ),
+              ),
+            )
+          : null,
+        // Connected Remote Agents — Tailscale/Linear grouped list
         h(
-          'div',
-          { className: 'dk-row1' },
+          'section',
+          null,
           h(
             'div',
-            { className: 'dk-kpis' },
-            h(
-              'div',
-              { className: 'dk-card dk-kpi' },
-              h('div', { className: 'dk-muted' }, t('kpiAgents')),
-              h(
-                'div',
-                {
-                  className: 'dk-kpi-num',
-                  style: { color: agents.length > 0 && verifiedCount === agents.length ? '#15803d' : undefined },
-                },
-                `${verifiedCount}/${agents.length}`,
-              ),
-              h('div', { className: 'dk-muted' }, `${agents.length} ${t('kpiAgentsSub')}`),
-            ),
-            h(
-              'div',
-              { className: 'dk-card dk-kpi' },
-              h('div', { className: 'dk-muted' }, t('kpiPending')),
-              h(
-                'div',
-                { className: 'dk-kpi-num', style: { color: pendingApprovals.length ? '#d97706' : undefined } },
-                String(pendingApprovals.length),
-              ),
-              h('div', { className: 'dk-muted' }, t('kpiPendingSub')),
-            ),
-            h(
-              'div',
-              { className: 'dk-card dk-kpi' },
-              h('div', { className: 'dk-muted' }, t('kpiRunning')),
-              h('div', { className: 'dk-kpi-num' }, String(runningJobs.length)),
-              h('div', { className: 'dk-muted' }, t('kpiRunningSub')),
-            ),
-            h(
-              'div',
-              { className: 'dk-card dk-kpi' },
-              h('div', { className: 'dk-muted' }, t('kpiShared')),
-              h('div', { className: 'dk-kpi-num' }, String(sharedCount)),
-              h('div', { className: 'dk-muted' }, t('kpiSharedSub')),
-            ),
-          ),
-          h(
-            'div',
-            { className: 'dk-card' },
-            h(
-              'div',
-              { className: 'dk-card-head' },
-              h('span', { className: 'dk-card-title' }, t('attentionTitle')),
-              h('span', { className: 'dk-muted dk-mono' }, `v${state?.version ?? '0.1.0'}`),
-            ),
-            runningJobs.length === 0
+            { className: 'dk-list' },
+            agents.length === 0
               ? h(
                   'div',
-                  { className: 'dk-muted', style: { padding: '24px 0', textAlign: 'center' } },
-                  t('attentionEmpty'),
-                )
-              : h(
-                  'div',
-                  { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
-                  runningJobs.map((job) =>
-                    job.pendingApproval
-                      ? h(
-                          'div',
-                          { key: job.id, className: 'dk-warnbox' },
-                          h(
-                            'div',
-                            {
-                              style: {
-                                display: 'flex',
-                                justifyContent: 'space-between',
-                                alignItems: 'center',
-                                gap: '8px',
-                              },
-                            },
-                            h('strong', null, `${job.agentId} · ${t('wantsApproval')}`),
-                            h(
-                              'div',
-                              { style: { display: 'flex', gap: '6px' } },
-                              agents.find((a) => a.id === job.agentId)?.supportsRespond === false
-                                ? h('span', { className: 'dk-pill-off' }, t('approveRemotely'))
-                                : (job.pendingApproval.choices.length
-                                    ? job.pendingApproval.choices
-                                    : ['approve', 'deny']
-                                  ).map((choice) =>
-                                    h(
-                                      'button',
-                                      {
-                                        key: choice,
-                                        className: /deny|reject|no/i.test(choice)
-                                          ? 'dk-btn dk-btn-danger'
-                                          : 'dk-btn dk-btn-primary',
-                                        onClick: () =>
-                                          void respondApproval(job.id, job.pendingApproval?.requestId ?? '', choice),
-                                      },
-                                      choice,
-                                    ),
-                                  ),
-                            ),
-                          ),
-                          h(
-                            'pre',
-                            { className: 'dk-pre dk-mono' },
-                            job.pendingApproval.text ?? job.pendingApproval.requestId,
-                          ),
-                        )
-                      : h(
-                          'div',
-                          { key: job.id, className: 'dk-subbox' },
-                          h(
-                            'div',
-                            {
-                              style: {
-                                display: 'flex',
-                                justifyContent: 'space-between',
-                                alignItems: 'center',
-                                gap: '8px',
-                              },
-                            },
-                            h('span', null, `${job.agentId} · ${t('runningNow')}`),
-                            h(
-                              'button',
-                              { className: 'dk-btn dk-btn-danger', onClick: () => void cancelJob(job.id) },
-                              t('stopTask'),
-                            ),
-                          ),
-                          job.text
-                            ? h(
-                                'div',
-                                { className: 'dk-muted dk-mono', style: { marginTop: '6px' } },
-                                job.text.slice(-180),
-                              )
-                            : null,
-                        ),
+                  { className: 'dk-empty' },
+                  h('div', { style: { maxWidth: '420px' } }, t('agentsEmpty')),
+                  h(
+                    'button',
+                    { type: 'button', className: 'dk-btn dk-btn-primary', onClick: openAddForm },
+                    icons.plus(13),
+                    t('addAgent').replace(/^\+\s*/, ''),
                   ),
-                ),
-          ),
-        ),
-        // Row 2: Connected Remote Agents
-        h(
-          'div',
-          { className: 'dk-card' },
-          h(
-            'div',
-            { className: 'dk-card-head' },
-            h('span', { className: 'dk-card-title' }, t('agentsHeading')),
-            h('button', { className: 'dk-btn dk-btn-primary', onClick: openAddForm }, t('addAgent')),
-          ),
-          agents.length === 0
-            ? h('div', { className: 'dk-muted', style: { padding: '12px 0' } }, t('agentsEmpty'))
-            : h(
-                'div',
-                { className: 'dk-agents-grid' },
-                agents.map((agent) => {
+                )
+              : agents.map((agent) => {
                   const steps = agent.connection?.steps;
                   const connStatus = agent.connection?.status ?? 'unverified';
                   const isOpen = Boolean(expandedDoctor[agent.id]);
+                  const isDeleteArmed = confirmDeleteId === agent.id;
                   const endpoint = agent.acpTransport === 'stdio' ? 'Local stdio' : formatDirectEndpoint(agent);
+                  const dotClass =
+                    connStatus === 'connected'
+                      ? 'dk-dot dk-dot-ok'
+                      : connStatus === 'error'
+                        ? 'dk-dot dk-dot-err'
+                        : 'dk-dot';
                   return h(
                     'div',
-                    { key: agent.id, className: 'dk-subbox' },
+                    { key: agent.id, className: 'dk-agent-row' },
                     h(
                       'div',
-                      {
-                        style: {
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'flex-start',
-                          gap: '8px',
-                        },
-                      },
+                      { className: 'dk-agent-main' },
                       h(
                         'div',
-                        null,
+                        { className: 'dk-agent-left' },
                         h(
-                          'div',
-                          { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
-                          h('span', { style: { fontWeight: 600, fontSize: '14px' } }, agent.id),
-                          connStatus === 'connected'
-                            ? h('span', { className: 'dk-pill-ok' }, t('statusConnected'))
-                            : connStatus === 'error'
-                              ? h(
-                                  'span',
-                                  { className: 'dk-pill-err' },
-                                  `${t('statusFailed')}${agent.connection?.failedStep ? `: ${agent.connection.failedStep}` : ''}`,
-                                )
-                              : h('span', { className: 'dk-pill-off' }, t('statusUnverified')),
-                          agent.hasToken ? h('span', { className: 'dk-pill-off' }, t('tokenConfigured')) : null,
+                          'span',
+                          {
+                            className: 'dk-agent-dot-wrap',
+                            title: t(
+                              connStatus === 'connected'
+                                ? 'statusConnected'
+                                : connStatus === 'error'
+                                  ? 'statusFailed'
+                                  : 'statusUnverified',
+                            ),
+                          },
+                          h('span', { className: dotClass, 'aria-hidden': true }),
                         ),
                         h(
                           'div',
-                          { className: 'dk-muted dk-mono', style: { marginTop: '2px' } },
-                          `${agent.kind} · ${endpoint}`,
+                          { className: 'dk-agent-info' },
+                          h(
+                            'div',
+                            { className: 'dk-agent-title-line' },
+                            h('span', { className: 'dk-agent-name' }, agent.id),
+                            h('span', { className: 'dk-agent-kind dk-mono' }, agent.kind),
+                            agent.hasToken
+                              ? h('span', { className: 'dk-agent-key', title: t('tokenConfigured') }, icons.key(12))
+                              : null,
+                          ),
+                          h('div', { className: 'dk-agent-sub dk-mono', title: endpoint }, endpoint),
                         ),
                       ),
                       h(
                         'div',
-                        { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
-                        h(
-                          'button',
-                          { className: 'dk-btn-link', onClick: () => setChatAgentId(agent.id) },
-                          t('chatWithAgent'),
-                        ),
-                        h('button', { className: 'dk-btn', onClick: () => openEditForm(agent) }, t('editAgent')),
-                        h(
-                          'button',
-                          {
-                            className: 'dk-btn dk-btn-danger',
-                            onClick: () => void removeAgent(agent.id),
-                            onBlur: () => setConfirmDeleteId((cur) => (cur === agent.id ? null : cur)),
-                          },
-                          confirmDeleteId === agent.id ? t('confirmDeleteAgent') : t('deleteAgent'),
-                        ),
-                        h(
-                          'button',
-                          {
-                            className: 'dk-btn',
-                            disabled: checkingDoctor,
-                            onClick: () => void runDoctorAll(agent.id),
-                          },
-                          t('retest'),
-                        ),
+                        { className: 'dk-agent-actions' },
                         steps
                           ? h(
                               'button',
                               {
-                                className: 'dk-btn',
+                                type: 'button',
+                                className: 'dk-btn dk-btn-sm dk-btn-ghost',
                                 onClick: () => setExpandedDoctor((prev) => ({ ...prev, [agent.id]: !prev[agent.id] })),
                               },
                               isOpen ? t('hide') : t('details'),
+                              icons.chevronDown(12, isOpen),
                             )
                           : null,
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dk-btn dk-btn-icon dk-btn-ghost',
+                            title: t('retest'),
+                            'aria-label': t('retest'),
+                            disabled: checkingDoctor,
+                            onClick: () => void runDoctorAll(agent.id),
+                          },
+                          icons.refresh(false, 13),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dk-btn dk-btn-icon dk-btn-ghost',
+                            title: t('editAgent'),
+                            'aria-label': t('editAgent'),
+                            onClick: () => openEditForm(agent),
+                          },
+                          icons.edit(13),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: isDeleteArmed
+                              ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
+                              : 'dk-btn dk-btn-icon dk-btn-danger',
+                            title: t('deleteAgent'),
+                            'aria-label': t('deleteAgent'),
+                            onClick: () => void removeAgent(agent.id),
+                            onBlur: () => setConfirmDeleteId((cur) => (cur === agent.id ? null : cur)),
+                          },
+                          icons.trash(13),
+                          isDeleteArmed ? t('confirmDeleteAgent') : null,
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dk-btn dk-btn-sm dk-btn-chat-go',
+                            onClick: () => setChatAgentId(agent.id),
+                          },
+                          t('chatWithAgent'),
+                        ),
                       ),
                     ),
                     connStatus === 'error' && agent.connection?.error && !isOpen
                       ? h(
                           'div',
-                          { className: 'dk-errbox', style: { marginTop: '8px', fontSize: '12px' } },
+                          { className: 'dk-row-err', role: 'alert' },
                           h(
                             'div',
                             { className: 'dk-mono', style: { fontWeight: 500 } },
@@ -1743,96 +2559,93 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                     isOpen && steps
                       ? h(
                           'div',
-                          {
-                            style: {
-                              marginTop: '10px',
-                              paddingTop: '8px',
-                              borderTop: '1px solid var(--dsw-alias-border-l3, rgba(0,0,0,0.08))',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: '6px',
-                            },
-                          },
-                          steps.map((step) =>
+                          { className: 'dk-diag' },
+                          ...steps.flatMap((step) => [
                             h(
-                              'div',
+                              'span',
                               {
-                                key: step.name,
-                                className: 'dk-mono',
-                                style: {
-                                  fontSize: '11.5px',
-                                  display: 'flex',
-                                  flexDirection: 'column',
-                                  gap: '2px',
-                                },
+                                key: `s-${step.name}`,
+                                className: `dk-diag-step dk-mono ${step.ok ? 'dk-diag-ok' : 'dk-diag-err'}`,
                               },
-                              h(
-                                'div',
-                                { style: { display: 'flex', justifyContent: 'space-between', gap: '8px' } },
-                                h(
-                                  'span',
-                                  { style: { color: step.ok ? '#15803d' : '#dc2626', fontWeight: 500 } },
-                                  `${step.ok ? '✓' : '!'} ${step.name}`,
-                                ),
-                                h('span', { className: 'dk-muted', style: { wordBreak: 'break-word' } }, step.detail),
-                              ),
-                              step.hint ? h('div', { className: 'dk-muted' }, `→ ${step.hint}`) : null,
+                              step.ok ? icons.check(12) : icons.alert(12),
+                              step.name,
                             ),
-                          ),
+                            h('span', { key: `d-${step.name}`, className: 'dk-diag-detail dk-mono' }, step.detail),
+                            step.hint
+                              ? h('div', { key: `h-${step.name}`, className: 'dk-diag-hint' }, `→ ${step.hint}`)
+                              : null,
+                          ]),
                         )
                       : null,
                   );
                 }),
-              ),
-        ),
-        h(
-          'div',
-          { className: 'dk-card' },
-          h(
-            'div',
-            { className: 'dk-card-head' },
-            h(
-              'div',
-              null,
-              h('div', { className: 'dk-card-title' }, t('shareHeading')),
-              h('div', { className: 'dk-muted' }, t('shareSub')),
-            ),
-            state?.mcp.enabled ? h('button', { className: 'dk-capsule', onClick: copyYaml }, t('copyYaml')) : null,
           ),
-          !state?.mcp.enabled
-            ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('mcpDisabled'))
-            : state.mcp.localSessions.length === 0
-              ? h('div', { className: 'dk-muted', style: { padding: '16px 0' } }, t('noLocalSessions'))
-              : h(
-                  'div',
-                  { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
-                  state.mcp.localSessions.map((item) =>
-                    h(
-                      'div',
-                      {
-                        key: item.sessionId,
-                        className: 'dk-subbox',
-                        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' },
-                      },
+        ),
+        // Shared Local Chats (Read-only MCP) — quiet 1-line footnote when off, grouped list when on
+        !state?.mcp.enabled
+          ? h(
+              'div',
+              { className: 'dk-mcp-footnote' },
+              icons.shield(13),
+              h('span', null, `${t('shareHeading')} · ${t('mcpDisabled')}`),
+            )
+          : h(
+              'section',
+              null,
+              h(
+                'div',
+                { className: 'dk-group-head' },
+                h('span', { className: 'dk-group-label' }, `${t('shareHeading')} (${sharedCount})`),
+                h(
+                  'button',
+                  { type: 'button', className: 'dk-btn dk-btn-sm dk-btn-ghost', onClick: copyYaml },
+                  icons.copy(12),
+                  t('copyYaml'),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'dk-list' },
+                state.mcp.localSessions.length === 0
+                  ? h('div', { className: 'dk-empty', style: { padding: '24px' } }, t('noLocalSessions'))
+                  : state.mcp.localSessions.map((item) =>
                       h(
                         'div',
-                        { style: { minWidth: 0 } },
-                        h('div', { style: { fontWeight: 500 } }, item.title ?? item.sessionId),
-                        h('div', { className: 'dk-muted dk-mono' }, item.sessionId),
-                      ),
-                      h(
-                        'button',
-                        {
-                          className: item.shared ? 'dk-pill-ok' : 'dk-pill-off',
-                          style: { cursor: 'pointer' },
-                          onClick: () => void toggleShare(item.sessionId, !item.shared),
-                        },
-                        item.shared ? t('sharedOn') : t('sharedOff'),
+                        { key: item.sessionId, className: 'dk-mcp-row' },
+                        h(
+                          'div',
+                          { style: { minWidth: 0 } },
+                          h(
+                            'div',
+                            {
+                              style: {
+                                fontWeight: 500,
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              },
+                            },
+                            item.title ?? item.sessionId,
+                          ),
+                          h('div', { className: 'dk-muted dk-mono', style: { fontSize: '11.5px' } }, item.sessionId),
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: item.shared ? 'dk-switch is-on' : 'dk-switch is-off',
+                            onClick: () => void toggleShare(item.sessionId, !item.shared),
+                          },
+                          h('span', {
+                            className: item.shared ? 'dk-dot dk-dot-ok' : 'dk-dot',
+                            'aria-hidden': true,
+                          }),
+                          item.shared ? t('sharedOn') : t('sharedOff'),
+                        ),
                       ),
                     ),
-                  ),
-                ),
-        ),
+              ),
+            ),
         form
           ? h(
               'div',
@@ -1841,12 +2654,24 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 'div',
                 {
                   className: 'dk-modal',
+                  role: 'dialog',
+                  'aria-modal': true,
                   onClick: (e: { stopPropagation?: () => void }) => e.stopPropagation?.(),
                 },
                 h(
                   'div',
-                  { className: 'dk-card-head', style: { marginBottom: 0 } },
-                  h('span', { className: 'dk-card-title' }, t(form.editing ? 'modalEditTitle' : 'modalAddTitle')),
+                  { className: 'dk-modal-head' },
+                  h('h3', { className: 'dk-modal-title' }, t(form.editing ? 'modalEditTitle' : 'modalAddTitle')),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dk-btn dk-btn-sm dk-btn-ghost',
+                      'aria-label': t('closeBtn'),
+                      onClick: () => setForm(null),
+                    },
+                    icons.close(15),
+                  ),
                 ),
                 h(
                   'div',
@@ -1939,10 +2764,10 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 form.transport === 'direct'
                   ? h(
                       'div',
-                      { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+                      { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
                       h(
                         'div',
-                        { className: 'dk-muted', style: { fontSize: '11.5px' } },
+                        { className: 'dk-infobox' },
                         t(
                           form.kind === 'hermes'
                             ? 'hermesSetupTip'
@@ -1981,7 +2806,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 form.kind === 'acp' && form.transport === 'local'
                   ? h(
                       'div',
-                      { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+                      { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
                       h(
                         'div',
                         { className: 'dk-field-row' },
@@ -2051,7 +2876,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 form.editing && form.hasToken
                   ? h(
                       'label',
-                      { style: { display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' } },
+                      { style: { display: 'flex', alignItems: 'center', gap: '7px', fontSize: '12px' } },
                       h('input', {
                         type: 'checkbox',
                         checked: form.clearToken,
@@ -2083,11 +2908,16 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 ),
                 h(
                   'div',
-                  { style: { display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '4px' } },
-                  h('button', { className: 'dk-btn', disabled: saving, onClick: () => setForm(null) }, t('cancelBtn')),
+                  { className: 'dk-modal-foot' },
+                  h(
+                    'button',
+                    { type: 'button', className: 'dk-btn', disabled: saving, onClick: () => setForm(null) },
+                    t('cancelBtn'),
+                  ),
                   h(
                     'button',
                     {
+                      type: 'button',
                       className: 'dk-btn dk-btn-primary',
                       disabled: saving,
                       onClick: () => void saveAgentForm(),

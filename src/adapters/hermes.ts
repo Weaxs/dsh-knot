@@ -9,15 +9,25 @@ import type {
   AgentEvent,
   AgentPromptOptions,
   AgentSession,
+  AgentToolActivity,
   AgentTranscriptMessage,
   Transport,
 } from '../types.js';
 import { readSse } from './sse.js';
 
 const MAX_TRANSCRIPT_MESSAGES = 200;
+const MAX_TRANSCRIPT_THOUGHT_LENGTH = 16_000;
+const MAX_TRANSCRIPT_TOOLS = 50;
 const MAX_TRACKED_RUNS = 500;
 const STOP_TIMEOUT_MS = 4_000;
 const TERMINAL_RUN_STATUSES = new Set(['cancelled', 'canceled', 'completed', 'failed', 'interrupted']);
+const APPROVAL_SETTLED_RE = /responded|resolved|settled|completed|approved|denied|rejected|cancelled/;
+const REASONING_EVENT_RE = /^(?:reasoning|thinking|thought)(?:\.|$)/;
+
+interface HermesApprovalContext {
+  runId: string;
+  executionGeneration?: number;
+}
 
 export class HermesAdapter implements AgentAdapter {
   readonly kind = 'hermes' as const;
@@ -25,6 +35,7 @@ export class HermesAdapter implements AgentAdapter {
   private readonly closing = new AbortController();
   private readonly admissions = new Map<string, Promise<string>>();
   private readonly runs = new Map<string, string>();
+  private readonly approvalContexts = new Map<string, HermesApprovalContext>();
 
   constructor(
     readonly id: string,
@@ -58,9 +69,10 @@ export class HermesAdapter implements AgentAdapter {
       .map((row: Record<string, unknown>) => {
         const updatedAt =
           typeof row.last_active === 'number' ? row.last_active * 1_000 : (row.last_active ?? row.updated_at);
+        const title = firstNonEmptyString(row.title, row.preview);
         return {
           id: String(row.session_id ?? row.id ?? ''),
-          ...(row.title === undefined && row.preview === undefined ? {} : { title: String(row.title ?? row.preview) }),
+          ...(title ? { title } : {}),
           ...(typeof updatedAt === 'number' || typeof updatedAt === 'string' ? { updatedAt } : {}),
         };
       })
@@ -76,12 +88,15 @@ export class HermesAdapter implements AgentAdapter {
 
     const messages: AgentTranscriptMessage[] = [];
     const ids = new Set<string>();
+    const token = secret(this.config);
     // shortcut: keep a recent message window until the chat supports loading older pages.
     for (let index = rows.length - 1; index >= 0 && messages.length < MAX_TRANSCRIPT_MESSAGES; index--) {
       const row = rows[index];
       if (row?.role !== 'user' && row?.role !== 'assistant') continue;
       const text = transcriptText(row.content);
-      if (!text.trim()) continue;
+      const thought = row.role === 'assistant' ? transcriptThought(row.reasoning_content ?? row.reasoning) : undefined;
+      const tools = row.role === 'assistant' ? transcriptTools(row.tool_calls, index, token) : undefined;
+      if (!text.trim() && !thought && !tools?.length) continue;
       const remoteId = row.id;
       const candidate =
         (typeof remoteId === 'string' && remoteId.length > 0) || Number.isSafeInteger(remoteId)
@@ -89,7 +104,13 @@ export class HermesAdapter implements AgentAdapter {
           : '';
       const id = candidate && !ids.has(candidate) ? candidate : `row:${index}`;
       ids.add(id);
-      messages.push({ id, role: row.role, text });
+      messages.push({
+        id,
+        role: row.role,
+        text,
+        ...(thought ? { thought } : {}),
+        ...(tools?.length ? { tools } : {}),
+      });
     }
     return messages.reverse();
   }
@@ -154,19 +175,48 @@ export class HermesAdapter implements AgentAdapter {
           };
           continue;
         }
+        if (isApproval) {
+          // Hermes session_authority emits `prompt_id` + `execution_generation`; legacy runs emit `request_id`.
+          const requestId = firstNonEmptyString(event.prompt_id, event.request_id, event.id, frame.id);
+          if (APPROVAL_SETTLED_RE.test(type)) {
+            if (requestId) {
+              this.approvalContexts.delete(approvalKey(id, requestId));
+              yield { type: 'approval', phase: 'end', requestId };
+            }
+          } else {
+            const executionGeneration =
+              typeof event.execution_generation === 'number' && Number.isInteger(event.execution_generation)
+                ? event.execution_generation
+                : undefined;
+            if (requestId) this.rememberApproval(id, requestId, runId, executionGeneration);
+            yield {
+              type: 'approval',
+              requestId,
+              text: formatApprovalText(event.description, event.command),
+              choices: stringChoices(event.choices),
+            };
+          }
+          continue;
+        }
+        if (REASONING_EVENT_RE.test(type)) {
+          const thought = textOf(event.delta ?? event.text_delta ?? event.text ?? event.content);
+          if (thought) yield { type: 'thought', text: thought };
+          continue;
+        }
+        if (type === 'message.interim') {
+          if (event.already_streamed !== true) {
+            const interim = textOf(event.text ?? event.content ?? event.delta);
+            if (interim) {
+              output += interim;
+              yield { type: 'text', text: interim };
+            }
+          }
+          continue;
+        }
         const textDelta = textOf(event.delta ?? event.text_delta ?? event.content);
         if (textDelta) {
           output += textDelta;
           yield { type: 'text', text: textDelta };
-        }
-        if (isApproval && !/responded|resolved|completed|approved|denied|rejected|cancelled/.test(type)) {
-          const requestId = String(event.request_id ?? event.id ?? frame.id ?? '');
-          yield {
-            type: 'approval',
-            requestId,
-            text: String(event.description ?? event.command ?? 'Approval requested'),
-            choices: stringChoices(event.choices),
-          };
         }
         if (/^run\.(completed|failed|cancelled|interrupted)$/.test(type)) {
           terminal = true;
@@ -224,17 +274,26 @@ export class HermesAdapter implements AgentAdapter {
   }
 
   async respond(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
-    const runId = this.runs.get(sessionId);
+    const key = approvalKey(sessionId, requestId);
+    const context = this.approvalContexts.get(key);
+    const runId = context?.runId ?? this.runs.get(sessionId);
     if (!runId) throw new Error(`No active Hermes run is recorded for session ${sessionId}`);
+    // Hermes session_authority strictly requires the exact 3-key set including `execution_generation`.
+    const body =
+      context?.executionGeneration !== undefined
+        ? { request_id: requestId, execution_generation: context.executionGeneration, choice }
+        : { request_id: requestId, choice };
     await this.json(`/v1/runs/${encodeURIComponent(runId)}/approval`, {
       method: 'POST',
-      body: { request_id: requestId, choice },
+      body,
       signal,
     });
+    this.approvalContexts.delete(key);
   }
 
   async close(): Promise<void> {
     this.closing.abort(new Error('Hermes adapter closed'));
+    this.approvalContexts.clear();
     await this.transport.close();
   }
 
@@ -261,6 +320,7 @@ export class HermesAdapter implements AgentAdapter {
     };
     signal?.addEventListener('abort', abortAdmission, { once: true });
     this.runs.delete(id);
+    this.clearSessionApprovals(id);
     const admission = this.json('/v1/runs', {
       method: 'POST',
       body: { input: text, session_id: id, ...(this.config.model ? { model: this.config.model } : {}) },
@@ -289,6 +349,24 @@ export class HermesAdapter implements AgentAdapter {
       const oldest = this.runs.keys().next().value;
       if (oldest === undefined) break;
       this.runs.delete(oldest);
+    }
+  }
+
+  private rememberApproval(sessionId: string, requestId: string, runId: string, executionGeneration?: number): void {
+    const key = approvalKey(sessionId, requestId);
+    this.approvalContexts.delete(key);
+    this.approvalContexts.set(key, { runId, executionGeneration });
+    while (this.approvalContexts.size > MAX_TRACKED_RUNS) {
+      const oldest = this.approvalContexts.keys().next().value;
+      if (oldest === undefined) break;
+      this.approvalContexts.delete(oldest);
+    }
+  }
+
+  private clearSessionApprovals(sessionId: string): void {
+    const prefix = `${sessionId}\0`;
+    for (const key of this.approvalContexts.keys()) {
+      if (key.startsWith(prefix)) this.approvalContexts.delete(key);
     }
   }
 
@@ -355,6 +433,64 @@ function textOf(value: unknown): string {
     return textOf(row.text ?? row.content ?? row.output_text ?? row.output ?? row.message);
   }
   return '';
+}
+
+function approvalKey(sessionId: string, requestId: string): string {
+  return `${sessionId}\0${requestId}`;
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  }
+  return '';
+}
+
+function formatApprovalText(description: unknown, command: unknown): string {
+  const desc = typeof description === 'string' ? description.trim() : '';
+  const cmd = typeof command === 'string' ? command.trim() : '';
+  if (desc && cmd && desc !== cmd && !desc.includes(cmd)) return `${desc}\n${cmd}`;
+  return desc || cmd || 'Approval requested';
+}
+
+function transcriptThought(value: unknown): string | undefined {
+  const thought = textOf(value).trim();
+  return thought ? thought.slice(-MAX_TRANSCRIPT_THOUGHT_LENGTH) : undefined;
+}
+
+function transcriptTools(rawToolCalls: unknown, rowIndex: number, token?: string): AgentToolActivity[] | undefined {
+  if (!Array.isArray(rawToolCalls) || rawToolCalls.length === 0) return undefined;
+  const tools: AgentToolActivity[] = [];
+  for (let i = 0; i < rawToolCalls.length && tools.length < MAX_TRANSCRIPT_TOOLS; i++) {
+    const item = rawToolCalls[i] as Record<string, unknown> | null | undefined;
+    if (!item || typeof item !== 'object') continue;
+    const fn = item.function as Record<string, unknown> | null | undefined;
+    const rawName = fn?.name ?? item.name ?? item.tool ?? item.tool_name;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim().slice(0, 120) : 'tool';
+    const rawArgs = fn?.arguments ?? item.arguments ?? item.input;
+    const parsedArgs = parseToolArguments(rawArgs);
+    const inputPreview = toolInputPreview(parsedArgs, token);
+    const callId = firstNonEmptyString(item.id, item.tool_call_id) || `row:${rowIndex}:tool:${i}`;
+    tools.push({
+      id: callId,
+      name,
+      status: 'completed',
+      ...(inputPreview ? { inputPreview } : {}),
+    });
+  }
+  return tools.length > 0 ? tools : undefined;
+}
+
+function parseToolArguments(raw: unknown): unknown {
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return trimmed;
+  }
 }
 
 function stringChoices(value: unknown): string[] {

@@ -82,6 +82,8 @@ export interface AgentTranscriptMessage {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  thought?: string;
+  tools?: AgentToolActivity[];
 }
 
 export interface AgentPromptOptions {
@@ -139,6 +141,11 @@ export interface AgentToolActivity {
   inputPreview?: string;
 }
 
+export type AgentTimelineEntry =
+  | { kind: 'thought'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; toolId: string };
+
 export interface AgentJob {
   id: string;
   agentId: string;
@@ -150,6 +157,7 @@ export interface AgentJob {
   text: string;
   thought?: string;
   tools?: AgentToolActivity[];
+  timeline?: AgentTimelineEntry[];
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed';
   pendingApproval?: { requestId: string; choices: string[]; text?: string };

@@ -19,7 +19,9 @@ export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 const MAX_JOBS = 200;
 const MAX_JOB_TOOLS = 50;
 const MAX_JOB_APPROVALS = 50;
+const MAX_JOB_TEXT_LENGTH = 2_000_000;
 const MAX_JOB_THOUGHT_LENGTH = 16_000;
+const MAX_JOB_TIMELINE = 120;
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -493,11 +495,15 @@ export class AgentManager {
             this.latestSessionJob.set(key, job.id);
           }
         }
-        if (event.type === 'text' && event.text) job.text = (job.text + event.text).slice(-2_000_000);
-        else if (event.type === 'thought' && event.text) {
+        if (event.type === 'text' && event.text) {
+          job.text = (job.text + event.text).slice(-MAX_JOB_TEXT_LENGTH);
+          appendTimelineText(job, 'text', event.text, MAX_JOB_TEXT_LENGTH);
+        } else if (event.type === 'thought' && event.text) {
           job.thought = ((job.thought ?? '') + event.text).slice(-MAX_JOB_THOUGHT_LENGTH);
-        } else if (event.type === 'tool' && (event.phase || event.requestId)) recordToolActivity(job, event);
-        else if (event.type === 'approval' && job.status === 'running') {
+          appendTimelineText(job, 'thought', event.text, MAX_JOB_THOUGHT_LENGTH);
+        } else if (event.type === 'tool' && (event.phase || event.requestId)) {
+          recordToolActivity(job, event);
+        } else if (event.type === 'approval' && job.status === 'running') {
           const requestId = event.requestId ?? '';
           if (event.phase === 'end') this.removeApproval(job, requestId);
           else {
@@ -513,7 +519,10 @@ export class AgentManager {
           }
         } else if (event.type === 'error') throw new Error(event.text ?? 'remote agent failed');
         else if (event.type === 'final') {
-          if (event.text) job.text = event.text.slice(-2_000_000);
+          if (event.text) {
+            job.text = event.text.slice(-MAX_JOB_TEXT_LENGTH);
+            reconcileFinalTimelineText(job, event.text);
+          }
           if (job.status === 'running') {
             if (event.stopReason === 'cancelled') {
               job.status = 'cancelled';
@@ -581,6 +590,54 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   job.tools = previous
     ? tools.map((tool, i) => (i === index ? activity : tool))
     : [...tools.slice(-(MAX_JOB_TOOLS - 1)), activity];
+  if (!previous) {
+    appendTimelineTool(job, activity.id);
+    if (tools.length >= MAX_JOB_TOOLS && job.timeline) {
+      const liveIds = new Set(job.tools.map((tool) => tool.id));
+      job.timeline = job.timeline.filter((entry) => entry.kind !== 'tool' || liveIds.has(entry.toolId));
+    }
+  }
+}
+
+function appendTimelineText(job: AgentJob, kind: 'text' | 'thought', chunk: string, maxLength: number): void {
+  const timeline = job.timeline ?? [];
+  const last = timeline.at(-1);
+  if (last && last.kind === kind) {
+    last.text = (last.text + chunk).slice(-maxLength);
+  } else {
+    job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind, text: chunk.slice(-maxLength) }];
+  }
+}
+
+function appendTimelineTool(job: AgentJob, toolId: string): void {
+  const timeline = job.timeline ?? [];
+  if (timeline.some((entry) => entry.kind === 'tool' && entry.toolId === toolId)) return;
+  job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind: 'tool', toolId }];
+}
+
+function reconcileFinalTimelineText(job: AgentJob, finalText: string): void {
+  const bounded = finalText.slice(-MAX_JOB_TEXT_LENGTH);
+  const timeline = job.timeline ?? [];
+  const textEntries = timeline.filter((entry): entry is { kind: 'text'; text: string } => entry.kind === 'text');
+  if (textEntries.length === 0) {
+    appendTimelineText(job, 'text', bounded, MAX_JOB_TEXT_LENGTH);
+    return;
+  }
+  const combined = textEntries.map((entry) => entry.text).join('');
+  const lastEntry = timeline.at(-1);
+  const lastText = textEntries.at(-1)!;
+  if (combined === bounded || lastText.text === bounded || lastText.text.endsWith(bounded)) {
+    return;
+  }
+  if (lastEntry?.kind === 'text' && bounded.startsWith(combined)) {
+    lastEntry.text = (lastEntry.text + bounded.slice(combined.length)).slice(-MAX_JOB_TEXT_LENGTH);
+    return;
+  }
+  if (lastEntry?.kind === 'text') {
+    lastEntry.text = bounded;
+  } else {
+    appendTimelineText(job, 'text', bounded, MAX_JOB_TEXT_LENGTH);
+  }
 }
 
 function sessionKey(agentId: string, sessionId: string): string {
