@@ -20,7 +20,7 @@ Every job tests exactly one target:
 4. Continue the same remote session and ask the model to repeat it.
 5. Require the second result to contain the same token. Hermes also verifies that the session appears in history.
 
-The second response verifies a real model invocation and remote session continuity. A manual `workflow_dispatch` without required credentials fails explicitly. Push and scheduled runs emit a visible warning and skip only the missing E2E jobs; they never substitute mocks or report skipped jobs as passing.
+The second response verifies a real model invocation and remote session continuity. A manual `workflow_dispatch` without required credentials fails explicitly. Push, pull request, and scheduled runs emit a visible warning and skip only the missing E2E jobs (for example on fork pull requests without repository secrets); they never substitute mocks or report skipped jobs as passing.
 
 ## Required secrets
 
@@ -72,7 +72,7 @@ This keeps DSH's authenticated browser trust boundary intact while exercising th
 
 ## Running the workflow
 
-Run **Transport Integration Tests** manually through `workflow_dispatch`, optionally selecting one transport, target, and protocol (`native` or `acp`), or let it run when E2E-related files change on `main` or on its weekly schedule. The normal `CI` workflow separately runs Biome, TypeScript, unit/protocol tests, build, and package checks without model credentials.
+Run **Transport Integration Tests** manually through `workflow_dispatch`, optionally selecting one transport, target, and protocol (`native` or `acp`), or let it run automatically on pull requests targeting `main` and pushes to `main` when runtime, build, or E2E files change, as well as on its weekly schedule. The normal `CI` workflow separately runs version sync, Biome, TypeScript, unit/protocol tests, build, and package checks without model credentials.
 
 To run one transport/target locally with Docker and the same credentials:
 
