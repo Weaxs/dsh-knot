@@ -1322,6 +1322,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
   const icons = makeIcons(React);
   const { CommandText, MarkdownText, UserMessageBubble } = primitives;
   const submissions = new Map<string, { message: string; sessionId: string; id: string }>();
+  const lastIdleBaselines = new Map<string, { length: number; lastId?: string; lastUserId?: string }>();
 
   return function ChatThread({
     agent,
@@ -1357,8 +1358,14 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const [observedJob, setObservedJob] = React.useState(initialJob);
     const [historyJobId, setHistoryJobId] = React.useState(initialJob?.id);
     const [retryMatchedJobId, setRetryMatchedJobId] = React.useState<string | undefined>(undefined);
+    const sessionBaselineKey = session ? `${agent.revision}\0${session}` : '';
     const historyBaselines = React.useRef<Map<string, { length: number; lastId?: string; lastUserId?: string }>>(
-      new Map(),
+      (() => {
+        const seeded = new Map<string, { length: number; lastId?: string; lastUserId?: string }>();
+        const prior = sessionBaselineKey ? lastIdleBaselines.get(sessionBaselineKey) : undefined;
+        if (initialJob && prior) seeded.set(initialJob.id, prior);
+        return seeded;
+      })(),
     );
     const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
     const [copyStatus, setCopyStatus] = React.useState('');
@@ -1372,9 +1379,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const followTail = React.useRef(true);
     const canReadHistory = Boolean(agent.supportsSessionMessages && session);
     const isAvailableAndRunning = (job?: JobSummary) => job?.id !== unavailableJobId && isRunning(job);
-    const initialJobRunning = Boolean(
-      initialJob && observedJob?.id === initialJob.id && isAvailableAndRunning(observedJob),
-    );
+    const observedJobRunning = Boolean(observedJob && isAvailableAndRunning(observedJob));
 
     React.useEffect(() => {
       alive.current = true;
@@ -1394,9 +1399,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     React.useEffect(() => {
       if (!canReadHistory) return;
       const controller = new AbortController();
-      const runningJobId = initialJobRunning ? observedJob?.id : undefined;
+      const runningJobId = observedJobRunning ? observedJob?.id : undefined;
       const settledJobId =
-        !initialJobRunning && observedJob && !isAvailableAndRunning(observedJob) ? observedJob.id : undefined;
+        !observedJobRunning && observedJob && !isAvailableAndRunning(observedJob) ? observedJob.id : undefined;
+      if (runningJobId && sessionBaselineKey && !historyBaselines.current.has(runningJobId)) {
+        const prior = lastIdleBaselines.get(sessionBaselineKey);
+        if (prior) historyBaselines.current.set(runningJobId, prior);
+      }
       setHistoryError('');
       void apiPost<{ messages: TranscriptMessage[] }>(
         ctx,
@@ -1407,14 +1416,24 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       )
         .then(({ messages }) => {
           if (controller.signal.aborted) return;
+          const snapshot = {
+            length: messages.length,
+            lastId: messages.at(-1)?.id,
+            lastUserId: messages.findLast((item) => item.role === 'user')?.id,
+          };
           if (runningJobId) {
-            const lastUser = messages.findLast((item) => item.role === 'user');
-            historyBaselines.current.set(runningJobId, {
-              length: messages.length,
-              lastId: messages.at(-1)?.id,
-              lastUserId: lastUser?.id,
-            });
+            if (!historyBaselines.current.has(runningJobId)) {
+              historyBaselines.current.set(runningJobId, snapshot);
+            }
+          } else if (sessionBaselineKey) {
+            lastIdleBaselines.delete(sessionBaselineKey);
+            lastIdleBaselines.set(sessionBaselineKey, snapshot);
+            if (lastIdleBaselines.size > 200) {
+              const oldest = lastIdleBaselines.keys().next().value;
+              if (oldest !== undefined) lastIdleBaselines.delete(oldest);
+            }
           }
+          if (runningJobId ?? settledJobId) setHistoryJobId(runningJobId ?? settledJobId);
           setHistoryMeta({ fetchedWhileRunning: Boolean(runningJobId), settledJobId });
           setHistory(messages);
         })
@@ -1422,7 +1441,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           if (!controller.signal.aborted) setHistoryError(errorMessage(error));
         });
       return () => controller.abort();
-    }, [agent.id, agent.revision, canReadHistory, historyAttempts, initialJobRunning, observedJob?.id, session]);
+    }, [agent.id, agent.revision, canReadHistory, historyAttempts, observedJobRunning, observedJob?.id, session]);
 
     const ownRunning = turns.find(isAvailableAndRunning);
     const listedRunning = jobs.find(
@@ -1742,10 +1761,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       // Prove that history actually includes THIS settled run rather than an identical previous turn:
       // 1) Explicit idempotent retry already matched on send()
       const retryProven = retryMatchedJobId === job.id;
-      // 2) Normalized tool-call identity match between live job tools and persisted history tools
-      const persistedToolIds = new Set(lastTurnAssistant.flatMap((item) => (item.tools ?? []).map((tool) => tool.id)));
-      const toolIdentityProven = Boolean(job.tools?.some((tool) => persistedToolIds.has(tool.id)));
-      // 3) History fetched after completion strictly advanced past the pre-completion running baseline
+      // 2) History fetched after completion strictly advanced past the pre-completion baseline
+      // (provider tool-call IDs can repeat across turns, so they must never override an unchanged tail).
       const baseline = historyBaselines.current.get(job.id);
       const postCompleteFetch = !historyMeta.fetchedWhileRunning && historyMeta.settledJobId === job.id;
       const baselineEndedOnAssistant = Boolean(baseline?.lastId && baseline.lastId !== baseline.lastUserId);
@@ -1755,7 +1772,9 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           (history.length > baseline.length || history.at(-1)?.id !== baseline.lastId) &&
           (!baselineEndedOnAssistant || lastUser?.id !== baseline.lastUserId),
       );
-      if (!retryProven && !toolIdentityProven && !historyAdvanced) return undefined;
+      // 3) A fast job that settled before any baseline could be captured, matched by a post-completion fetch
+      const postCompleteUnbaselined = !baseline && postCompleteFetch;
+      if (!retryProven && !historyAdvanced && !postCompleteUnbaselined) return undefined;
 
       return { startIndex: turnStart, persistedTurn: history.slice(turnStart) };
     };
@@ -1770,6 +1789,143 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             (job) => belongsToSession(job) && !turns.some(({ id }) => id === job.id) && job.id !== liveJob?.id,
           )
         : [];
+
+    type TurnSegment =
+      | { kind: 'thought'; text: string }
+      | { kind: 'commentary'; text: string }
+      | { kind: 'tool'; tool: ToolActivitySummary }
+      | { kind: 'text'; text: string };
+
+    const mergeToolDetails = (live: ToolActivitySummary, persisted?: ToolActivitySummary): ToolActivitySummary => {
+      const name = live.name && live.name !== 'tool' ? live.name : persisted?.name || live.name;
+      const title = live.title || persisted?.title;
+      const inputPreview = live.inputPreview || persisted?.inputPreview;
+      return {
+        ...persisted,
+        ...live,
+        name,
+        status: live.status,
+        ...(title ? { title } : {}),
+        ...(inputPreview ? { inputPreview } : {}),
+      };
+    };
+
+    const mergeTurnSegments = (live: TurnSegment[], persisted: TurnSegment[]): TurnSegment[] => {
+      if (!persisted.length) return live;
+      if (!live.length) return persisted;
+      const thoughtsMatch = (a: string, b: string): boolean => {
+        const ta = a.trim();
+        const tb = b.trim();
+        return Boolean(ta && tb && (ta === tb || ta.includes(tb) || tb.includes(ta)));
+      };
+      const matchWeight = (p: TurnSegment, l: TurnSegment): number => {
+        if (p.kind === 'tool' && l.kind === 'tool') return p.tool.id === l.tool.id ? 3 : 0;
+        if (p.kind === 'text' && (l.kind === 'text' || l.kind === 'commentary')) {
+          return p.text.trim() && p.text.trim() === l.text.trim() ? 2 : 0;
+        }
+        if (p.kind === 'thought' && l.kind === 'thought') return thoughtsMatch(p.text, l.text) ? 1 : 0;
+        return 0;
+      };
+      const P = persisted.length;
+      const L = live.length;
+      const dp: number[][] = Array.from({ length: P + 1 }, () => new Array<number>(L + 1).fill(0));
+      for (let i = P - 1; i >= 0; i--) {
+        for (let j = L - 1; j >= 0; j--) {
+          let best = Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
+          const weight = matchWeight(persisted[i]!, live[j]!);
+          if (weight > 0) best = Math.max(best, weight + dp[i + 1]![j + 1]!);
+          dp[i]![j] = best;
+        }
+      }
+      const anchors: Array<[number, number]> = [];
+      let pi = 0;
+      let li = 0;
+      while (pi < P && li < L) {
+        const weight = matchWeight(persisted[pi]!, live[li]!);
+        if (weight > 0 && dp[pi]![li] === weight + dp[pi + 1]![li + 1]!) {
+          anchors.push([pi, li]);
+          pi++;
+          li++;
+        } else if (dp[pi + 1]![li]! >= dp[pi]![li + 1]!) {
+          pi++;
+        } else {
+          li++;
+        }
+      }
+
+      const persistedToolById = new Map<string, ToolActivitySummary>();
+      for (const seg of persisted) {
+        if (seg.kind === 'tool' && !persistedToolById.has(seg.tool.id)) persistedToolById.set(seg.tool.id, seg.tool);
+      }
+      const liveToolIds = new Set<string>();
+      for (const seg of live) {
+        if (seg.kind === 'tool') liveToolIds.add(seg.tool.id);
+      }
+      const emittedToolIds = new Set<string>();
+      const merged: TurnSegment[] = [];
+
+      const emitGap = (pStart: number, pEnd: number, lStart: number, lEnd: number) => {
+        const unmatchedP = persisted.slice(pStart, pEnd);
+        const unmatchedL = live.slice(lStart, lEnd);
+        const persistedTexts = unmatchedP
+          .filter((seg): seg is { kind: 'text'; text: string } => seg.kind === 'text')
+          .map((seg) => seg.text.trim())
+          .filter(Boolean);
+        const joinedPersisted = persistedTexts.join('');
+        const joinedPersistedLines = persistedTexts.join('\n');
+
+        for (const seg of unmatchedP) {
+          if (seg.kind === 'tool') {
+            // Tools with a live timeline position are emitted at their live slot (merged with persisted details).
+            if (liveToolIds.has(seg.tool.id) || emittedToolIds.has(seg.tool.id)) continue;
+            emittedToolIds.add(seg.tool.id);
+          }
+          merged.push(seg);
+        }
+        for (const seg of unmatchedL) {
+          if (seg.kind === 'tool') {
+            if (emittedToolIds.has(seg.tool.id)) continue;
+            emittedToolIds.add(seg.tool.id);
+            merged.push({ kind: 'tool', tool: mergeToolDetails(seg.tool, persistedToolById.get(seg.tool.id)) });
+            continue;
+          }
+          if (
+            (seg.kind === 'text' || seg.kind === 'commentary') &&
+            persistedTexts.length > 0 &&
+            (seg.text.trim() === joinedPersisted || seg.text.trim() === joinedPersistedLines)
+          ) {
+            continue;
+          }
+          merged.push(seg);
+        }
+      };
+
+      let prevP = 0;
+      let prevL = 0;
+      for (const [anchorP, anchorL] of anchors) {
+        emitGap(prevP, anchorP, prevL, anchorL);
+        const pSeg = persisted[anchorP]!;
+        const lSeg = live[anchorL]!;
+        if (pSeg.kind === 'tool' && lSeg.kind === 'tool') {
+          if (!emittedToolIds.has(lSeg.tool.id)) {
+            emittedToolIds.add(lSeg.tool.id);
+            merged.push({ kind: 'tool', tool: mergeToolDetails(lSeg.tool, pSeg.tool) });
+          }
+        } else if (pSeg.kind === 'thought' && lSeg.kind === 'thought') {
+          merged.push({
+            kind: 'thought',
+            text: pSeg.text.trim().length > lSeg.text.trim().length ? pSeg.text : lSeg.text,
+          });
+        } else {
+          merged.push(lSeg);
+        }
+        prevP = anchorP + 1;
+        prevL = anchorL + 1;
+      }
+      emitGap(prevP, P, prevL, L);
+      return merged;
+    };
+
     const renderJob = (job: JobSummary, matchedTurn?: MatchedLiveTurn) => {
       const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
@@ -1788,15 +1944,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       const showPrompt = !matchedTurn?.suppressPromptOnly;
       const promptText = persistedUser?.text ?? job.prompt;
 
-      const toolById = new Map<string, ToolActivitySummary>((job.tools ?? []).map((tool) => [tool.id, tool]));
-      const persistedToolStep = new Map<string, number>();
-      persistedAssistant.forEach((msg, mIdx) => {
-        for (const tool of msg.tools ?? []) {
-          if (!toolById.has(tool.id)) toolById.set(tool.id, tool);
-          if (!persistedToolStep.has(tool.id)) persistedToolStep.set(tool.id, mIdx);
-        }
-      });
-
+      const liveToolById = new Map<string, ToolActivitySummary>((job.tools ?? []).map((tool) => [tool.id, tool]));
       const effectiveTimeline: TimelineEntry[] = job.timeline?.length
         ? job.timeline
         : [
@@ -1804,23 +1952,23 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             ...(job.tools ?? []).map((tool) => ({ kind: 'tool' as const, toolId: tool.id })),
             ...(job.text ? [{ kind: 'text' as const, text: job.text }] : []),
           ];
-
-      const thoughtsMatch = (a: string, b: string): boolean => {
-        const ta = a.trim();
-        const tb = b.trim();
-        return Boolean(ta && tb && (ta === tb || ta.includes(tb) || tb.includes(ta)));
-      };
-      const liveMatchedThoughtSteps = new Set<number>();
+      const liveSegments: TurnSegment[] = [];
       for (const entry of effectiveTimeline) {
-        if (entry.kind !== 'thought' || !entry.text.trim()) continue;
-        persistedAssistant.forEach((msg, mIdx) => {
-          if (msg.thought && thoughtsMatch(entry.text, msg.thought)) liveMatchedThoughtSteps.add(mIdx);
-        });
+        if (entry.kind === 'tool') {
+          const tool = liveToolById.get(entry.toolId);
+          if (tool) liveSegments.push({ kind: 'tool', tool });
+        } else if (entry.text) {
+          liveSegments.push(entry);
+        }
       }
+      const persistedSegments: TurnSegment[] = [];
+      for (const msg of persistedAssistant) {
+        if (msg.thought) persistedSegments.push({ kind: 'thought', text: msg.thought });
+        if (msg.text.trim()) persistedSegments.push({ kind: 'text', text: msg.text });
+        for (const tool of msg.tools ?? []) persistedSegments.push({ kind: 'tool', tool });
+      }
+      const mergedSegments = mergeTurnSegments(liveSegments, persistedSegments);
 
-      const emittedPersistedThoughts = new Set<number>();
-      const emittedPersistedToolIds = new Set<string>();
-      const emittedPersistedTexts = new Set<number>();
       const contentParts: unknown[] = [];
       let pendingTools: ToolActivitySummary[] = [];
       const flushTools = (suffix: string) => {
@@ -1829,86 +1977,19 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           pendingTools = [];
         }
       };
-      const maybeEmitPersistedThought = (mIdx: number | undefined, keyPrefix: string) => {
-        if (mIdx === undefined) return;
-        const msg = persistedAssistant[mIdx];
-        if (!msg?.thought || emittedPersistedThoughts.has(mIdx) || liveMatchedThoughtSteps.has(mIdx)) return;
-        flushTools(`${keyPrefix}-pre-thought`);
-        contentParts.push(renderThoughtBlock(`${keyPrefix}-pthought-${mIdx}`, msg.thought, false));
-        emittedPersistedThoughts.add(mIdx);
-      };
-
-      effectiveTimeline.forEach((entry, index) => {
-        if (entry.kind === 'tool') {
-          const tool = toolById.get(entry.toolId);
-          if (!tool) return;
-          maybeEmitPersistedThought(persistedToolStep.get(tool.id), `step-${index}`);
-          pendingTools.push(tool);
-          emittedPersistedToolIds.add(tool.id);
+      mergedSegments.forEach((segment, index) => {
+        if (segment.kind === 'tool') {
+          pendingTools.push(segment.tool);
           return;
         }
-        flushTools(`entry-${index}`);
-        if (entry.kind === 'thought' && entry.text) {
-          contentParts.push(renderThoughtBlock(`thought-${index}`, entry.text, active));
-          persistedAssistant.forEach((msg, mIdx) => {
-            if (msg.thought && thoughtsMatch(entry.text, msg.thought)) emittedPersistedThoughts.add(mIdx);
-          });
-        } else if (entry.kind === 'commentary' && entry.text) {
-          contentParts.push(renderTextBlock(`commentary-${index}`, entry.text, active));
-          const trimmed = entry.text.trim();
-          persistedAssistant.forEach((msg, mIdx) => {
-            if (trimmed && msg.text.trim() === trimmed) emittedPersistedTexts.add(mIdx);
-          });
-        } else if (entry.kind === 'text' && entry.text) {
-          const trimmed = entry.text.trim();
-          const matchedStep = persistedAssistant.findIndex(
-            (msg, mIdx) =>
-              !emittedPersistedTexts.has(mIdx) &&
-              Boolean(msg.text.trim()) &&
-              (msg.text.trim() === trimmed || trimmed.endsWith(msg.text.trim()) || msg.text.trim().includes(trimmed)),
-          );
-          if (matchedStep >= 0) {
-            for (let mIdx = 0; mIdx <= matchedStep; mIdx++) {
-              maybeEmitPersistedThought(mIdx, `text-${index}`);
-              const extraTools = (persistedAssistant[mIdx]?.tools ?? []).filter(
-                (tool) => !emittedPersistedToolIds.has(tool.id),
-              );
-              if (extraTools.length > 0) {
-                for (const tool of extraTools) {
-                  pendingTools.push(tool);
-                  emittedPersistedToolIds.add(tool.id);
-                }
-              }
-            }
-            flushTools(`text-${index}-persisted`);
-          }
-          contentParts.push(renderTextBlock(`text-${index}`, entry.text, active));
-          persistedAssistant.forEach((msg, mIdx) => {
-            const pText = msg.text.trim();
-            if (pText && (pText === trimmed || trimmed.includes(pText) || pText.includes(trimmed))) {
-              emittedPersistedTexts.add(mIdx);
-            }
-          });
+        flushTools(`seg-${index}`);
+        if (segment.kind === 'thought') {
+          contentParts.push(renderThoughtBlock(`thought-${index}`, segment.text, active));
+        } else {
+          contentParts.push(renderTextBlock(`${segment.kind}-${index}`, segment.text, active));
         }
       });
       flushTools('tail');
-
-      // Append any persisted segments that were not present in the live timeline (e.g. non-streamed reasoning/tools).
-      persistedAssistant.forEach((msg, mIdx) => {
-        if (msg.thought && !emittedPersistedThoughts.has(mIdx)) {
-          contentParts.push(renderThoughtBlock(`persisted-thought-${mIdx}`, msg.thought, false));
-          emittedPersistedThoughts.add(mIdx);
-        }
-        const extraTools = (msg.tools ?? []).filter((tool) => !emittedPersistedToolIds.has(tool.id));
-        if (extraTools.length > 0) {
-          contentParts.push(renderToolGroup(`persisted-tools-${mIdx}`, extraTools));
-          for (const tool of extraTools) emittedPersistedToolIds.add(tool.id);
-        }
-        if (msg.text.trim() && !emittedPersistedTexts.has(mIdx)) {
-          contentParts.push(renderTextBlock(`persisted-text-${mIdx}`, msg.text, false));
-          emittedPersistedTexts.add(mIdx);
-        }
-      });
 
       const hasPrompt = Boolean(showPrompt && promptText);
       const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice);
@@ -1997,8 +2078,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         const parts: unknown[] = [];
         for (const msg of assistantBatch) {
           if (msg.thought) parts.push(renderThoughtBlock(`${msg.id}-thought`, msg.thought));
-          if (msg.tools?.length) parts.push(renderToolGroup(`${msg.id}-tools`, msg.tools));
           if (msg.text.trim()) parts.push(renderTextBlock(`${msg.id}-text`, msg.text));
+          if (msg.tools?.length) parts.push(renderToolGroup(`${msg.id}-tools`, msg.tools));
         }
         if (parts.length) items.push(renderAssistant(first.id, parts));
         assistantBatch = [];

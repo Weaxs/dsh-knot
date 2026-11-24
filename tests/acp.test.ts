@@ -224,16 +224,28 @@ describe('ACP provider and bridge', () => {
   });
 
   it('propagates cancellation through ACP session/cancel', async () => {
-    class SlowAdapter extends FakeNativeAdapter {
-      override async *prompt(sessionId: string | undefined): AsyncIterable<AgentEvent> {
-        void sessionId;
+    class SlowAdapter implements AgentAdapter {
+      readonly id = 'native';
+      readonly kind = 'openclaw' as const;
+      cancelled = false;
+      async health() {
+        return { ok: true };
+      }
+      async listSessions() {
+        return [];
+      }
+      async *prompt(): AsyncIterable<AgentEvent> {
         yield { type: 'text', text: 'working' };
         while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
         yield { type: 'final', text: 'working', stopReason: 'cancelled' };
       }
+      async cancel() {
+        this.cancelled = true;
+      }
+      async close() {}
     }
     const native = new SlowAdapter();
-    const bridge = new AcpBridge({ id: 'native', kind: 'hermes' }, () => native);
+    const bridge = new AcpBridge({ id: 'native', kind: 'openclaw' }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const adapter = new AcpAdapter('unified', {
       id: 'unified',
@@ -255,6 +267,47 @@ describe('ACP provider and bridge', () => {
     }
     expect(native.cancelled).toBe(true);
     expect(events.at(-1)).toMatchObject({ type: 'final', stopReason: 'cancelled' });
+
+    // Hermes defers text until turn boundaries; cancelling mid-run still propagates and flushes partial text.
+    let hermesStarted!: () => void;
+    const hermesReady = new Promise<void>((resolve) => {
+      hermesStarted = resolve;
+    });
+    class SlowHermesAdapter extends FakeNativeAdapter {
+      override async *prompt(sessionId: string | undefined): AsyncIterable<AgentEvent> {
+        void sessionId;
+        yield { type: 'text', text: 'partial hermes' };
+        hermesStarted();
+        while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
+        yield { type: 'final', text: 'partial hermes', stopReason: 'cancelled' };
+      }
+    }
+    const hermesNative = new SlowHermesAdapter();
+    const hermesBridge = new AcpBridge({ id: 'hermes-slow', kind: 'hermes' }, () => hermesNative);
+    const hermesAddr = await hermesBridge.start({ port: 0, token: 'acp-test-token' });
+    const hermesClient = new AcpAdapter('hermes-slow-client', {
+      id: 'hermes-slow-client',
+      kind: 'acp',
+      transport: 'local',
+      host: hermesAddr.host,
+      port: hermesAddr.port,
+      token: 'acp-test-token',
+    });
+    cleanups.push(async () => {
+      await hermesClient.close();
+      await hermesBridge.close();
+    });
+
+    const hermesEvents = [];
+    for await (const event of hermesClient.prompt(undefined, 'wait')) {
+      hermesEvents.push(event);
+      if (event.type === 'text' && !event.text && event.sessionId) {
+        const sid = event.sessionId;
+        void hermesReady.then(() => hermesClient.cancel(sid));
+      }
+    }
+    expect(hermesNative.cancelled).toBe(true);
+    expect(hermesEvents.at(-1)).toMatchObject({ type: 'final', text: 'partial hermes', stopReason: 'cancelled' });
   });
 
   it('connects to a standard ACP stdio agent through ndJsonStream', async () => {
@@ -491,8 +544,12 @@ describe('ACP provider and bridge', () => {
     expect(settled.text).toBe('turn-2-done');
   });
 
-  it('keeps Hermes interim commentary out of model-facing job.text over the ACP WebSocket bridge', async () => {
+  it('keeps Hermes interim commentary out of model-facing job.text and standard ACP SDK readText() over WebSocket', async () => {
     const { AgentManager } = await import('../src/manager.js');
+    const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+    const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
+    const { default: WebSocket } = await import('ws');
+
     for (const alreadyStreamed of [false, true]) {
       const native: AgentAdapter = {
         id: 'hermes-native',
@@ -505,7 +562,8 @@ describe('ACP provider and bridge', () => {
         },
         async *prompt() {
           if (alreadyStreamed) {
-            yield { type: 'text', text: 'Checking repo...' };
+            yield { type: 'text', text: 'Checking ' };
+            yield { type: 'text', text: 'repo...' };
             yield { type: 'text', text: 'Checking repo...', interim: true, alreadyStreamed: true };
           } else {
             yield { type: 'text', text: 'Checking repo...', interim: true };
@@ -520,6 +578,29 @@ describe('ACP provider and bridge', () => {
       };
       const bridge = new AcpBridge({ id: 'hermes-native', kind: 'hermes' }, () => native);
       const { host, port } = await bridge.start({ port: 0, token: 'acp-commentary-token' });
+
+      // 1. Standard unmodified ACP SDK client (ignores _meta) calling readText()
+      const sdkStream = createWebSocketStream(`ws://${host}:${port}/acp`, {
+        WebSocket,
+        headers: { Authorization: 'Bearer acp-commentary-token' },
+      });
+      const sdkConn = client().connect(sdkStream);
+      cleanups.push(async () => {
+        sdkConn.close();
+      });
+      await sdkConn.agent.request(methods.agent.initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        clientInfo: { name: 'standard-acp-test', version: '1.0.0' },
+        clientCapabilities: {},
+      });
+      const activeSession = await sdkConn.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
+      const promptDone = activeSession.prompt('check repo');
+      const standardText = await activeSession.readText();
+      await promptDone;
+      activeSession.dispose();
+      expect(standardText).toBe('All clean.');
+
+      // 2. Paired dsh-knot AcpAdapter + AgentManager preserves commentary in UI timeline while keeping job.text clean
       const manager = new AgentManager(
         [{ id: 'bridged', kind: 'acp', transport: 'local', host, port, token: 'acp-commentary-token' }],
         10_000,

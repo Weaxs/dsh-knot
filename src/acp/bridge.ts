@@ -176,129 +176,173 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     cancelled.delete(sessionId);
     const text = params.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
     const toolIds = new Map<string, string>();
+    const MAX_PENDING_TEXT_CHARS = 2_000_000;
+    const deferTextUntilBoundary = adapter.kind === 'hermes';
+    let pendingText = '';
     let output = '';
     let stopReason: StopReason = 'end_turn';
     const notify = async (update: SessionUpdate) => {
       await client.notify(methods.client.session.update, { sessionId, update });
     };
-    for await (const event of adapter.prompt(sessionId, text, signal)) {
-      if (event.type === 'text' && event.text) {
-        if (event.interim) {
-          if (event.alreadyStreamed) output = stripTrailingText(output, event.text);
-          // Carry mid-turn commentary on agent_thought_chunk with explicit _meta so generic ACP
-          // readText() callers keep clean final replies while dsh-knot preserves commentary in UI.
-          await notify({
-            sessionUpdate: 'agent_thought_chunk',
-            content: { type: 'text', text: event.text },
-            _meta: {
-              'dsh-knot/commentary': true,
-              ...(event.alreadyStreamed ? { 'dsh-knot/alreadyStreamed': true } : {}),
-            },
-          });
-        } else {
-          output += event.text;
-          await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
-        }
-      } else if (event.type === 'thought' && event.text) {
-        await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
-      } else if (event.type === 'tool') {
-        const key = event.requestId ? `id:${event.requestId}` : `name:${event.name ?? 'tool'}`;
-        const knownId = toolIds.get(key);
-        const toolCallId = knownId ?? event.requestId ?? randomUUID();
-        if (event.phase === 'end') toolIds.delete(key);
-        else if (!knownId) {
-          if (toolIds.size >= 500) throw new Error('Too many concurrent tool calls');
-          toolIds.set(key, toolCallId);
-        }
-        const status =
-          event.phase === 'end'
-            ? event.failed
-              ? 'failed'
-              : 'completed'
-            : event.phase === 'start'
-              ? 'in_progress'
-              : event.phase;
-        if (knownId) {
-          await notify({
-            sessionUpdate: 'tool_call_update',
-            toolCallId,
-            status,
-            name: event.name,
-            title: event.title,
-            rawInput: event.inputPreview,
-          });
-        } else {
-          await notify({
-            sessionUpdate: 'tool_call',
-            toolCallId,
-            title: event.title ?? event.name ?? 'Tool call',
-            name: event.name,
-            kind: 'other',
-            status,
-            rawInput: event.inputPreview,
-          });
-        }
-      } else if (event.type === 'approval') {
-        if (!adapter.respond) {
-          if (!event.requestId) continue;
-          await notify(
+    const flushPendingText = async () => {
+      if (!pendingText) return;
+      const chunk = pendingText;
+      pendingText = '';
+      output += chunk;
+      await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } });
+    };
+    try {
+      for await (const event of adapter.prompt(sessionId, text, signal)) {
+        if (event.type === 'text' && event.text) {
+          if (event.interim) {
+            if (event.alreadyStreamed) {
+              if (deferTextUntilBoundary) {
+                pendingText = stripTrailingText(pendingText, event.text);
+                await flushPendingText();
+              } else {
+                output = stripTrailingText(output, event.text);
+              }
+            } else {
+              await flushPendingText();
+            }
+            // Carry mid-turn commentary on agent_thought_chunk with explicit _meta so generic ACP
+            // readText() callers keep clean final replies while dsh-knot preserves commentary in UI.
+            await notify({
+              sessionUpdate: 'agent_thought_chunk',
+              content: { type: 'text', text: event.text },
+              _meta: {
+                'dsh-knot/commentary': true,
+                ...(!deferTextUntilBoundary && event.alreadyStreamed ? { 'dsh-knot/alreadyStreamed': true } : {}),
+              },
+            });
+          } else if (deferTextUntilBoundary) {
+            // Hold Hermes text deltas until the next turn boundary so already_streamed commentary
+            // can be classified before anything is emitted on the standard ACP answer channel.
+            if (pendingText.length + event.text.length > MAX_PENDING_TEXT_CHARS) {
+              await flushPendingText();
+            }
+            if (event.text.length > MAX_PENDING_TEXT_CHARS) {
+              output += event.text;
+              await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+            } else {
+              pendingText += event.text;
+            }
+          } else {
+            output += event.text;
+            await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
+          }
+        } else if (event.type === 'thought' && event.text) {
+          await flushPendingText();
+          await notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: event.text } });
+        } else if (event.type === 'tool') {
+          await flushPendingText();
+          const key = event.requestId ? `id:${event.requestId}` : `name:${event.name ?? 'tool'}`;
+          const knownId = toolIds.get(key);
+          const toolCallId = knownId ?? event.requestId ?? randomUUID();
+          if (event.phase === 'end') toolIds.delete(key);
+          else if (!knownId) {
+            if (toolIds.size >= 500) throw new Error('Too many concurrent tool calls');
+            toolIds.set(key, toolCallId);
+          }
+          const status =
             event.phase === 'end'
-              ? { sessionUpdate: 'tool_call_update', toolCallId: event.requestId, status: 'completed' }
-              : {
-                  sessionUpdate: 'tool_call',
-                  toolCallId: event.requestId,
-                  title: 'Approval required on the remote gateway',
-                  status: 'pending',
-                  rawInput: event.text,
-                },
-          );
-          continue;
-        }
-        if (event.phase === 'end') continue;
-        const choices = event.choices?.length ? event.choices : ['approve', 'reject'];
-        const toolCallId = event.requestId || randomUUID();
-        const response = (await client.request(
-          methods.client.session.requestPermission,
-          {
-            sessionId,
-            toolCall: {
+              ? event.failed
+                ? 'failed'
+                : 'completed'
+              : event.phase === 'start'
+                ? 'in_progress'
+                : event.phase;
+          if (knownId) {
+            await notify({
+              sessionUpdate: 'tool_call_update',
               toolCallId,
-              title: event.text ?? 'Permission requested',
+              status,
+              name: event.name,
+              title: event.title,
+              rawInput: event.inputPreview,
+            });
+          } else {
+            await notify({
+              sessionUpdate: 'tool_call',
+              toolCallId,
+              title: event.title ?? event.name ?? 'Tool call',
+              name: event.name,
               kind: 'other',
-              status: 'pending',
+              status,
+              rawInput: event.inputPreview,
+            });
+          }
+        } else if (event.type === 'approval') {
+          await flushPendingText();
+          if (!adapter.respond) {
+            if (!event.requestId) continue;
+            await notify(
+              event.phase === 'end'
+                ? { sessionUpdate: 'tool_call_update', toolCallId: event.requestId, status: 'completed' }
+                : {
+                    sessionUpdate: 'tool_call',
+                    toolCallId: event.requestId,
+                    title: 'Approval required on the remote gateway',
+                    status: 'pending',
+                    rawInput: event.text,
+                  },
+            );
+            continue;
+          }
+          if (event.phase === 'end') continue;
+          const choices = event.choices?.length ? event.choices : ['approve', 'reject'];
+          const toolCallId = event.requestId || randomUUID();
+          const response = (await client.request(
+            methods.client.session.requestPermission,
+            {
+              sessionId,
+              toolCall: {
+                toolCallId,
+                title: event.text ?? 'Permission requested',
+                kind: 'other',
+                status: 'pending',
+              },
+              options: choices.map((choice) => ({
+                optionId: choice,
+                name: choice,
+                kind: /reject|deny|no/i.test(choice) ? ('reject_once' as const) : ('allow_once' as const),
+              })),
             },
-            options: choices.map((choice) => ({
-              optionId: choice,
-              name: choice,
-              kind: /reject|deny|no/i.test(choice) ? ('reject_once' as const) : ('allow_once' as const),
-            })),
-          },
-          { cancellationSignal: signal, stopWaitingOnCancel: true },
-        )) as RequestPermissionResponse;
-        if (response.outcome.outcome !== 'selected') {
-          cancelled.add(sessionId);
-          await adapter.cancel(sessionId, signal);
-          stopReason = 'cancelled';
+            { cancellationSignal: signal, stopWaitingOnCancel: true },
+          )) as RequestPermissionResponse;
+          if (response.outcome.outcome !== 'selected') {
+            cancelled.add(sessionId);
+            await adapter.cancel(sessionId, signal);
+            stopReason = 'cancelled';
+            break;
+          }
+          await adapter.respond(sessionId, event.requestId ?? '', response.outcome.optionId, signal);
+        } else if (event.type === 'error') {
+          await flushPendingText();
+          throw new Error(event.text ?? 'Remote agent failed');
+        } else if (event.type === 'final') {
+          await flushPendingText();
+          const finalText = event.text ?? '';
+          const remaining = finalText.startsWith(output)
+            ? finalText.slice(output.length)
+            : output.endsWith(finalText)
+              ? ''
+              : finalText;
+          if (remaining) {
+            output += remaining;
+            await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: remaining } });
+          }
+          stopReason = acpStopReason(event.stopReason);
           break;
         }
-        await adapter.respond(sessionId, event.requestId ?? '', response.outcome.optionId, signal);
-      } else if (event.type === 'error') {
-        throw new Error(event.text ?? 'Remote agent failed');
-      } else if (event.type === 'final') {
-        const finalText = event.text ?? '';
-        const remaining = finalText.startsWith(output)
-          ? finalText.slice(output.length)
-          : output.endsWith(finalText)
-            ? ''
-            : finalText;
-        if (remaining) {
-          output += remaining;
-          await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: remaining } });
-        }
-        stopReason = acpStopReason(event.stopReason);
-        break;
       }
+    } catch (error) {
+      await flushPendingText().catch(() => {
+        /* best-effort partial output flush before propagating the adapter error */
+      });
+      throw error;
     }
+    await flushPendingText();
     return { stopReason: cancelled.has(sessionId) ? 'cancelled' : stopReason };
   });
   app.onNotification(methods.agent.session.cancel, async ({ params, signal }) => {

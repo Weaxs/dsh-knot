@@ -11,7 +11,14 @@ import { AgentManager } from '../src/manager.js';
 import { McpServer } from '../src/mcp/server.js';
 import type { SessionControllerLike } from '../src/mcp/session-service.js';
 import { loadStoredState } from '../src/store.js';
-import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
+import type {
+  AgentAdapter,
+  AgentConfig,
+  AgentEvent,
+  AgentTimelineEntry,
+  AgentToolActivity,
+  AgentTranscriptMessage,
+} from '../src/types.js';
 import { registerWebRoutes, WEB_ROUTES } from '../src/web/routes.js';
 
 class StubAdapter implements AgentAdapter {
@@ -623,7 +630,19 @@ describe('web UI host routes & schemastery Config', () => {
       return undefined;
     };
 
-    let currentJob = {
+    let currentJob: {
+      id: string;
+      agentId: string;
+      sessionId: string;
+      prompt: string;
+      status: string;
+      createdAt: number;
+      updatedAt: number;
+      text: string;
+      thought?: string;
+      tools?: AgentToolActivity[];
+      timeline?: AgentTimelineEntry[];
+    } = {
       id: 'job-2',
       agentId: 'hermes-remote',
       sessionId: 'sess-1',
@@ -640,7 +659,7 @@ describe('web UI host routes & schemastery Config', () => {
         { kind: 'tool', toolId: 't-live' },
       ],
     };
-    let historyMessages = [
+    let historyMessages: AgentTranscriptMessage[] = [
       { id: 'm1', role: 'user', text: 'previous prompt' },
       {
         id: 'm2',
@@ -699,6 +718,7 @@ describe('web UI host routes & schemastery Config', () => {
               sessions: [
                 { id: 'sess-1', title: 'Live session' },
                 { id: 'sess-2', title: 'Live session 2' },
+                { id: 'sess-3', title: 'Live session 3' },
               ],
             });
           }
@@ -746,8 +766,19 @@ describe('web UI host routes & schemastery Config', () => {
       expect(liveText).toContain('Checking live state...');
       expect(liveText).toContain('ls -la');
 
-      // Case B: If the job settles with the SAME prompt and reply as the previous turn
-      // while history row IDs are still unchanged (m1/m2), do NOT hide the newly completed turn!
+      // Case B: If the job settles with the SAME prompt, reply, AND reused tool-call ID as the previous
+      // turn while history row IDs are still unchanged (m1/m2), do NOT hide the newly completed turn!
+      const reusedToolId = 'r'.repeat(64);
+      historyMessages = [
+        { id: 'm1', role: 'user', text: 'previous prompt' },
+        {
+          id: 'm2',
+          role: 'assistant',
+          text: 'previous reply',
+          thought: 'previous turn thought',
+          tools: [{ id: reusedToolId, name: 'terminal', status: 'completed', inputPreview: 'pwd' }],
+        },
+      ];
       currentJob = {
         ...currentJob,
         prompt: 'previous prompt',
@@ -755,14 +786,14 @@ describe('web UI host routes & schemastery Config', () => {
         updatedAt: 3000,
         text: 'previous reply',
         thought: 'second run thought',
-        tools: [{ id: 't-live-2', name: 'terminal', status: 'completed', inputPreview: 'whoami' }],
+        tools: [{ id: reusedToolId, name: 'terminal', status: 'completed', inputPreview: 'whoami' }],
         timeline: [
           { kind: 'thought', text: 'second run thought' },
-          { kind: 'tool', toolId: 't-live-2' },
+          { kind: 'tool', toolId: reusedToolId },
           { kind: 'text', text: 'previous reply' },
         ],
       };
-      // Trigger poll update in-place by flushing timers (polling interval is 400ms; simulate fast by waiting)
+      // Trigger poll update in-place by waiting past the 400ms poll interval
       await new Promise((r) => setTimeout(r, 450));
       const unchangedHistoryTree = await flush();
       const unchangedTexts = collectText(unchangedHistoryTree);
@@ -771,13 +802,13 @@ describe('web UI host routes & schemastery Config', () => {
       expect(unchangedTexts).toContain('second run thought');
       expect(unchangedTexts).toContain('whoami');
 
-      // Case C: Open a second session ('sess-2') with a running job containing two same-name `terminal`
-      // calls (A and B) + commentary; when the job completes in-place and history advances to m3/m4
-      // persisting ONLY call B (by normalized ID) + final answer (not commentary or call A), verify:
-      // (1) call A is kept, call B is NOT duplicated, (2) merged turn renders in exact chronological
-      // order: thought -> commentary -> call A -> call B -> final answer!
+      // Case C: Open 'sess-2' with a running job containing two same-name `terminal` calls (A and B),
+      // partial live thought, missing live preview on B, and prose + tool B; when history advances to m3/m4
+      // with fuller thought, persisted-only prose & tool, and persisted preview on B, verify exact merged
+      // order, fuller thought, filled preview, zero duplicate tools, and preserved earlier distinct prose.
       const toolAId = 'a'.repeat(64);
       const toolBId = 'b'.repeat(64);
+      const toolPersistedOnlyId = 'p'.repeat(64);
       currentJob = {
         id: 'job-3',
         agentId: 'hermes-remote',
@@ -787,10 +818,10 @@ describe('web UI host routes & schemastery Config', () => {
         createdAt: 4000,
         updatedAt: 4000,
         text: '',
-        thought: 'live turn thought',
+        thought: 'Check the status',
         tools: [{ id: toolAId, name: 'terminal', status: 'running', inputPreview: 'cmd-A' }],
         timeline: [
-          { kind: 'thought', text: 'live turn thought' },
+          { kind: 'thought', text: 'Check the status' },
           { kind: 'commentary', text: 'Checking live state...' },
           { kind: 'tool', toolId: toolAId },
         ],
@@ -811,20 +842,23 @@ describe('web UI host routes & schemastery Config', () => {
       (session2Btn!.props.onClick as () => void)();
       await flush();
 
-      // Now job-3 completes with both tool A and tool B, and history advances to m3/m4 with only tool B persisted
+      // job-3 completes: live has partial thought, commentary, tool A, prose 'Working...', tool B (NO live preview),
+      // and 'final answer'. Persisted history has fuller thought, distinct prose containing 'final answer',
+      // persisted-only tool P, prose 'Working...' + tool B (WITH persisted preview), and 'final answer'.
       currentJob = {
         ...currentJob,
         status: 'completed',
         updatedAt: 5000,
-        text: 'final answer',
+        text: 'Working...final answer',
         tools: [
           { id: toolAId, name: 'terminal', status: 'completed', inputPreview: 'cmd-A' },
-          { id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B' },
+          { id: toolBId, name: 'terminal', status: 'completed' },
         ],
         timeline: [
-          { kind: 'thought', text: 'live turn thought' },
+          { kind: 'thought', text: 'Check the status' },
           { kind: 'commentary', text: 'Checking live state...' },
           { kind: 'tool', toolId: toolAId },
+          { kind: 'text', text: 'Working...' },
           { kind: 'tool', toolId: toolBId },
           { kind: 'text', text: 'final answer' },
         ],
@@ -835,9 +869,20 @@ describe('web UI host routes & schemastery Config', () => {
         {
           id: 'm4',
           role: 'assistant',
+          thought: 'Check the status, then investigate the failed process',
+          text: 'The final answer depends on README.',
+          tools: [{ id: toolPersistedOnlyId, name: 'terminal', status: 'completed', inputPreview: 'cmd-P' }],
+        },
+        {
+          id: 'm5',
+          role: 'assistant',
+          text: 'Working...',
+          tools: [{ id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B-persisted' }],
+        },
+        {
+          id: 'm6',
+          role: 'assistant',
           text: 'final answer',
-          thought: 'live turn thought',
-          tools: [{ id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B' }],
         },
       ];
       await new Promise((r) => setTimeout(r, 450));
@@ -845,21 +890,88 @@ describe('web UI host routes & schemastery Config', () => {
       const settledTexts = collectText(settledTree);
       expect(settledTexts.filter((t) => t === 'current prompt')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'final answer')).toHaveLength(1);
-      expect(settledTexts.filter((t) => t === 'live turn thought')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'Working...')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'cmd-A')).toHaveLength(1);
-      expect(settledTexts.filter((t) => t === 'cmd-B')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'cmd-B-persisted')).toHaveLength(1);
+      expect(settledTexts.filter((t) => t === 'cmd-P')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'Checking live state...')).toHaveLength(1);
-      // Assert strict chronological rendering order inside the merged turn
-      const idxThought = settledTexts.indexOf('live turn thought');
+      // Fuller persisted thought replaces shorter live prefix; distinct prose containing 'final answer' is preserved
+      expect(settledTexts).toContain('Check the status, then investigate the failed process');
+      expect(settledTexts).not.toContain('Check the status');
+      expect(settledTexts).toContain('The final answer depends on README.');
+      // Assert strict chronological order across persisted-only and live-only items
+      const idxThought = settledTexts.indexOf('Check the status, then investigate the failed process');
+      const idxDistinctProse = settledTexts.indexOf('The final answer depends on README.');
+      const idxCmdP = settledTexts.indexOf('cmd-P');
       const idxCommentary = settledTexts.indexOf('Checking live state...');
       const idxCmdA = settledTexts.indexOf('cmd-A');
-      const idxCmdB = settledTexts.indexOf('cmd-B');
+      const idxWorking = settledTexts.indexOf('Working...');
+      const idxCmdB = settledTexts.indexOf('cmd-B-persisted');
       const idxFinal = settledTexts.indexOf('final answer');
       expect(idxThought).toBeGreaterThan(-1);
-      expect(idxThought).toBeLessThan(idxCommentary);
+      expect(idxThought).toBeLessThan(idxDistinctProse);
+      expect(idxDistinctProse).toBeLessThan(idxCmdP);
+      expect(idxCmdP).toBeLessThan(idxWorking);
       expect(idxCommentary).toBeLessThan(idxCmdA);
-      expect(idxCmdA).toBeLessThan(idxCmdB);
+      expect(idxCmdA).toBeLessThan(idxWorking);
+      expect(idxWorking).toBeLessThan(idxCmdB);
       expect(idxCmdB).toBeLessThan(idxFinal);
+
+      // Case D: Fast text-only job settles before the first history fetch returns (aborted before baseline);
+      // the post-completion history fetch returns the new turn and must merge without duplicating bubbles.
+      let releaseFirstFastFetch!: () => void;
+      let fastFetchCount = 0;
+      const origFetch = (root as any).get('connection').fetch;
+      (root as any).get('connection').fetch = async (path: string, init?: RequestInit) => {
+        if (path === WEB_ROUTES.sessionMessages && currentJob.sessionId === 'sess-3') {
+          fastFetchCount++;
+          if (fastFetchCount === 1) {
+            await new Promise<void>((resolve) => {
+              releaseFirstFastFetch = resolve;
+              init?.signal?.addEventListener('abort', () => resolve(), { once: true });
+            });
+            return { ok: true, status: 200, json: async () => ({ ok: true, value: { messages: [] } }) };
+          }
+        }
+        return origFetch(path, init);
+      };
+      currentJob = {
+        id: 'job-4',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-3',
+        prompt: 'fast prompt',
+        status: 'running',
+        createdAt: 6000,
+        updatedAt: 6000,
+        text: '',
+        timeline: [],
+      };
+      historyMessages = [
+        { id: 'f1', role: 'user', text: 'fast prompt' },
+        { id: 'f2', role: 'assistant', text: 'fast reply' },
+      ];
+      (findButton(settledTree, '助手设置')!.props.onClick as () => void)();
+      const dash3 = await flush();
+      (findButton(dash3, '对话')!.props.onClick as () => void)();
+      const reopened3 = await flush();
+      (findButton(reopened3, 'Live session 3')!.props.onClick as () => void)();
+      // Render once so Fetch 1 starts (stalled), then complete job-4 before Fetch 1 resolves
+      renderNode(renderMain!());
+      while (pendingEffects.length > 0) pendingEffects.shift()!();
+      currentJob = {
+        ...currentJob,
+        status: 'completed',
+        updatedAt: 7000,
+        text: 'fast reply',
+        timeline: [{ kind: 'text', text: 'fast reply' }],
+      };
+      await new Promise((r) => setTimeout(r, 450));
+      releaseFirstFastFetch?.();
+      const fastTree = await flush();
+      const fastTexts = collectText(fastTree);
+      expect(fastFetchCount).toBeGreaterThanOrEqual(2);
+      expect(fastTexts.filter((t) => t === 'fast prompt')).toHaveLength(1);
+      expect(fastTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
 
       for (const cleanup of cleanups) cleanup();
       await fiber.dispose();
