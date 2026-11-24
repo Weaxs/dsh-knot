@@ -4,7 +4,7 @@ import { runDoctor } from '../doctor.js';
 import type { AgentManager } from '../manager.js';
 import type { McpServer } from '../mcp/server.js';
 import type { SessionControllerLike } from '../mcp/session-service.js';
-import { redact } from '../policy/redact.js';
+import { redact, redactTextSegments } from '../policy/redact.js';
 import { updateStoredState } from '../store.js';
 import type { AgentConfig, AgentJob } from '../types.js';
 import { VERSION } from '../version.js';
@@ -44,6 +44,27 @@ function errorReply(message: string, status = 400): Response {
 
 function jobPriority(job: AgentJob): number {
   return Number(job.status === 'queued' || job.status === 'running' || job.remoteStop !== undefined);
+}
+
+function redactJob(job: AgentJob): AgentJob {
+  if (!job.timeline?.length) return redact(job);
+  const timeline = job.timeline.map((entry) => ({ ...entry }));
+  const textEntries = timeline.filter((entry) => entry.kind !== 'tool');
+  for (const [kind, fullText] of [
+    ['text', job.text],
+    ['thought', job.thought],
+    ['commentary', undefined],
+  ] as const) {
+    const entries = textEntries.filter((entry) => entry.kind === kind);
+    const texts = redactTextSegments(
+      entries.map((entry) => entry.text),
+      fullText,
+    );
+    entries.forEach((entry, index) => {
+      entry.text = texts[index]!;
+    });
+  }
+  return redact({ ...job, timeline });
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -135,12 +156,11 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: redact(
-              manager
-                .listJobs({ currentOnly: true })
-                .sort((a, b) => jobPriority(b) - jobPriority(a))
-                .slice(0, 50),
-            ),
+            jobs: manager
+              .listJobs({ currentOnly: true })
+              .sort((a, b) => jobPriority(b) - jobPriority(a))
+              .slice(0, 50)
+              .map(redactJob),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -186,7 +206,7 @@ export function registerWebRoutes(
           return errorReply('Invalid clientMessageId', 400);
         }
         const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
-        return jsonReply({ ok: true, value: redact(job) });
+        return jsonReply({ ok: true, value: redactJob(job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -200,7 +220,7 @@ export function registerWebRoutes(
         }
         if (!manager.matchesRevision(agentId, revision)) return staleGateway();
         const job = manager.getCurrentJob(agentId, jobId);
-        return job ? jsonReply({ ok: true, value: redact(job) }) : errorReply('Job not found for this gateway', 404);
+        return job ? jsonReply({ ok: true, value: redactJob(job) }) : errorReply('Job not found for this gateway', 404);
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -214,7 +234,7 @@ export function registerWebRoutes(
         const choice = typeof body.choice === 'string' ? body.choice : '';
         if (!jobId || !requestId || !choice) return errorReply('jobId, requestId, and choice are required', 400);
         const job = await manager.respond(jobId, choice, request.signal, requestId);
-        return jsonReply({ ok: true, value: redact(job) });
+        return jsonReply({ ok: true, value: redactJob(job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }
@@ -226,7 +246,7 @@ export function registerWebRoutes(
         const jobId = typeof body.jobId === 'string' ? body.jobId : '';
         if (!jobId) return errorReply('jobId is required', 400);
         const job = await manager.cancel(jobId, request.signal);
-        return jsonReply({ ok: true, value: redact(job) });
+        return jsonReply({ ok: true, value: redactJob(job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
       }

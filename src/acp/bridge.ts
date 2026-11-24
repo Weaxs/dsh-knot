@@ -23,6 +23,8 @@ import { verifyBearerToken } from '../policy/auth.js';
 import type { AgentAdapter, AgentConfig } from '../types.js';
 import { VERSION } from '../version.js';
 
+const MAX_TRACKED_SESSIONS = 500;
+
 export type NativeAdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 export interface AcpBridgeOptions {
@@ -114,6 +116,7 @@ export class AcpBridge {
 export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): AgentApp {
   const cancelled = new Set<string>();
   const sessionCwds = new Map<string, string>();
+  const activeHermesPrompts = adapter.kind === 'hermes' ? new Set<string>() : undefined;
   let supportsInterimRetraction = false;
   const app = agent({ name: 'dsh-knot-acp-bridge' });
   app.onConnect((connection: AgentConnection) => {
@@ -137,7 +140,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     const sessionId = createNativeSessionId(config);
     sessionCwds.delete(sessionId);
     sessionCwds.set(sessionId, params.cwd);
-    while (sessionCwds.size > 500) {
+    while (sessionCwds.size > MAX_TRACKED_SESSIONS) {
       const oldest = sessionCwds.keys().next().value;
       if (oldest === undefined) break;
       sessionCwds.delete(oldest);
@@ -152,7 +155,7 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
     if (!known) throw RequestError.resourceNotFound(params.sessionId);
     sessionCwds.delete(params.sessionId);
     sessionCwds.set(params.sessionId, params.cwd);
-    while (sessionCwds.size > 500) {
+    while (sessionCwds.size > MAX_TRACKED_SESSIONS) {
       const oldest = sessionCwds.keys().next().value;
       if (oldest === undefined) break;
       sessionCwds.delete(oldest);
@@ -176,7 +179,6 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
   });
   app.onRequest(methods.agent.session.prompt, async ({ params, client, signal }) => {
     const sessionId = params.sessionId;
-    cancelled.delete(sessionId);
     const text = params.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('\n');
     const toolIds = new Map<string, string>();
     const MAX_PENDING_TEXT_CHARS = 2_000_000;
@@ -197,6 +199,14 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
       output += chunk;
       await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } });
     };
+    if (activeHermesPrompts?.has(sessionId))
+      throw RequestError.internalError(undefined, 'Session already has an active prompt');
+    if (activeHermesPrompts && activeHermesPrompts.size >= MAX_TRACKED_SESSIONS) {
+      throw RequestError.internalError(undefined, 'Too many active Hermes prompts');
+    }
+    // Hermes cancels by session ID, so a prompt owns the session through any overflow cleanup.
+    activeHermesPrompts?.add(sessionId);
+    cancelled.delete(sessionId);
     try {
       for await (const event of adapter.prompt(sessionId, text, signal)) {
         if (event.type === 'text' && event.text) {
@@ -230,14 +240,16 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
             // Hold Hermes text deltas for generic ACP clients until a non-reasoning turn boundary so
             // commentary is classified before anything is emitted on the standard ACP answer channel.
             if (pendingText.length + event.text.length > MAX_PENDING_TEXT_CHARS) {
-              await flushPendingText();
+              pendingText = '';
+              const detail = `Hermes unclassified text exceeded the ${MAX_PENDING_TEXT_CHARS} character buffer limit`;
+              try {
+                await adapter.cancel(sessionId, signal);
+              } catch {
+                throw RequestError.internalError(undefined, `${detail}. The remote stop is unconfirmed`);
+              }
+              throw RequestError.internalError(undefined, detail);
             }
-            if (event.text.length > MAX_PENDING_TEXT_CHARS) {
-              output += event.text;
-              await notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: event.text } });
-            } else {
-              pendingText += event.text;
-            }
+            pendingText += event.text;
           } else {
             output += event.text;
             stepStreamed = (stepStreamed + event.text).slice(-MAX_PENDING_TEXT_CHARS);
@@ -352,14 +364,16 @@ export function createAcpAgent(config: AgentConfig, adapter: AgentAdapter): Agen
           break;
         }
       }
+      await flushPendingText();
+      return { stopReason: cancelled.has(sessionId) ? 'cancelled' : stopReason };
     } catch (error) {
       await flushPendingText().catch(() => {
         /* best-effort partial output flush before propagating the adapter error */
       });
       throw error;
+    } finally {
+      activeHermesPrompts?.delete(sessionId);
     }
-    await flushPendingText();
-    return { stopReason: cancelled.has(sessionId) ? 'cancelled' : stopReason };
   });
   app.onNotification(methods.agent.session.cancel, async ({ params, signal }) => {
     cancelled.add(params.sessionId);

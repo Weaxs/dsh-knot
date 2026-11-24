@@ -69,10 +69,11 @@ describe('Hermes API Server adapter', () => {
                 id: 3,
                 role: 'assistant',
                 content: '',
+                reasoning_content: ' ',
                 reasoning: 'Check status first',
                 tool_calls: [
                   {
-                    id: 'call_1',
+                    id: ' call_1 ',
                     function: { name: 'terminal', arguments: JSON.stringify({ command: 'git status' }) },
                   },
                   {
@@ -519,14 +520,40 @@ describe('Hermes API Server adapter', () => {
     }
   });
 
+  it('retracts a resent Hermes commentary prefix past the job text budget', async () => {
+    const streamed = `Checking ${'x'.repeat(2_000_000)}`;
+    class OversizedInterimTransport extends FakeTransport {
+      override async stream(): Promise<IncomingMessage> {
+        return incoming(
+          `data: ${JSON.stringify({ event: 'message.delta', delta: streamed })}\n\n` +
+            `data: ${JSON.stringify({ event: 'message.interim', text: `${streamed}...`, already_streamed: false })}\n\n` +
+            'data: {"event":"run.cancelled"}\n\n',
+        );
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new OversizedInterimTransport(),
+    );
+    try {
+      const events = [];
+      for await (const event of adapter.prompt('session-1', 'check')) events.push(event);
+      expect(events[1]?.alreadyStreamed).toBe(true);
+      expect(events.at(-1)?.text).toHaveLength(0);
+    } finally {
+      await adapter.close();
+    }
+  });
+
   it('normalizes Hermes reasoning and interim commentary on both already_streamed paths', async () => {
     class UnstreamedInterimTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {
         return incoming(
           'id: 1\ndata: {"event":"reasoning.available","text":"Inspect git status first."}\n\n' +
             'id: 2\ndata: {"event":"message.interim","text":"Checking repo...","already_streamed":false}\n\n' +
-            'id: 3\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":"call-1","preview":"git status"}\n\n' +
-            'id: 4\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":"call-1","error":false}\n\n' +
+            'id: 3\ndata: {"event":"tool.started","tool":"terminal","tool_call_id":" call-1 ","preview":"git status"}\n\n' +
+            'id: 4\ndata: {"event":"tool.completed","tool":"terminal","tool_call_id":" call-1 ","error":false}\n\n' +
             'id: 5\ndata: {"event":"message.delta","delta":"All clean."}\n\n' +
             'id: 6\ndata: {"event":"run.completed","output":"All clean.","completed":true}\n\n',
         );

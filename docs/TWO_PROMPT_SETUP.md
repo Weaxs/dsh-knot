@@ -36,7 +36,7 @@ Reuse an existing private network whenever one is already available. Do **not** 
 - **`tailscale`**: Install Tailscale for the host OS if missing, join your specified tailnet, keep the gateway on loopback (`127.0.0.1`), and expose it via Tailscale Serve HTTPS/WSS.
 - **`headscale`**: Reuse the host's existing Headscale-enrolled Tailscale client and private tailnet address without overwriting its control server.
 - **`wireguard`**: Reuse the host's existing WireGuard interface and bind the gateway (or a local private reverse proxy) to the WireGuard IP only.
-- **`lan`**: Reuse an existing trusted private LAN IP (never a public NIC).
+- **`lan`**: Reuse an existing trusted private LAN IP. Use HTTPS or WSS when sending gateway credentials over the LAN.
 - **`same-host`**: Loopback (`127.0.0.1`) or local ACP stdio on the same machine as `dsh`.
 
 ---
@@ -91,7 +91,8 @@ Task steps:
      - Hermes / Remote dsh / ACP WebSocket: configure `tailscale serve --bg http://127.0.0.1:<port>` and verify HTTPS/WSS reachability.
      - OpenClaw: set `gateway.tailscale.mode` to `serve` in OpenClaw config and restart the gateway (or if reusing an external Serve route, verify OpenClaw's proxy attribution settings).
    - **Existing Headscale**: Reuse the enrolled Tailscale/Headscale node and private hostname/IP. Do NOT log out or overwrite the Headscale `--login-server`.
-   - **Existing WireGuard / Private LAN**: Reuse the existing interface; bind the gateway or local TLS proxy only to that private IP (never a public interface) and verify the listener is reachable on that private IP.
+   - **Existing WireGuard**: Reuse the existing encrypted interface. Bind the gateway or proxy only to the WireGuard IP and verify reachability.
+   - **Private LAN**: Bind the gateway or reverse proxy only to the private IP. For a credentialed gateway, provide an HTTPS or WSS endpoint with a certificate the local client trusts.
    - **Same-host**: Keep loopback (`127.0.0.1`) or local ACP stdio only.
 
 4. Output a single clean handoff block at the end that I can forward directly to my local dsh agent. Include ONLY safe credential references (file path + env/key name, or command to view securely) — NEVER plaintext secrets or URLs containing `?token=`, usernames, passwords, queries, or fragments:
@@ -108,7 +109,7 @@ dsh_knot_handoff:
   acp_command: "<absolute path to stdio binary if acp_transport is stdio; otherwise omit>"
   acp_args: []
   credential_type: "<hermes_api_key | openclaw_gateway_token | dsh_launch_token | acp_bearer_token | none>"
-  credential_reference: "<safe location only, e.g. 'HERMES_API_KEY in ~svc/.hermes/.env' — NEVER the secret value>"
+  credential_reference: "<safe location only, e.g. 'API_SERVER_KEY in ~svc/.hermes/.env' — NEVER the secret value>"
   pairing_status: "<not_required | paired | pending_first_connection>"
   pairing_hint: "<e.g. 'If first test asks for pairing, run openclaw devices list && openclaw devices approve <id> on host'>"
   checks_completed:
@@ -195,6 +196,6 @@ Handoff block from the server agent:
 The two agents handle discovery, package installation, service restarts, config updates, diagnostics, and smoke testing automatically. You should only be asked to step in for:
 
 1. **Network login or OS authorization**: Tailscale interactive SSO login URL or macOS/Windows VPN extension approval.
-2. **Entering a secret safely**: Typing or pasting the gateway token into **Remote Agents / 远端助手** (`$DSH_HOME/knot/agents.json`, `0600`) or a protected local env file, without exposing it in chat transcripts.
+2. **Entering a secret safely**: Typing or pasting the gateway token into **Remote Agents / 远端助手** (saved to `$DSH_KNOT_STATE_DIR/agents.json` when set, otherwise `$DSH_HOME/knot/agents.json`, with `0600` permissions) or a protected local env file, without exposing it in chat transcripts.
 3. **OpenClaw first-time device pairing**: Running `openclaw devices list` and `openclaw devices approve <requestId>` on the OpenClaw host after `dsh-knot` creates its Ed25519 key in `$DSH_HOME/knot/devices`.
 4. **Remote stdio-only ACP agents (such as remote Claude Code)**: Deciding how to proceed if no compatible Bearer-authenticated ACP v1 WebSocket bridge is installed on the remote host.

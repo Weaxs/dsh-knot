@@ -54,6 +54,38 @@ export function redactText(text: string): string {
   return PATTERNS.reduce((value, pattern) => value.replace(pattern, '[REDACTED]'), text);
 }
 
+export function redactTextSegments(segments: readonly string[], fullText?: string): string[] {
+  if (segments.length === 0) return [];
+  const joined = segments.join('');
+  // The retained segments can start inside a credential whose prefix was evicted.
+  const source = fullText?.endsWith(joined) ? fullText : joined;
+  if (segments.length === 1 && source === joined) return [redactText(joined)];
+  const spans = PATTERNS.flatMap((pattern) =>
+    Array.from(source.matchAll(pattern), (match) => ({ start: match.index, end: match.index + match[0].length })),
+  ).sort((a, b) => a.start - b.start);
+  let offset = source.length - joined.length;
+  let coveredUntil = 0;
+  let next = 0;
+  return segments.map((segment) => {
+    if (!segment) return '';
+    const end = offset + segment.length;
+    let text = '';
+    let cursor = Math.max(offset, coveredUntil);
+    for (let span = spans[next]; span && span.start < end; span = spans[++next]) {
+      if (span.end <= offset) continue;
+      const start = Math.max(span.start, offset);
+      if (span.start >= coveredUntil) {
+        text += `${source.slice(cursor, start)}[REDACTED]`;
+      }
+      coveredUntil = Math.max(coveredUntil, span.end);
+      cursor = Math.max(cursor, coveredUntil);
+    }
+    if (cursor < end) text += source.slice(cursor, end);
+    offset = end;
+    return text;
+  });
+}
+
 export function redact<T>(value: T, seen = new WeakSet<object>()): T {
   if (typeof value === 'string') return redactText(value) as T;
   if (!value || typeof value !== 'object') return value;

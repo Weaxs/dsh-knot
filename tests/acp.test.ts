@@ -223,10 +223,14 @@ describe('ACP provider and bridge', () => {
     expect(missing.at(-1)?.text).toMatch(/not found/);
   });
 
-  it('propagates cancellation through ACP session/cancel', async () => {
+  it.each(['openclaw', 'hermes'] as const)('propagates %s cancellation through ACP session/cancel', async (kind) => {
+    let releasePrompt!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
     class SlowAdapter implements AgentAdapter {
       readonly id = 'native';
-      readonly kind = 'openclaw' as const;
+      readonly kind = kind;
       cancelled = false;
       async health() {
         return { ok: true };
@@ -236,16 +240,19 @@ describe('ACP provider and bridge', () => {
       }
       async *prompt(): AsyncIterable<AgentEvent> {
         yield { type: 'text', text: 'working' };
-        while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
-        yield { type: 'final', text: 'working', stopReason: 'cancelled' };
+        await stopped;
+        if (this.cancelled) yield { type: 'final', text: 'working', stopReason: 'cancelled' };
       }
       async cancel() {
         this.cancelled = true;
+        releasePrompt();
       }
-      async close() {}
+      async close() {
+        releasePrompt();
+      }
     }
     const native = new SlowAdapter();
-    const bridge = new AcpBridge({ id: 'native', kind: 'openclaw' }, () => native);
+    const bridge = new AcpBridge({ id: native.id, kind }, () => native);
     const address = await bridge.start({ port: 0, token: 'acp-test-token' });
     const adapter = new AcpAdapter('unified', {
       id: 'unified',
@@ -256,50 +263,18 @@ describe('ACP provider and bridge', () => {
       token: 'acp-test-token',
     });
     cleanups.push(async () => {
+      await native.close();
       await adapter.close();
       await bridge.close();
     });
 
     const events = [];
-    for await (const event of adapter.prompt(undefined, 'wait')) {
+    for await (const event of adapter.prompt(undefined, 'wait', AbortSignal.timeout(2_000))) {
       events.push(event);
       if (event.type === 'text' && event.text) await adapter.cancel(event.sessionId!);
     }
     expect(native.cancelled).toBe(true);
-    expect(events.at(-1)).toMatchObject({ type: 'final', stopReason: 'cancelled' });
-
-    // Paired dsh-knot ACP client negotiates interim retraction, so Hermes text streams live before cancel.
-    class SlowHermesAdapter extends FakeNativeAdapter {
-      override async *prompt(sessionId: string | undefined): AsyncIterable<AgentEvent> {
-        void sessionId;
-        yield { type: 'text', text: 'partial hermes' };
-        while (!this.cancelled) await new Promise((resolve) => setTimeout(resolve, 1));
-        yield { type: 'final', text: 'partial hermes', stopReason: 'cancelled' };
-      }
-    }
-    const hermesNative = new SlowHermesAdapter();
-    const hermesBridge = new AcpBridge({ id: 'hermes-slow', kind: 'hermes' }, () => hermesNative);
-    const hermesAddr = await hermesBridge.start({ port: 0, token: 'acp-test-token' });
-    const hermesClient = new AcpAdapter('hermes-slow-client', {
-      id: 'hermes-slow-client',
-      kind: 'acp',
-      transport: 'local',
-      host: hermesAddr.host,
-      port: hermesAddr.port,
-      token: 'acp-test-token',
-    });
-    cleanups.push(async () => {
-      await hermesClient.close();
-      await hermesBridge.close();
-    });
-
-    const hermesEvents = [];
-    for await (const event of hermesClient.prompt(undefined, 'wait')) {
-      hermesEvents.push(event);
-      if (event.type === 'text' && event.text) await hermesClient.cancel(event.sessionId!);
-    }
-    expect(hermesNative.cancelled).toBe(true);
-    expect(hermesEvents.at(-1)).toMatchObject({ type: 'final', text: 'partial hermes', stopReason: 'cancelled' });
+    expect(events.at(-1)).toMatchObject({ type: 'final', text: 'working', stopReason: 'cancelled' });
   });
 
   it('connects to a standard ACP stdio agent through ndJsonStream', async () => {
@@ -710,6 +685,96 @@ describe('ACP provider and bridge', () => {
     expect(stopRequests).toBe(1);
     if (interim) expect(settled.timeline).toEqual([{ kind: 'commentary', text: commentary }]);
   });
+
+  it.each([[2_000_001], [1_000_001, 1_000_000]])(
+    'rejects oversized unclassified Hermes text on standard ACP',
+    async (...deltaLengths) => {
+      const { client, methods, PROTOCOL_VERSION } = await import('@agentclientprotocol/sdk');
+      const { createWebSocketStream } = await import('@agentclientprotocol/sdk/experimental/ws-client');
+      const { default: WebSocket } = await import('ws');
+      let allowOverflow = () => {};
+      let finishStop = () => {};
+      let markAdmitted = () => {};
+      let markStopping = () => {};
+      const overflowGate = new Promise<void>((resolve) => {
+        allowOverflow = resolve;
+      });
+      const stopGate = new Promise<void>((resolve) => {
+        finishStop = resolve;
+      });
+      const admitted = new Promise<void>((resolve) => {
+        markAdmitted = resolve;
+      });
+      const stopping = new Promise<void>((resolve) => {
+        markStopping = resolve;
+      });
+      class OversizedAdapter extends FakeNativeAdapter {
+        stoppedPrompt?: string;
+
+        override async *prompt(sessionId: string | undefined, text: string): AsyncIterable<AgentEvent> {
+          this.prompts.push({ sessionId: sessionId ?? '', text });
+          if (text !== 'oversized') {
+            yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
+            return;
+          }
+          markAdmitted();
+          await overflowGate;
+          for (const length of deltaLengths) yield { type: 'text', text: 'x'.repeat(length) };
+          yield { type: 'text', text: 'x'.repeat(2_000_001), interim: true, alreadyStreamed: true };
+          yield { type: 'final', text: 'All clean.', stopReason: 'completed' };
+        }
+
+        override async cancel(): Promise<void> {
+          this.stoppedPrompt = this.prompts.at(-1)?.text;
+          markStopping();
+          await stopGate;
+        }
+      }
+      const native = new OversizedAdapter();
+      const bridge = new AcpBridge({ id: native.id, kind: 'hermes' }, () => native);
+      const { host, port } = await bridge.start({ port: 0, token: 'acp-test-token' });
+      const connection = client().connect(
+        createWebSocketStream(`ws://${host}:${port}/acp`, {
+          WebSocket,
+          headers: { Authorization: 'Bearer acp-test-token' },
+        }),
+      );
+      cleanups.push(async () => {
+        allowOverflow();
+        finishStop();
+        connection.close();
+        await bridge.close();
+      });
+      await connection.agent.request(methods.agent.initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {},
+      });
+      const session = await connection.agent.buildSession({ cwd: '/', mcpServers: [] }).start();
+      const prompt = session.prompt('oversized');
+      const outcomes = Promise.allSettled([prompt, session.nextUpdate()]);
+      // A raw request bypasses the SDK's ActiveSession guard and exercises the bridge's ownership check.
+      const sendPrompt = (text: string) =>
+        connection.agent.request(methods.agent.session.prompt, {
+          sessionId: session.sessionId,
+          prompt: [{ type: 'text', text }],
+        });
+      await admitted;
+      await expect(sendPrompt('before overflow')).rejects.toThrow(/active prompt/i);
+      allowOverflow();
+      await stopping;
+      await expect(sendPrompt('during overflow cleanup')).rejects.toThrow(/active prompt/i);
+      finishStop();
+
+      const overflowFailure = {
+        status: 'rejected',
+        reason: { message: expect.stringMatching(/unclassified text.*buffer limit/i) },
+      };
+      expect(await outcomes).toMatchObject([overflowFailure, overflowFailure]);
+      expect(native.stoppedPrompt).toBe('oversized');
+      await expect(sendPrompt('after overflow')).resolves.toMatchObject({ stopReason: 'end_turn' });
+      expect(native.prompts.map(({ text }) => text)).toEqual(['oversized', 'after overflow']);
+    },
+  );
 
   it('keeps Hermes interim commentary out of model-facing job.text and standard ACP SDK readText() over WebSocket', async () => {
     const { AgentManager } = await import('../src/manager.js');

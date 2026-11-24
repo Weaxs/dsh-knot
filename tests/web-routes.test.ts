@@ -363,6 +363,61 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
+  it('redacts credentials split across timeline chunks in job and state responses', async () => {
+    const marker = 'syntheticmarker0123456';
+    class SplitOutputAdapter extends StubAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: 'Before Bearer ' };
+        yield { type: 'tool', phase: 'start', requestId: 'tool-1', name: 'read' };
+        yield { type: 'text', text: `${marker} after.` };
+      }
+    }
+    const config: AgentConfig = { id: 'split-output', kind: 'hermes', transport: 'local' };
+    const manager = new AgentManager([config], 10_000, () => new SplitOutputAdapter(config.id));
+    const routes = new Map<string, (req: Request) => Promise<Response>>();
+    const ctx = {
+      connection: {
+        fetch: {
+          register(route: { path: string; fetch: (req: Request) => Promise<Response> }) {
+            routes.set(route.path, route.fetch);
+            return () => routes.delete(route.path);
+          },
+        },
+      },
+      effect() {},
+    } as any;
+    registerWebRoutes(ctx, manager, undefined, undefined);
+    const post = async (path: string, body?: object) => {
+      const response = await routes.get(path)!(
+        new Request(`http://localhost${path}`, { method: 'POST', body: JSON.stringify(body) }),
+      );
+      expect(response.ok).toBe(true);
+      return response.json();
+    };
+    try {
+      const job = await manager.wait(manager.start(config.id, 'inspect output', undefined).id);
+      const revision = manager.list()[0]?.revision;
+      const [details, state] = await Promise.all([
+        post(WEB_ROUTES.job, { agentId: config.id, revision, jobId: job.id }),
+        post(WEB_ROUTES.state),
+      ]);
+      for (const entry of [details.value, state.value.jobs[0]]) {
+        expect(JSON.stringify(entry)).not.toContain(marker);
+        expect(entry).toMatchObject({
+          text: 'Before [REDACTED] after.',
+          timeline: [
+            { kind: 'text', text: 'Before [REDACTED]' },
+            { kind: 'tool', toolId: job.tools?.[0]?.id },
+            { kind: 'text', text: ' after.' },
+          ],
+        });
+      }
+      expect(job.text).toBe(`Before Bearer ${marker} after.`);
+    } finally {
+      await manager.close();
+    }
+  });
+
   it('captures a fresh baseline for each admitted turn despite out-of-order history requests', async () => {
     let transcript: AgentTranscriptMessage[] = [];
     let holdNextRead = true;
@@ -801,15 +856,22 @@ describe('web UI host routes & schemastery Config', () => {
       const own = typeof vnode.props?.text === 'string' ? [vnode.props.text] : [];
       return [...own, ...vnode.children.flatMap(collectText)];
     };
-    const findButton = (node: unknown, label: string): VNode | undefined => {
+    const findNode = (node: unknown, predicate: (vnode: VNode) => boolean): VNode | undefined => {
       if (!node || typeof node !== 'object') return undefined;
       const vnode = node as VNode;
-      if (vnode.type === 'button' && collectText(vnode).join('').includes(label)) return vnode;
+      if (predicate(vnode)) return vnode;
       for (const child of vnode.children) {
-        const found = findButton(child, label);
+        const found = findNode(child, predicate);
         if (found) return found;
       }
       return undefined;
+    };
+    const findButton = (node: unknown, label: string) =>
+      findNode(node, (vnode) => vnode.type === 'button' && collectText(vnode).join('').includes(label));
+    const requestField = (init: RequestInit | undefined, field: string): string => {
+      const value = typeof init?.body === 'string' ? JSON.parse(init.body)[field] : undefined;
+      if (typeof value !== 'string') throw new Error(`Missing request field ${field}`);
+      return value;
     };
 
     let currentJob: {
@@ -844,16 +906,24 @@ describe('web UI host routes & schemastery Config', () => {
         { kind: 'tool', toolId: 't-live' },
       ],
     };
-    let historyMessages: AgentTranscriptMessage[] = [
-      { id: 'm1', role: 'user', text: 'previous prompt' },
-      {
-        id: 'm2',
-        role: 'assistant',
-        text: 'previous reply',
-        thought: 'previous turn thought',
-        tools: [{ id: 't-old', name: 'terminal', status: 'completed', inputPreview: 'pwd' }],
-      },
-    ];
+    let localJob: typeof currentJob | undefined;
+    let localJobSubmitted = false;
+    const settledJobs: Array<typeof currentJob> = [];
+    const transcriptBySession = new Map<string, AgentTranscriptMessage[]>([
+      [
+        'sess-1',
+        [
+          { id: 'm1', role: 'user', text: 'previous prompt' },
+          {
+            id: 'm2',
+            role: 'assistant',
+            text: 'previous reply',
+            thought: 'previous turn thought',
+            tools: [{ id: 't-old', name: 'terminal', status: 'completed', inputPreview: 'pwd' }],
+          },
+        ],
+      ],
+    ]);
 
     mod._load = (req, parent, isMain) => {
       if (req === 'react') return fakeReact;
@@ -870,13 +940,14 @@ describe('web UI host routes & schemastery Config', () => {
       return origLoad(req, parent, isMain);
     };
 
+    let dispose: (() => Promise<void>) | undefined;
     try {
       let renderMain: (() => unknown) | undefined;
       const root = new Context();
       (root as any).provide('slots');
       (root as any).provide('connection');
       (root as any).set('connection', {
-        async fetch(path: string) {
+        async fetch(path: string, init?: RequestInit) {
           const ok = (value: unknown) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
           if (path === WEB_ROUTES.state) {
             return ok({
@@ -894,7 +965,7 @@ describe('web UI host routes & schemastery Config', () => {
                   connection: { status: 'connected' },
                 },
               ],
-              jobs: [currentJob],
+              jobs: [currentJob, ...(localJob && localJobSubmitted ? [localJob] : []), ...settledJobs],
               mcp: { enabled: false, address: null, allowSessions: [], localSessions: [] },
             });
           }
@@ -909,8 +980,24 @@ describe('web UI host routes & schemastery Config', () => {
               ],
             });
           }
-          if (path === WEB_ROUTES.sessionMessages) return ok({ messages: historyMessages });
-          if (path === WEB_ROUTES.job) return ok(currentJob);
+          if (path === WEB_ROUTES.sessionMessages) {
+            const sessionId = requestField(init, 'sessionId');
+            const messages = transcriptBySession.get(sessionId);
+            if (!messages) throw new Error(`Unexpected history session ${sessionId}`);
+            return ok({ messages });
+          }
+          if (path === WEB_ROUTES.ask) {
+            expect(requestField(init, 'sessionId')).toBe(localJob?.sessionId);
+            expect(requestField(init, 'message')).toBe(localJob?.prompt);
+            localJobSubmitted = true;
+            return ok(localJob);
+          }
+          if (path === WEB_ROUTES.job) {
+            const jobId = requestField(init, 'jobId');
+            if (jobId === localJob?.id) return ok(localJob);
+            if (jobId === currentJob.id) return ok(currentJob);
+            throw new Error(`Unexpected job ${jobId}`);
+          }
           return ok({});
         },
       });
@@ -924,6 +1011,7 @@ describe('web UI host routes & schemastery Config', () => {
         },
       });
       const fiber = root.plugin(clientPlugin as any, {});
+      dispose = () => fiber.dispose();
       await fiber;
       const flush = async () => {
         for (let step = 0; step < 6; step++) {
@@ -934,10 +1022,30 @@ describe('web UI host routes & schemastery Config', () => {
         }
         return renderNode(renderMain!());
       };
+      const submit = async (tree: unknown, message: string) => {
+        localJobSubmitted = false;
+        const input = findNode(tree, (vnode) => vnode.type === 'textarea')!;
+        (input.props.onInput as (event: { target: { value: string } }) => void)({ target: { value: message } });
+        const withInput = await flush();
+        const form = findNode(withInput, (vnode) => vnode.type === 'form')!;
+        (form.props.onSubmit as (event: { preventDefault: () => void }) => void)({ preventDefault() {} });
+        const ownTree = await flush();
+        expect(localJobSubmitted).toBe(true);
+        return ownTree;
+      };
 
       // Case A: While the job is running and history still ends on the previous turn,
       // live activity (prompt, thought, commentary, tool) stays visible.
-      const dashboard = await flush();
+      let dashboard = await flush();
+      (findButton(dashboard, '添加助手')!.props.onClick as () => void)();
+      const withDialog = await flush();
+      const dialog = findNode(withDialog, (vnode) => vnode.props.role === 'dialog')!;
+      const heading = findNode(dialog, (vnode) => vnode.type === 'h3')!;
+      expect(dialog.props['aria-labelledby']).toBe(heading.props.id);
+      expect(collectText(heading)).toContain('添加远端助手');
+      const close = findNode(dialog, (vnode) => vnode.props['aria-label'] === '关闭')!;
+      (close.props.onClick as () => void)();
+      dashboard = await flush();
       const chatBtn = findButton(dashboard, '对话');
       expect(chatBtn).toBeDefined();
       (chatBtn!.props.onClick as () => void)();
@@ -956,7 +1064,7 @@ describe('web UI host routes & schemastery Config', () => {
       // Case B: If the job settles with the SAME prompt, reply, AND reused tool-call ID as the previous
       // turn while history row IDs are still unchanged (m1/m2), do NOT hide the newly completed turn!
       const reusedToolId = 'r'.repeat(64);
-      historyMessages = [
+      transcriptBySession.set('sess-1', [
         { id: 'm1', role: 'user', text: 'previous prompt' },
         {
           id: 'm2',
@@ -965,7 +1073,7 @@ describe('web UI host routes & schemastery Config', () => {
           thought: 'previous turn thought',
           tools: [{ id: reusedToolId, name: 'terminal', status: 'completed', inputPreview: 'pwd' }],
         },
-      ];
+      ]);
       currentJob = {
         ...currentJob,
         prompt: 'previous prompt',
@@ -1014,10 +1122,10 @@ describe('web UI host routes & schemastery Config', () => {
           { kind: 'tool', toolId: toolAId },
         ],
       };
-      historyMessages = [
+      transcriptBySession.set('sess-2', [
         { id: 'm1', role: 'user', text: 'older prompt' },
         { id: 'm2', role: 'assistant', text: 'older reply' },
-      ];
+      ]);
       // Switch to sess-2 while job-3 is running (captures baseline m1/m2)
       const backBtn = findButton(unchangedHistoryTree, '助手设置');
       expect(backBtn).toBeDefined();
@@ -1032,7 +1140,7 @@ describe('web UI host routes & schemastery Config', () => {
 
       // job-3 completes: live has partial thought, commentary, tool A, prose 'Working...', tool B (NO live preview),
       // and 'final answer'. Persisted history has fuller thought, distinct prose containing 'final answer',
-      // persisted-only tool P, prose 'Working...' + tool B (WITH persisted preview), and 'final answer'.
+      // persisted-only tool P, and both live answer fragments joined in the same row as B.
       currentJob = {
         ...currentJob,
         status: 'completed',
@@ -1051,8 +1159,8 @@ describe('web UI host routes & schemastery Config', () => {
           { kind: 'text', text: 'final answer' },
         ],
       };
-      historyMessages = [
-        ...historyMessages,
+      transcriptBySession.set('sess-2', [
+        ...transcriptBySession.get('sess-2')!,
         { id: 'm3', role: 'user', text: 'current prompt' },
         {
           id: 'm4',
@@ -1064,21 +1172,17 @@ describe('web UI host routes & schemastery Config', () => {
         {
           id: 'm5',
           role: 'assistant',
-          text: 'Working...',
+          text: 'Working...final answer',
           tools: [{ id: toolBId, name: 'terminal', status: 'completed', inputPreview: 'cmd-B-persisted' }],
         },
-        {
-          id: 'm6',
-          role: 'assistant',
-          text: 'final answer',
-        },
-      ];
+      ]);
       await new Promise((r) => setTimeout(r, 450));
       const settledTree = await flush();
       const settledTexts = collectText(settledTree);
       expect(settledTexts.filter((t) => t === 'current prompt')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'final answer')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'Working...')).toHaveLength(1);
+      expect(settledTexts).not.toContain('Working...final answer');
       expect(settledTexts.filter((t) => t === 'cmd-A')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'cmd-B-persisted')).toHaveLength(1);
       expect(settledTexts.filter((t) => t === 'cmd-P')).toHaveLength(1);
@@ -1127,16 +1231,17 @@ describe('web UI host routes & schemastery Config', () => {
       ]);
       const origFetch = (root as any).get('connection').fetch;
       (root as any).get('connection').fetch = async (path: string, init?: RequestInit) => {
-        if (path === WEB_ROUTES.sessionMessages && firstFetchMessages.has(currentJob.sessionId)) {
-          const sid = currentJob.sessionId;
-          const count = (sessionFetchCounts.get(sid) ?? 0) + 1;
-          sessionFetchCounts.set(sid, count);
-          if (count === 1) {
+        if (path === WEB_ROUTES.sessionMessages) {
+          const sid = requestField(init, 'sessionId');
+          const scripted = firstFetchMessages.get(sid);
+          if (scripted !== undefined) {
+            const count = (sessionFetchCounts.get(sid) ?? 0) + 1;
+            sessionFetchCounts.set(sid, count);
+            if (count > 1) return origFetch(path, init);
             await new Promise<void>((resolve) => {
               stalledResolvers.set(sid, resolve);
               init?.signal?.addEventListener('abort', () => resolve(), { once: true });
             });
-            const scripted = firstFetchMessages.get(sid)!;
             if (scripted === 'fail') {
               return { ok: false, status: 500, json: async () => ({ ok: false, error: 'temporary history error' }) };
             }
@@ -1157,10 +1262,10 @@ describe('web UI host routes & schemastery Config', () => {
         timeline: [],
         historyBaseline: { length: 0 },
       };
-      historyMessages = [
+      transcriptBySession.set('sess-3', [
         { id: 'f1', role: 'user', text: 'fast prompt' },
         { id: 'f2', role: 'assistant', text: 'fast reply' },
-      ];
+      ]);
       (findButton(settledTree, '助手设置')!.props.onClick as () => void)();
       const dash3 = await flush();
       (findButton(dash3, '对话')!.props.onClick as () => void)();
@@ -1197,10 +1302,10 @@ describe('web UI host routes & schemastery Config', () => {
         text: '',
         timeline: [],
       };
-      historyMessages = [
+      transcriptBySession.set('sess-4', [
         { id: 'old1', role: 'user', text: 'fast prompt' },
         { id: 'old2', role: 'assistant', text: 'fast reply' },
-      ];
+      ]);
       (findButton(fastFreshTree, '助手设置')!.props.onClick as () => void)();
       const dash4 = await flush();
       (findButton(dash4, '对话')!.props.onClick as () => void)();
@@ -1236,10 +1341,10 @@ describe('web UI host routes & schemastery Config', () => {
         text: '',
         timeline: [],
       };
-      historyMessages = [
+      transcriptBySession.set('sess-5', [
         { id: 'old1', role: 'user', text: 'fast prompt' },
         { id: 'old2', role: 'assistant', text: 'fast reply' },
-      ];
+      ]);
       (findButton(fastStaleTree, '助手设置')!.props.onClick as () => void)();
       const dash5 = await flush();
       (findButton(dash5, '对话')!.props.onClick as () => void)();
@@ -1263,10 +1368,106 @@ describe('web UI host routes & schemastery Config', () => {
       expect(failedRunTexts.filter((t) => t === 'fast reply')).toHaveLength(1);
       expect(failedRunTexts.join('\n')).toContain('Gateway error');
 
-      for (const cleanup of cleanups) cleanup();
-      await fiber.dispose();
+      // Case E: Activity can outlive the answer's timeline entry. The retained reply remains visible.
+      localJob = {
+        id: 'own-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-5',
+        prompt: 'local prompt',
+        status: 'running',
+        createdAt: 12_000,
+        updatedAt: 12_000,
+        historyBaseline: { length: 2, lastId: 'old2' },
+        text: 'retained local reply',
+        timeline: [{ kind: 'thought', text: 'remaining activity' }],
+      };
+      const ownTree = await submit(failedRunTree, localJob.prompt);
+      expect(collectText(ownTree)).toContain('retained local reply');
+      expect(collectText(ownTree)).toContain('remaining activity');
+
+      // The next job carries a fresh anchor after the local turn. History must replace the same turn in place.
+      localJob = { ...localJob, status: 'cancelled', updatedAt: 13_000 };
+      currentJob = {
+        id: 'next-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-5',
+        prompt: 'remote prompt',
+        status: 'running',
+        createdAt: 14_000,
+        updatedAt: 14_000,
+        historyBaseline: { length: 4, lastId: 'own2' },
+        text: 'remote reply',
+      };
+      transcriptBySession.set('sess-5', [
+        ...transcriptBySession.get('sess-5')!,
+        { id: 'own1', role: 'user', text: localJob.prompt },
+        { id: 'own2', role: 'assistant', text: localJob.text },
+      ]);
+      await new Promise((r) => setTimeout(r, 450));
+      const observedTree = await flush();
+      const observedTexts = collectText(observedTree);
+      expect(observedTexts.filter((t) => t === 'local prompt')).toHaveLength(1);
+      expect(observedTexts.filter((t) => t === 'retained local reply')).toHaveLength(1);
+      expect(observedTexts).toContain('remaining activity');
+      expect(observedTexts).toContain('remote reply');
+      expect(observedTexts.indexOf('retained local reply')).toBeLessThan(observedTexts.indexOf('remote prompt'));
+
+      currentJob = { ...currentJob, status: 'completed', updatedAt: 15_000 };
+      transcriptBySession.set('sess-5', [
+        ...transcriptBySession.get('sess-5')!,
+        { id: 'remote1', role: 'user', text: currentJob.prompt },
+        { id: 'remote2', role: 'assistant', text: currentJob.text },
+      ]);
+      await new Promise((r) => setTimeout(r, 450));
+      const finishedTree = await flush();
+      settledJobs.push(currentJob, localJob);
+
+      // Case F: A partial answer stays below its persisted prompt when the next prompt is already in history.
+      localJob = {
+        id: 'partial-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-5',
+        prompt: 'partial prompt',
+        status: 'running',
+        createdAt: 16_000,
+        updatedAt: 16_000,
+        historyBaseline: { length: 6, lastId: 'remote2' },
+        text: 'partial reply',
+      };
+      await submit(finishedTree, localJob.prompt);
+      localJob = { ...localJob, status: 'cancelled', updatedAt: 17_000 };
+      currentJob = {
+        ...currentJob,
+        id: 'next-running-job',
+        prompt: 'latest remote prompt',
+        status: 'running',
+        createdAt: 18_000,
+        updatedAt: 18_000,
+        historyBaseline: { length: 7, lastId: 'partial1' },
+        text: '',
+      };
+      transcriptBySession.set('sess-5', [
+        ...transcriptBySession.get('sess-5')!,
+        { id: 'partial1', role: 'user', text: localJob.prompt },
+        { id: 'latest1', role: 'user', text: currentJob.prompt },
+      ]);
+      await new Promise((r) => setTimeout(r, 450));
+      const nextTexts = collectText(await flush());
+      expect(nextTexts.filter((t) => t === 'local prompt')).toHaveLength(1);
+      expect(nextTexts.filter((t) => t === 'partial prompt')).toHaveLength(1);
+      expect(nextTexts.filter((t) => t === 'latest remote prompt')).toHaveLength(1);
+      expect(nextTexts.indexOf('partial prompt')).toBeLessThan(nextTexts.indexOf('partial reply'));
+      expect(nextTexts.indexOf('partial reply')).toBeLessThan(nextTexts.indexOf('latest remote prompt'));
     } finally {
-      mod._load = origLoad;
+      try {
+        try {
+          for (const cleanup of cleanups) cleanup();
+        } finally {
+          await dispose?.();
+        }
+      } finally {
+        mod._load = origLoad;
+      }
     }
   });
 });

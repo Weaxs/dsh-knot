@@ -1482,7 +1482,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, [history, turns, observedJob]);
 
     const historyPending = canReadHistory && !history && !historyError;
-    const lastMessage = history?.at(-1);
     const send = async () => {
       const message = input.trim();
       if (!message || activeId || historyPending || sendLock.current || actionLock.current) return;
@@ -1663,25 +1662,29 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
 
     interface MatchedLiveTurn {
       startIndex: number;
+      endIndex: number;
       persistedTurn: TranscriptMessage[];
-      suppressPromptOnly?: boolean;
     }
 
-    const matchObservedTurnInHistory = (job: JobSummary | undefined): MatchedLiveTurn | undefined => {
-      if (!job || historyJob?.id !== job.id || !history?.length || !job.historyBaseline) return undefined;
+    const matchTurnInHistory = (job: JobSummary, nextJob?: JobSummary): MatchedLiveTurn | undefined => {
+      if (!historyJob || !history?.length || !job.historyBaseline) return undefined;
+      const observed = historyJob.id === job.id;
+      // A later job's pre-run tail gives a settled local turn a separate upper bound.
+      const nextTail = nextJob?.historyBaseline?.lastId;
+      const endIndex = observed ? history.length : history.findIndex((message) => message.id === nextTail) + 1;
+      if (!endIndex || (!observed && isRunning(job))) return undefined;
       const baseline = job.historyBaseline;
       const boundary = history.findIndex((message) => message.id === baseline.lastId);
       if (baseline.length > 0 && boundary < 0) return undefined;
       const turnStart = history.findIndex((message, index) => index > boundary && message.role === 'user');
-      if (turnStart < 0 || history[turnStart]?.text !== job.prompt) return undefined;
-      const lastTurnAssistant = history.slice(turnStart + 1);
+      if (turnStart < 0 || turnStart >= endIndex || history[turnStart]?.text !== job.prompt) return undefined;
+      const lastTurnAssistant = history.slice(turnStart + 1, endIndex);
+      const lastMessage = history[endIndex - 1];
       // A session may be advanced outside Knot. Multiple new prompts do not identify this job.
       if (lastTurnAssistant.some((message) => message.role === 'user')) return undefined;
-      if (isAvailableAndRunning(job) || !historyJob.settled) {
-        return lastMessage?.role === 'user'
-          ? { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true }
-          : undefined;
-      }
+      const match = { startIndex: turnStart, endIndex, persistedTurn: history.slice(turnStart, endIndex) };
+      if (lastMessage?.role === 'user') return match;
+      if (observed && (isAvailableAndRunning(job) || !historyJob.settled)) return undefined;
 
       const joinedAssistantText = lastTurnAssistant.map((item) => item.text).join('');
       const replyMatches =
@@ -1694,19 +1697,11 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       const contentMatches =
         (job.status === 'completed' || Boolean(job.text)) &&
         (replyMatches || (job.status === 'completed' && !job.text && lastTurnAssistant.length > 0));
-      if (!contentMatches) {
-        if (lastMessage?.role === 'user') {
-          return { startIndex: history.length, persistedTurn: [], suppressPromptOnly: true };
-        }
-        return undefined;
-      }
-
-      return { startIndex: turnStart, persistedTurn: history.slice(turnStart) };
+      return contentMatches ? match : undefined;
     };
 
     const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
     const liveIsOwnTurn = Boolean(liveJob && turns.some(({ id }) => id === liveJob.id));
-    const matchedLiveTurn = liveIsOwnTurn ? undefined : matchObservedTurnInHistory(liveJob);
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(
@@ -1737,6 +1732,13 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const mergeTurnSegments = (live: TurnSegment[], persisted: TurnSegment[]): TurnSegment[] => {
       if (!persisted.length) return live;
       if (!live.length) return persisted;
+      const liveAnswer = live.filter((segment) => segment.kind === 'text').map((segment) => segment.text);
+      const finalTextIndex = persisted.findLastIndex((segment) => segment.kind === 'text');
+      const finalText = persisted[finalTextIndex];
+      // History can store the full answer across tools in one row. Keep the live fragments at their original positions.
+      if (liveAnswer.length > 1 && finalText?.kind === 'text' && finalText.text.trim() === liveAnswer.join('').trim()) {
+        persisted = persisted.filter((_, index) => index !== finalTextIndex);
+      }
       const thoughtsMatch = (a: string, b: string): boolean => {
         const ta = a.trim();
         const tb = b.trim();
@@ -1865,7 +1867,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       const persistedTurn = matchedTurn?.persistedTurn ?? [];
       const persistedUser = persistedTurn.find((item) => item.role === 'user');
       const persistedAssistant = persistedTurn.filter((item) => item.role === 'assistant');
-      const showPrompt = !matchedTurn?.suppressPromptOnly;
       const promptText = persistedUser?.text ?? job.prompt;
 
       const liveToolById = new Map<string, ToolActivitySummary>((job.tools ?? []).map((tool) => [tool.id, tool]));
@@ -1884,6 +1885,9 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         } else if (entry.text) {
           liveSegments.push(entry);
         }
+      }
+      if (job.text && !liveSegments.some((segment) => segment.kind === 'text')) {
+        liveSegments.push({ kind: 'text', text: job.text });
       }
       const persistedSegments: TurnSegment[] = [];
       for (const msg of persistedAssistant) {
@@ -1915,7 +1919,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       });
       flushTools('tail');
 
-      const hasPrompt = Boolean(showPrompt && promptText);
+      const hasPrompt = Boolean(promptText);
       const hasAssistantContent = Boolean(contentParts.length > 0 || active || approval || terminalNotice);
       if (!hasPrompt && !hasAssistantContent) return null;
       const assistantParts = [
@@ -1989,12 +1993,28 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       );
     };
 
-    const renderHistoryItems = () => {
-      if (!history?.length) return null;
-      const visibleHistory =
-        matchedLiveTurn && !matchedLiveTurn.suppressPromptOnly ? history.slice(0, matchedLiveTurn.startIndex) : history;
-      if (!visibleHistory.length) return null;
+    const renderConversation = () => {
+      const displayJobs = [
+        ...fallbackJobs.sort((a, b) => a.createdAt - b.createdAt).slice(-20),
+        ...turns,
+        ...(liveJob && !liveIsOwnTurn ? [liveJob] : []),
+      ].sort((a, b) => a.createdAt - b.createdAt);
+      if (!history?.length) return displayJobs.map((job) => renderJob(job));
+      const boundaryJobs = [...displayJobs, ...jobs.filter(belongsToSession)]
+        .filter((job) => job.historyBaseline?.lastId)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      const matches = displayJobs.map((job) =>
+        matchTurnInHistory(
+          job,
+          boundaryJobs.find((next) => next.createdAt > job.createdAt),
+        ),
+      );
+      const matchedJobIndexes = new Map<number, number>();
+      matches.forEach((match, index) => {
+        if (match) matchedJobIndexes.set(match.startIndex, index);
+      });
       const items: unknown[] = [];
+      let nextJobIndex = 0;
       let assistantBatch: TranscriptMessage[] = [];
       const flushAssistantBatch = () => {
         if (!assistantBatch.length) return;
@@ -2008,7 +2028,20 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         if (parts.length) items.push(renderAssistant(first.id, parts));
         assistantBatch = [];
       };
-      for (const message of visibleHistory) {
+      for (let index = 0; index < history.length; index++) {
+        const matchedJobIndex = matchedJobIndexes.get(index);
+        if (matchedJobIndex !== undefined && matchedJobIndex >= nextJobIndex) {
+          flushAssistantBatch();
+          while (nextJobIndex < matchedJobIndex) {
+            items.push(renderJob(displayJobs[nextJobIndex]!));
+            nextJobIndex++;
+          }
+          const match = matches[matchedJobIndex]!;
+          items.push(renderJob(displayJobs[nextJobIndex++]!, match));
+          index = match.endIndex - 1;
+          continue;
+        }
+        const message = history[index]!;
         if (message.role === 'user') {
           flushAssistantBatch();
           items.push(h(UserMessageBubble, { key: message.id, className: 'dk-chat-user' }, message.text));
@@ -2017,6 +2050,9 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         }
       }
       flushAssistantBatch();
+      for (; nextJobIndex < displayJobs.length; nextJobIndex++) {
+        items.push(renderJob(displayJobs[nextJobIndex]!));
+      }
       return items;
     };
 
@@ -2091,13 +2127,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
                 h('div', { className: 'dk-muted', style: { marginTop: '4px' } }, t('chatEmpty')),
               )
             : null,
-          renderHistoryItems(),
-          fallbackJobs
-            .sort((a, b) => a.createdAt - b.createdAt)
-            .slice(-20)
-            .map((job) => renderJob(job)),
-          liveJob && !liveIsOwnTurn ? renderJob(liveJob, matchedLiveTurn) : null,
-          turns.map((job) => renderJob(job)),
+          renderConversation(),
         ),
       ),
       h(
@@ -2830,12 +2860,17 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                   className: 'dk-modal',
                   role: 'dialog',
                   'aria-modal': true,
+                  'aria-labelledby': 'dk-agent-dialog-title',
                   onClick: (e: { stopPropagation?: () => void }) => e.stopPropagation?.(),
                 },
                 h(
                   'div',
                   { className: 'dk-modal-head' },
-                  h('h3', { className: 'dk-modal-title' }, t(form.editing ? 'modalEditTitle' : 'modalAddTitle')),
+                  h(
+                    'h3',
+                    { id: 'dk-agent-dialog-title', className: 'dk-modal-title' },
+                    t(form.editing ? 'modalEditTitle' : 'modalAddTitle'),
+                  ),
                   h(
                     'button',
                     {

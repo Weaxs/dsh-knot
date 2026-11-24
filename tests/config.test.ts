@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { normalizeConfig } from '../src/config.js';
-import { redact, redactText, toolInputPreview } from '../src/policy/redact.js';
+import { redact, redactText, redactTextSegments, toolInputPreview } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
   it('defaults to direct and assigns protocol ports', () => {
@@ -69,6 +69,12 @@ describe('configuration and policy', () => {
     expect((value.nested as { text: string }).text).not.toContain('abcdefghijklmnop');
     expect(value.safe).toBe(42);
     expect(value.self).toBe('[Circular]');
+  });
+
+  it('redacts retained fragments of a credential even if the scheme is no longer in the timeline', () => {
+    expect(
+      redactTextSegments(['', 'synthetic', 'marker0123456 after'], 'Before Bearer syntheticmarker0123456 after'),
+    ).toEqual(['', '[REDACTED]', ' after']);
   });
 
   it('bounds tool input previews and masks credentials in nested values', () => {

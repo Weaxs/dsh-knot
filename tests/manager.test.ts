@@ -876,6 +876,30 @@ describe('AgentManager', () => {
     await finalManager.close();
   });
 
+  it('retracts the retained reply when streamed commentary exceeds the text budget', async () => {
+    const tail = 'x'.repeat(2_000_000);
+    const commentary = `Checking ${tail}`;
+    class OversizedInterimAdapter extends FakeAdapter {
+      override async *prompt(): AsyncIterable<AgentEvent> {
+        yield { type: 'text', text: `Checking ${tail.slice(0, 200)}` };
+        for (let i = 0; i < 120; i++) {
+          yield { type: 'tool', requestId: `t${i}`, phase: 'start', name: 'terminal' };
+        }
+        yield { type: 'text', text: tail.slice(200) };
+        yield { type: 'text', text: commentary, interim: true, alreadyStreamed: true };
+        yield { type: 'final', text: '', stopReason: 'cancelled' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new OversizedInterimAdapter(config.id));
+    try {
+      const job = await manager.wait(manager.start(config.id, 'check', undefined).id);
+      expect(job.text).toHaveLength(0);
+      expect(job.timeline?.filter((entry) => entry.kind !== 'tool')).toEqual([{ kind: 'commentary', text: tail }]);
+    } finally {
+      await manager.close();
+    }
+  });
+
   it('reconciles aggregate and divergent finals, keeps interim commentary out of job.text, and bounds timeline budgets', async () => {
     // 1. Aggregate final after tool appends only the missing suffix (text('A') -> tool -> final('AB'))
     class AggregateFinalAdapter extends FakeAdapter {

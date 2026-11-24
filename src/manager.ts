@@ -603,7 +603,6 @@ export class AgentManager {
           if (event.interim) {
             const retracted = event.retractText ?? (event.alreadyStreamed ? event.text : '');
             if (retracted) {
-              job.text = stripTrailingText(job.text, retracted);
               reclassifyStreamedCommentary(job, event.text, retracted);
             } else {
               appendTimelineText(job, 'commentary', event.text, MAX_JOB_TEXT_LENGTH);
@@ -762,20 +761,25 @@ function appendTimelineTool(job: AgentJob, toolId: string): void {
   job.timeline = [...timeline.slice(-(MAX_JOB_TIMELINE - 1)), { kind: 'tool', toolId }];
 }
 
-function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retracted = commentary): void {
+function reclassifyStreamedCommentary(job: AgentJob, commentary: string, retracted: string): void {
+  const previous = job.text;
+  const retainedRetraction =
+    previous.length === MAX_JOB_TEXT_LENGTH ? retracted.slice(-MAX_JOB_TEXT_LENGTH) : retracted;
+  job.text = stripTrailingText(previous, retainedRetraction);
+
   const timeline = job.timeline ?? [];
-  const reply = timeline
-    .filter((entry) => entry.kind === 'text')
-    .map((entry) => entry.text)
-    .join('');
-  let charsToRemove = reply.length - stripTrailingText(reply, retracted).length;
+  const retainedReplyLength = timeline.reduce(
+    (length, entry) => length + (entry.kind === 'text' ? entry.text.length : 0),
+    0,
+  );
+  let charsToRemove = Math.min(previous.length - job.text.length, retainedReplyLength);
   if (!charsToRemove) {
     appendTimelineText(job, 'commentary', commentary, MAX_JOB_TEXT_LENGTH);
     return;
   }
 
   const next = [...timeline];
-  const commentaryEntry = { kind: 'commentary' as const, text: commentary };
+  const commentaryEntry = { kind: 'commentary' as const, text: commentary.slice(-MAX_JOB_TEXT_LENGTH) };
   for (let i = timeline.length - 1; i >= 0; i--) {
     const entry = timeline[i];
     if (entry?.kind !== 'text') continue;

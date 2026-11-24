@@ -101,7 +101,10 @@ export class HermesAdapter implements AgentAdapter {
       const row = rows[index];
       if (row?.role !== 'user' && row?.role !== 'assistant') continue;
       const text = transcriptText(row.content);
-      const thought = row.role === 'assistant' ? transcriptThought(row.reasoning_content ?? row.reasoning) : undefined;
+      const thought =
+        row.role === 'assistant'
+          ? (transcriptThought(row.reasoning_content) ?? transcriptThought(row.reasoning))
+          : undefined;
       const tools = row.role === 'assistant' ? transcriptTools(row.tool_calls, index, token) : undefined;
       if (!text.trim() && !thought && !tools?.length) continue;
       const remoteId = row.id;
@@ -133,9 +136,8 @@ export class HermesAdapter implements AgentAdapter {
     signal?.throwIfAborted();
     let terminal = false;
     let output = '';
-    // Tracks message.delta text emitted in the current LLM step so truncated-prefix
-    // `message.interim(..., already_streamed: false)` resends can strip what was streamed.
-    let stepText = '';
+    // Keep the current step's original prefix available for `message.interim` resends.
+    let stepStart = 0;
     let response: Awaited<ReturnType<Transport['stream']>>;
     try {
       response = await this.transport.stream({
@@ -166,12 +168,12 @@ export class HermesAdapter implements AgentAdapter {
         const type = String(event.event ?? event.type ?? frame.event ?? '');
         const isApproval = /approval|permission/.test(type);
         if (type.startsWith('tool.') && !isApproval) {
-          stepText = '';
+          stepStart = output.length;
           const started = /^tool\.start(?:ed)?$/.test(type);
           const ended = /^tool\.(?:complete(?:d)?|end(?:ed)?|finish(?:ed)?|failed)$/.test(type);
           if (!started && !ended) continue;
           const name = event.tool ?? event.name ?? event.tool_name;
-          const requestId = event.tool_call_id;
+          const requestId = firstNonEmptyString(event.tool_call_id);
           const inputPreview =
             started && typeof event.preview === 'string'
               ? toolInputPreview(event.preview, secret(this.config))
@@ -181,13 +183,13 @@ export class HermesAdapter implements AgentAdapter {
             phase: ended ? 'end' : 'start',
             name: typeof name === 'string' && name ? name : 'tool',
             ...(inputPreview ? { inputPreview } : {}),
-            ...(typeof requestId === 'string' && requestId ? { requestId } : {}),
+            ...(requestId ? { requestId } : {}),
             ...(ended && (type === 'tool.failed' || event.error === true) ? { failed: true } : {}),
           };
           continue;
         }
         if (isApproval) {
-          stepText = '';
+          stepStart = output.length;
           // Hermes session_authority emits `prompt_id` + `execution_generation`; legacy runs emit `request_id`.
           const requestId = firstNonEmptyString(event.prompt_id, event.request_id, event.id, frame.id);
           const executionGeneration =
@@ -228,13 +230,11 @@ export class HermesAdapter implements AgentAdapter {
           // was streamed before resending the full commentary, and may emit `reasoning.available` in between.
           const interim = textOf(event.text ?? event.content ?? event.delta);
           const matched =
-            event.already_streamed === true
-              ? matchStreamedInterim(stepText, interim) || interim
-              : matchStreamedInterim(stepText, interim);
-          stepText = '';
+            matchStreamedInterim(output.slice(stepStart), interim) || (event.already_streamed === true ? interim : '');
+          if (matched) output = stripTrailingText(output, matched);
+          stepStart = output.length;
           if (interim) {
             if (matched) {
-              output = stripTrailingText(output, matched);
               yield {
                 type: 'text',
                 text: interim,
@@ -251,7 +251,6 @@ export class HermesAdapter implements AgentAdapter {
         const textDelta = textOf(event.delta ?? event.text_delta ?? event.content);
         if (textDelta) {
           output += textDelta;
-          stepText = (stepText + textDelta).slice(-2_000_000);
           yield { type: 'text', text: textDelta };
         }
         if (/^run\.(completed|failed|cancelled|interrupted)$/.test(type)) {
