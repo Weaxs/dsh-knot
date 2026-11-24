@@ -57,8 +57,9 @@ function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
   ] as const) {
     const entries = textEntries.filter((entry) => entry.kind === kind);
     const segments = entries.map((entry) => entry.text);
-    const prefix = kind === 'commentary' && segments.length > 0 ? manager.getCommentaryPrefix(job.id) : undefined;
-    const texts = redactTextSegments(segments, prefix ? `${prefix}${segments.join('')}` : fullText);
+    const context =
+      kind === 'commentary' && segments.length > 0 ? manager.getCommentaryRedactionContext(job.id) : undefined;
+    const texts = redactTextSegments(segments, fullText, context);
     entries.forEach((entry, index) => {
       entry.text = texts[index]!;
     });

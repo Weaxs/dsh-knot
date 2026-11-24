@@ -84,10 +84,11 @@ describe('configuration and policy', () => {
     const incomplete = `${header}\n${marker}\n-----END EC PRIVATE KEY-----\n${marker}`;
     expect(redactText(`Before ${incomplete}`)).toBe('Before [REDACTED]');
     expect(redactText(`Before ${incomplete}\n-----END RSA PRIVATE KEY-----\nAfter`)).toBe('Before [REDACTED]\nAfter');
-    const prefix = retainRedactionTail('', `${incomplete}\n${'x'.repeat(5_000)}\n${partialFooter}`);
-    expect(prefix).toBe(`${header}${partialFooter}`);
+    const context = retainRedactionTail(undefined, `${incomplete}\n${'x'.repeat(5_000)}\n${partialFooter}`);
+    expect(context.suffix).toBe('');
+    expect(context.shapes.get('privateKey')).toEqual([`${header}${partialFooter}`]);
     const visible = 'VATE KEY-----\nAfter';
-    expect(redactTextSegments([visible], prefix + visible)).toEqual(['[REDACTED]\nAfter']);
+    expect(redactTextSegments([visible], undefined, context)).toEqual(['[REDACTED]\nAfter']);
   });
 
   it.each([
@@ -96,11 +97,40 @@ describe('configuration and policy', () => {
     ['ghp_', 'suffix'],
     ['eyJ', '.abcdefgh.abcdefgh'],
   ])('keeps bounded recognition of a long credential beginning with %s', (prefix, suffix) => {
-    const context = retainRedactionTail('', `${prefix}${'x'.repeat(5_000)}`);
-    expect(context.length).toBeLessThan(64);
-    expect(context).not.toContain('x');
+    const context = retainRedactionTail(undefined, `${prefix}${'x'.repeat(5_000)}`);
+    const retained = context.suffix + [...context.shapes.values()].flat().join('');
+    expect(retained.length).toBeLessThan(64);
+    expect(retained).not.toContain('x');
     const visible = `${suffix} after`;
-    expect(redactTextSegments([visible], context + visible)).toEqual(['[REDACTED] after']);
+    expect(redactTextSegments([visible], undefined, context)).toEqual(['[REDACTED] after']);
+  });
+
+  it.each([
+    ['sk-abcdefghijkl-sk-', 'suffix'],
+    ['eyJabcdefgh.sk-abcdefghijkl', '.abcdefgh'],
+    ['eyJabcdefgh.sk-abcdefghijkl', 'suffix'],
+    ['eyJshort.eyJabcdefgh.abcdefgh', '.abcdefgh'],
+    ['eyJabcdefgh.abcdefgh.eyJabcdefgh', '.abcdefgh.abcdefgh'],
+  ])('redacts retained text in overlapping credential shapes (%#)', (dropped, suffix) => {
+    const context = retainRedactionTail(undefined, dropped);
+    const visible = `${suffix} after`;
+    expect(redactTextSegments([visible], undefined, context)).toEqual(['[REDACTED] after']);
+  });
+
+  it('redacts an enclosing credential even when a separate grammar matches inside it', () => {
+    expect(redactText('Before eyJabcdefgh.sk-abcdefghijkl.abcdefgh after')).toBe('Before [REDACTED] after');
+  });
+
+  it('retains a divided JWT opener across evictions while another token is open', () => {
+    const prefix = retainRedactionTail(undefined, 'sk-abcdefgh-ey');
+    const context = retainRedactionTail(prefix, 'Jabcdefgh.abcdefgh');
+    expect(redactTextSegments(['.abcdefgh after'], undefined, context)).toEqual(['[REDACTED] after']);
+  });
+
+  it('retains a new authorization opener that starts inside the previous value', () => {
+    const prefix = retainRedactionTail(undefined, 'Bearer abc-Basic');
+    const context = retainRedactionTail(prefix, ' ');
+    expect(redactTextSegments(['syntheticvalue after'], undefined, context)).toEqual(['[REDACTED] after']);
   });
 
   it('bounds tool input previews and masks credentials in nested values', () => {

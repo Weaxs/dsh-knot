@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AcpAdapter } from './adapters/acp.js';
 import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
 import { LocalOnlyAbortError, normalizeToolCallId, raceAbort, secret, stripTrailingText } from './config.js';
-import { retainRedactionTail } from './policy/redact.js';
+import { type RedactionContext, retainRedactionTail } from './policy/redact.js';
 import type {
   AgentAdapter,
   AgentConfig,
@@ -24,7 +24,7 @@ const MAX_JOB_APPROVALS = 50;
 const MAX_JOB_TEXT_LENGTH = 2_000_000;
 const MAX_JOB_THOUGHT_LENGTH = 16_000;
 const MAX_JOB_TIMELINE = 120;
-const commentaryPrefixes = new WeakMap<AgentJob, string>();
+const commentaryContexts = new WeakMap<AgentJob, RedactionContext>();
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -289,9 +289,9 @@ export class AgentManager {
     return job?.agentId === agentId && owner && owner.adapter === this.adapters.get(agentId) ? job : undefined;
   }
 
-  getCommentaryPrefix(id: string): string | undefined {
+  getCommentaryRedactionContext(id: string): RedactionContext | undefined {
     const job = this.jobs.get(id);
-    return job && commentaryPrefixes.get(job);
+    return job && commentaryContexts.get(job);
   }
 
   listJobs({ currentOnly = false } = {}): AgentJob[] {
@@ -737,13 +737,13 @@ function appendTimelineText(
   trimTimelineBudget(job, kind === 'thought' ? 'thought' : 'text', maxLength);
 }
 
-function rememberCommentaryPrefix(job: AgentJob, dropped: string): void {
-  commentaryPrefixes.set(job, retainRedactionTail(commentaryPrefixes.get(job) ?? '', dropped));
+function rememberCommentaryContext(job: AgentJob, dropped: string): void {
+  commentaryContexts.set(job, retainRedactionTail(commentaryContexts.get(job), dropped));
 }
 
 function limitTimeline(job: AgentJob, timeline: AgentTimelineEntry[]): void {
   for (const entry of timeline.slice(0, -MAX_JOB_TIMELINE)) {
-    if (entry.kind === 'commentary') rememberCommentaryPrefix(job, entry.text);
+    if (entry.kind === 'commentary') rememberCommentaryContext(job, entry.text);
   }
   job.timeline = timeline.slice(-MAX_JOB_TIMELINE);
 }
@@ -765,7 +765,7 @@ function trimTimelineBudget(job: AgentJob, bucket: 'text' | 'thought', maxChars:
       trimmed.push(entry);
       continue;
     }
-    if (entry.kind === 'commentary') rememberCommentaryPrefix(job, entry.text.slice(0, excess));
+    if (entry.kind === 'commentary') rememberCommentaryContext(job, entry.text.slice(0, excess));
     if (entry.text.length <= excess) {
       excess -= entry.text.length;
       continue;
