@@ -88,6 +88,8 @@ Then add the absolute repository directory through **Plugins → Add plugin** an
 
 ## Quick Start
 
+> **Fastest path:** Prefer to let your server agent and local `dsh` agent handle installation, private networking, and verification automatically? Use the **[Connect a Remote Agent with Two Prompts](docs/TWO_PROMPT_SETUP.md)** guide — pick a network, copy Prompt 1 to the target host, and forward its handoff block with Prompt 2 to your local `dsh` agent.
+
 1. Open **Remote Agents / 远端助手** in the left sidebar of `dsh web`.
 2. Click **`+ Add Agent` / `+ 添加助手`**.
 3. Choose the protocol (**ACP v1**, **Hermes**, **OpenClaw**, or **Remote DSH**). Use **Direct / Tailscale** with the gateway's full endpoint URL, or **Local** for a gateway or ACP stdio agent on the dsh host. Enter the gateway token where required.
@@ -240,6 +242,7 @@ npm run check
 ```
 
 - Repository rules & lessons: [AGENTS.md](AGENTS.md)
+- Two-prompt agent setup guide: [docs/TWO_PROMPT_SETUP.md](docs/TWO_PROMPT_SETUP.md)
 - Protocol architecture: [docs/DESIGN.md](docs/DESIGN.md)
 - Live E2E matrix: [docs/E2E.md](docs/E2E.md)
 
