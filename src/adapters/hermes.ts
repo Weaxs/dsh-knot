@@ -27,7 +27,7 @@ const MAX_TRANSCRIPT_MESSAGES = 200;
 const MAX_TRANSCRIPT_THOUGHT_LENGTH = 16_000;
 const MAX_TRANSCRIPT_TOOLS = 50;
 const MAX_TRACKED_RUNS = 500;
-const STOP_TIMEOUT_MS = 4_000;
+const STOP_TIMEOUT_MS = 10_000;
 const TERMINAL_RUN_STATUSES = new Set(['cancelled', 'canceled', 'completed', 'failed', 'interrupted']);
 const APPROVAL_SETTLED_RE = /responded|resolved|settled|completed|approved|denied|rejected|cancelled/;
 const REASONING_EVENT_RE = /^(?:reasoning|thinking|thought)(?:\.|$)/;
@@ -289,20 +289,24 @@ export class HermesAdapter implements AgentAdapter {
       const admission = this.admissions.get(sessionId);
       const runId = admission ? await raceAbort(admission, stopSignal) : this.runs.get(sessionId);
       if (!runId) throw new Error('The run ID is unavailable');
-      await this.stopRun(runId, stopSignal);
+      await this.stopOrConfirmRun(runId, stopSignal);
     });
   }
 
   async cancelRun(runId: string, signal?: AbortSignal): Promise<void> {
     await this.withStopDeadline(signal, async (stopSignal) => {
-      try {
-        await this.stopRun(runId, stopSignal);
-      } catch (error) {
-        stopSignal.throwIfAborted();
-        const state = await this.status(runId, stopSignal).catch(() => undefined);
-        if (!TERMINAL_RUN_STATUSES.has(String(state?.status))) throw error;
-      }
+      await this.stopOrConfirmRun(runId, stopSignal);
     });
+  }
+
+  private async stopOrConfirmRun(runId: string, signal: AbortSignal): Promise<void> {
+    try {
+      await this.stopRun(runId, signal);
+    } catch (error) {
+      signal.throwIfAborted();
+      const state = await this.status(runId, signal).catch(() => undefined);
+      if (!TERMINAL_RUN_STATUSES.has(String(state?.status))) throw error;
+    }
   }
 
   private async withStopDeadline(

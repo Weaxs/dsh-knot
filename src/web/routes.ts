@@ -43,12 +43,13 @@ function errorReply(message: string, status = 400): Response {
 }
 
 function jobPriority(job: AgentJob): number {
-  return Number(
-    job.status === 'queued' ||
-      job.status === 'running' ||
-      job.remoteStop === 'pending' ||
-      job.remoteStop === 'unconfirmed',
-  );
+  if (job.queued) return 1;
+  return job.status === 'queued' ||
+    job.status === 'running' ||
+    job.remoteStop === 'pending' ||
+    job.remoteStop === 'unconfirmed'
+    ? 2
+    : 0;
 }
 
 function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
@@ -74,6 +75,16 @@ function redactJob(manager: AgentManager, job: AgentJob): AgentJob {
   }
   if (timeline) result.timeline = redact(timeline);
   return result;
+}
+
+function listDashboardJobs(manager: AgentManager): AgentJob[] {
+  const jobs = manager.listJobs({ currentOnly: true }).sort((a, b) => jobPriority(b) - jobPriority(a));
+  const recent = jobs.slice(0, 50).map((job) => redactJob(manager, job));
+  const overflow = jobs.slice(50).filter(jobPriority);
+  for (const { thought: _thought, timeline: _timeline, tools: _tools, ...job } of overflow) {
+    recent.push(redact({ ...job, text: '' }));
+  }
+  return recent;
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -165,11 +176,7 @@ export function registerWebRoutes(
           value: {
             version: VERSION,
             agents: manager.list(),
-            jobs: manager
-              .listJobs({ currentOnly: true })
-              .sort((a, b) => jobPriority(b) - jobPriority(a))
-              .slice(0, 50)
-              .map((job) => redactJob(manager, job)),
+            jobs: listDashboardJobs(manager),
             mcp: {
               enabled: Boolean(mcp?.address),
               address: mcp?.address ?? null,
@@ -214,7 +221,10 @@ export function registerWebRoutes(
         ) {
           return errorReply('Invalid clientMessageId', 400);
         }
-        const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
+        if (body.queue !== undefined && typeof body.queue !== 'boolean') {
+          return errorReply('queue must be a boolean', 400);
+        }
+        const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId, body.queue === true);
         return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);
@@ -258,6 +268,16 @@ export function registerWebRoutes(
         if (!jobId) return errorReply('jobId is required', 400);
         if (body.releaseUnconfirmed !== undefined && typeof body.releaseUnconfirmed !== 'boolean') {
           return errorReply('releaseUnconfirmed must be a boolean', 400);
+        }
+        if (body.queuedOnly !== undefined && typeof body.queuedOnly !== 'boolean') {
+          return errorReply('queuedOnly must be a boolean', 400);
+        }
+        if (body.queuedOnly) {
+          if (body.releaseUnconfirmed) return errorReply('Cannot remove and release a job in the same request', 400);
+          const removed = manager.removeQueued(jobId, request.signal);
+          return removed
+            ? jsonReply({ ok: true, value: redactJob(manager, removed) })
+            : errorReply('The message is no longer queued', 409);
         }
         const job = body.releaseUnconfirmed
           ? manager.releaseUnconfirmedStop(jobId, request.signal)

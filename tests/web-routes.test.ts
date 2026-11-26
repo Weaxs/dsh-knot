@@ -162,6 +162,25 @@ describe('web UI host routes & schemastery Config', () => {
       jobList.mockRestore();
     }
 
+    const queuedJobs: AgentJob[] = Array.from({ length: 60 }, (_, index) => ({
+      id: `queued-${index}`,
+      agentId: config.id,
+      sessionId: `session-${Math.floor(index / 20)}`,
+      status: 'queued',
+      queued: true,
+      createdAt: 2,
+      updatedAt: 2,
+      prompt: `Queued message ${index}`,
+      text: '',
+    }));
+    const overflowingList = vi.spyOn(manager, 'listJobs').mockReturnValue([...queuedJobs, olderStop]);
+    try {
+      const state = await post(WEB_ROUTES.state);
+      expect(state.value.jobs).toEqual([olderStop, ...queuedJobs]);
+    } finally {
+      overflowingList.mockRestore();
+    }
+
     const toggled = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggled.ok).toBe(true);
     expect(toggled.value.allowSessions).toEqual(['local-1']);
@@ -215,6 +234,30 @@ describe('web UI host routes & schemastery Config', () => {
       sessionId: 'remote-1',
     });
     expect(duplicate).toMatchObject({ ok: false, error: expect.stringMatching(/active or cancelling job/) });
+    expect(
+      await post(WEB_ROUTES.ask, {
+        agentId: 'hermes-local',
+        revision,
+        message: 'bad queue flag',
+        sessionId: 'remote-1',
+        queue: 'yes',
+      }),
+    ).toMatchObject({ ok: false, error: 'queue must be a boolean' });
+    const queued = await post(WEB_ROUTES.ask, {
+      agentId: 'hermes-local',
+      revision,
+      message: 'queued turn',
+      sessionId: 'remote-1',
+      queue: true,
+    });
+    expect(queued).toMatchObject({ ok: true, value: { status: 'queued', queued: true, prompt: 'queued turn' } });
+    const staleRemoval = await post(WEB_ROUTES.cancel, { jobId: asked.value.id, queuedOnly: true });
+    expect(staleRemoval).toEqual({ ok: false, error: 'The message is no longer queued' });
+    expect(manager.get(queued.value.id).queued).toBe(true);
+    const removedQueued = await post(WEB_ROUTES.cancel, { jobId: queued.value.id, queuedOnly: true });
+    expect(removedQueued).toMatchObject({ ok: true, value: { status: 'cancelled' } });
+    expect(removedQueued.value.queued).toBeUndefined();
+    expect(adapter.cancelled).toBe(false);
     expect(() => manager.start('hermes-local', 'overlapping tool turn', 'remote-1')).toThrow(
       /active or cancelling job/,
     );
@@ -851,56 +894,59 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it('releases an unconfirmed ACP stop locally through the cancel route', async () => {
-    const cancel = vi.fn(async () => {
-      throw new Error('Connection lost before confirming the stop');
-    });
-    const adapter: AgentAdapter = {
-      id: 'acp-remote',
-      kind: 'acp',
-      health: async () => ({ ok: true }),
-      listSessions: async () => [],
-      async *prompt(_session, _text, signal) {
-        if (!signal?.aborted) {
-          await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
-        }
-      },
-      cancel,
-      close: async () => {},
-    };
-    const manager = new AgentManager([{ id: adapter.id, kind: 'acp', transport: 'local' }], 10_000, () => adapter);
-    let handler: ((request: Request) => Promise<Response>) | undefined;
-    registerWebRoutes(
-      {
-        connection: {
-          fetch: {
-            register(route: { path: string; fetch: (request: Request) => Promise<Response> }) {
-              if (route.path === WEB_ROUTES.cancel) handler = route.fetch;
-              return () => {};
+  it.each(['acp', 'hermes'] as const)(
+    'releases an unconfirmed %s stop locally through the cancel route',
+    async (kind) => {
+      const cancel = vi.fn(async () => {
+        throw new Error('Connection lost before confirming the stop');
+      });
+      const adapter: AgentAdapter = {
+        id: `${kind}-remote`,
+        kind,
+        health: async () => ({ ok: true }),
+        listSessions: async () => [],
+        async *prompt(_session, _text, signal) {
+          if (!signal?.aborted) {
+            await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+          }
+        },
+        cancel,
+        close: async () => {},
+      };
+      const manager = new AgentManager([{ id: adapter.id, kind, transport: 'local' }], 10_000, () => adapter);
+      let handler: ((request: Request) => Promise<Response>) | undefined;
+      registerWebRoutes(
+        {
+          connection: {
+            fetch: {
+              register(route: { path: string; fetch: (request: Request) => Promise<Response> }) {
+                if (route.path === WEB_ROUTES.cancel) handler = route.fetch;
+                return () => {};
+              },
             },
           },
-        },
-        effect() {},
-      } as any,
-      manager,
-      undefined,
-      undefined,
-    );
-    const job = manager.start(adapter.id, 'test', 'session', undefined, true);
-    const request = (body: object) =>
-      handler!(new Request(`http://localhost${WEB_ROUTES.cancel}`, { method: 'POST', body: JSON.stringify(body) }));
-    try {
-      expect((await request({ jobId: job.id })).ok).toBe(false);
-      await manager.wait(job.id);
-      expect(job.remoteStop).toBe('unconfirmed');
-      expect((await request({ jobId: job.id, releaseUnconfirmed: 'true' })).ok).toBe(false);
-      const released = await request({ jobId: job.id, releaseUnconfirmed: true });
-      expect(await released.json()).toMatchObject({ ok: true, value: { remoteStop: 'unconfirmed-released' } });
-      expect(cancel).toHaveBeenCalledTimes(1);
-    } finally {
-      await manager.close();
-    }
-  });
+          effect() {},
+        } as any,
+        manager,
+        undefined,
+        undefined,
+      );
+      const job = manager.start(adapter.id, 'test', 'session', undefined, true);
+      const request = (body: object) =>
+        handler!(new Request(`http://localhost${WEB_ROUTES.cancel}`, { method: 'POST', body: JSON.stringify(body) }));
+      try {
+        expect((await request({ jobId: job.id })).ok).toBe(false);
+        await manager.wait(job.id);
+        expect(job.remoteStop).toBe('unconfirmed');
+        expect((await request({ jobId: job.id, releaseUnconfirmed: 'true' })).ok).toBe(false);
+        const released = await request({ jobId: job.id, releaseUnconfirmed: true });
+        expect(await released.json()).toMatchObject({ ok: true, value: { remoteStop: 'unconfirmed-released' } });
+        expect(cancel).toHaveBeenCalledTimes(1);
+      } finally {
+        await manager.close();
+      }
+    },
+  );
 
   it('activates in real Cordis 4.1.0 and requires user confirmation for approvals and local release', async () => {
     const root = new Context();
@@ -1127,6 +1173,8 @@ describe('web UI host routes & schemastery Config', () => {
       sessionId: string;
       prompt: string;
       status: string;
+      queued?: boolean;
+      wasQueued?: true;
       sequence?: number;
       createdAt: number;
       updatedAt: number;
@@ -1160,6 +1208,7 @@ describe('web UI host routes & schemastery Config', () => {
     let fixtureAgentKind: AgentConfig['kind'] = 'hermes';
     let localReleaseRequests = 0;
     let confirmedStopJobReads = 0;
+    let queueHistory: Promise<AgentTranscriptMessage[]> | undefined;
     const settledJobs: Array<typeof currentJob> = [];
     const transcriptBySession = new Map<string, AgentTranscriptMessage[]>([
       [
@@ -1231,18 +1280,23 @@ describe('web UI host routes & schemastery Config', () => {
                 { id: 'sess-5', title: 'Live session 5' },
                 { id: 'sess-release', title: 'Unconfirmed ACP session' },
                 { id: 'sess-stop', title: 'Externally stopped ACP session' },
+                { id: 'sess-hermes-release', title: 'Unconfirmed Hermes session' },
+                { id: 'sess-queue', title: 'Queued chat session' },
               ],
             });
           }
           if (path === WEB_ROUTES.sessionMessages) {
             const sessionId = requestField(init, 'sessionId');
-            const messages = transcriptBySession.get(sessionId);
+            const messages =
+              sessionId === 'sess-queue' && queueHistory ? await queueHistory : transcriptBySession.get(sessionId);
             if (!messages) throw new Error(`Unexpected history session ${sessionId}`);
             return ok({ messages });
           }
           if (path === WEB_ROUTES.ask) {
-            expect(requestField(init, 'sessionId')).toBe(localJob?.sessionId);
-            expect(requestField(init, 'message')).toBe(localJob?.prompt);
+            const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+            expect(body.sessionId).toBe(localJob?.sessionId);
+            expect(body.message).toBe(localJob?.prompt);
+            expect(body.queue).toBe(body.sessionId ? true : undefined);
             localJobSubmitted = true;
             return ok(localJob);
           }
@@ -1254,8 +1308,17 @@ describe('web UI host routes & schemastery Config', () => {
             throw new Error(`Unexpected job ${jobId}`);
           }
           if (path === WEB_ROUTES.cancel) {
+            const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+            if (body.jobId === localJob?.id && localJob) {
+              expect(body).toEqual({ jobId: localJob.id, queuedOnly: true });
+              if (!localJob.queued) {
+                return Response.json({ ok: false, error: 'The message is no longer queued' }, { status: 409 });
+              }
+              localJob = { ...localJob, status: 'cancelled', queued: undefined, updatedAt: localJob.updatedAt + 1 };
+              return ok(localJob);
+            }
             localReleaseRequests++;
-            expect(JSON.parse(String(init?.body))).toEqual({ jobId: currentJob.id, releaseUnconfirmed: true });
+            expect(body).toEqual({ jobId: currentJob.id, releaseUnconfirmed: true });
             currentJob = { ...currentJob, remoteStop: 'unconfirmed-released', updatedAt: currentJob.updatedAt + 1 };
             return ok(currentJob);
           }
@@ -1807,6 +1870,163 @@ describe('web UI host routes & schemastery Config', () => {
       expect(sendButton(confirmed)?.props.disabled).toBe(false);
       expect(confirmedStopJobReads).toBe(0);
       expect(localReleaseRequests).toBe(1);
+
+      // Native Hermes also offers local release when remote stop is unconfirmed
+      fixtureAgentKind = 'hermes';
+      transcriptBySession.set('sess-hermes-release', []);
+      currentJob = {
+        id: 'hermes-release-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-hermes-release',
+        prompt: 'Stuck Hermes prompt',
+        status: 'cancelled',
+        remoteStop: 'unconfirmed',
+        createdAt: 20_000,
+        updatedAt: 20_000,
+        text: '',
+      };
+      (findButton(await flush(), 'Unconfirmed Hermes session')!.props.onClick as () => void)();
+      const hermesUnconfirmed = await flush();
+      expect(findButton(hermesUnconfirmed, '释放本地会话')).toBeDefined();
+      (findButton(hermesUnconfirmed, '释放本地会话')!.props.onClick as () => void)();
+      const hermesReleased = await flush();
+      expect(localReleaseRequests).toBe(2);
+      expect(collectText(hermesReleased)).toContain('本地会话已释放，远端停止尚未确认');
+
+      // Queue follow-up messages while a turn is running and remove queued items
+      transcriptBySession.set('sess-queue', []);
+      currentJob = {
+        id: 'queue-running-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-queue',
+        prompt: 'Running turn',
+        status: 'running',
+        createdAt: 21_000,
+        updatedAt: 21_000,
+        text: 'working...',
+      };
+      localJob = {
+        id: 'queued-followup-job',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-queue',
+        prompt: 'Follow-up queued message',
+        status: 'queued',
+        queued: true,
+        createdAt: 21_100,
+        updatedAt: 21_100,
+        text: '',
+      };
+      localJobSubmitted = false;
+      (findButton(await flush(), 'Queued chat session')!.props.onClick as () => void)();
+      const queueSession = await flush();
+      const queueInput = findNode(queueSession, (vnode) => vnode.type === 'textarea')!;
+      (queueInput.props.onInput as (event: { target: { value: string } }) => void)({
+        target: { value: 'Follow-up queued message' },
+      });
+      const queueWithInput = await flush();
+      expect(sendButton(queueWithInput)?.props.disabled).toBe(false);
+      expect(sendButton(queueWithInput)?.props['aria-label']).toBe('加入队列');
+      const queueForm = findNode(queueWithInput, (vnode) => vnode.type === 'form')!;
+      (queueForm.props.onSubmit as (event: { preventDefault(): void }) => void)({ preventDefault() {} });
+      const withQueuedBar = await flush();
+      expect(collectText(withQueuedBar)).toContain('待发送队列 (1)');
+      expect(collectText(withQueuedBar)).toContain('Follow-up queued message');
+      expect(findButton(withQueuedBar, '移除')).toBeDefined();
+      (findButton(withQueuedBar, '移除')!.props.onClick as () => void)();
+      const afterRemove = await flush();
+      expect(collectText(afterRemove)).not.toContain('待发送队列 (1)');
+
+      // Re-queue a follow-up and verify it transitions from queue to active reply once the running turn finishes
+      localJob = {
+        id: 'queued-followup-job-2',
+        agentId: 'hermes-remote',
+        sessionId: 'sess-queue',
+        prompt: 'Second queued message',
+        status: 'queued',
+        queued: true,
+        createdAt: 21_200,
+        updatedAt: 21_200,
+        text: '',
+      };
+      localJobSubmitted = false;
+      const queueInput2 = findNode(afterRemove, (vnode) => vnode.type === 'textarea')!;
+      (queueInput2.props.onInput as (event: { target: { value: string } }) => void)({
+        target: { value: 'Second queued message' },
+      });
+      const queueWithInput2 = await flush();
+      (
+        findNode(queueWithInput2, (vnode) => vnode.type === 'form')!.props.onSubmit as (event: {
+          preventDefault(): void;
+        }) => void
+      )({ preventDefault() {} });
+      const externalQueued = {
+        ...localJob,
+        id: 'external-queued-followup',
+        prompt: 'Queued in another tab',
+        createdAt: 21_201,
+        updatedAt: 21_201,
+      };
+      settledJobs.push(externalQueued);
+      const withQueuedBar2 = await flush();
+      expect(collectText(withQueuedBar2)).toContain('待发送队列 (2)');
+      currentJob = { ...currentJob, status: 'completed', text: 'first done', updatedAt: 21_300 };
+      localJob = { ...localJob, status: 'running', queued: undefined, text: 'second streaming', updatedAt: 21_400 };
+      settledJobs[settledJobs.indexOf(externalQueued)] = {
+        ...externalQueued,
+        queued: undefined,
+        status: 'failed',
+        wasQueued: true,
+        error: 'The gateway failed before writing history',
+        updatedAt: 21_401,
+      };
+      let finishQueueHistory!: (messages: AgentTranscriptMessage[]) => void;
+      queueHistory = new Promise<AgentTranscriptMessage[]>((resolve) => {
+        finishQueueHistory = resolve;
+      });
+      settledJobs.unshift({
+        ...externalQueued,
+        id: 'fast-completed-followup',
+        prompt: 'Fast queued message',
+        status: 'completed',
+        queued: undefined,
+        wasQueued: true,
+        historyBaseline: { length: 2, lastId: 'unanchored-assistant' },
+        createdAt: 21_402,
+        updatedAt: 21_403,
+        text: 'Fast queued reply',
+      });
+      settledJobs.push({
+        ...externalQueued,
+        id: 'completed-without-baseline',
+        prompt: 'Queued without baseline',
+        status: 'completed',
+        queued: undefined,
+        wasQueued: true,
+        createdAt: 21_401,
+        updatedAt: 21_402,
+        text: 'Unanchored queued reply',
+      });
+      (findButton(withQueuedBar2, '移除')!.props.onClick as () => void)();
+      const staleRemoval = await flush();
+      expect(collectText(staleRemoval)).toContain('The message is no longer queued');
+      expect(collectText(staleRemoval).join(' ')).toContain('The gateway failed before writing history');
+      expect(collectText(staleRemoval)).toContain('Fast queued reply');
+      finishQueueHistory([
+        { id: 'unanchored-user', role: 'user', text: 'Queued without baseline' },
+        { id: 'unanchored-assistant', role: 'assistant', text: 'Unanchored queued reply' },
+        { id: 'fast-user', role: 'user', text: 'Fast queued message' },
+        { id: 'fast-assistant', role: 'assistant', text: 'Fast queued reply', thought: 'Persisted queued thought' },
+        { id: 'later-user', role: 'user', text: 'Later external turn' },
+        { id: 'later-assistant', role: 'assistant', text: 'Later external reply' },
+      ]);
+      await new Promise((r) => setTimeout(r, 450));
+      const promoted = await flush();
+      expect(collectText(promoted)).not.toContain('待发送队列 (1)');
+      expect(collectText(promoted)).toContain('second streaming');
+      expect(collectText(promoted)).toContain('Persisted queued thought');
+      expect(collectText(promoted)).toContain('Later external reply');
+      expect(collectText(promoted).filter((text) => text === 'Fast queued reply')).toHaveLength(1);
+      expect(collectText(promoted).filter((text) => text === 'Unanchored queued reply')).toHaveLength(1);
     } finally {
       try {
         try {

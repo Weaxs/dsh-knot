@@ -396,6 +396,53 @@ describe('Hermes API Server adapter', () => {
     await expect(adapter.cancel('session-1', controller.signal)).rejects.toThrow('Hermes remote stop is unconfirmed');
   });
 
+  it('confirms cancellation via run status when /stop fails on an already-terminal run', async () => {
+    let statusReads = 0;
+    class TerminalFallbackTransport extends FakeTransport {
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1/stop') {
+          throw new Error('HTTP 409: run already completed');
+        }
+        if (request.path === '/v1/runs/run_1') {
+          statusReads++;
+          return { status: 200, headers: {}, text: '{"status":"completed"}' };
+        }
+        return super.request(request);
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new TerminalFallbackTransport(),
+    );
+    for await (const _ of adapter.prompt('session-1', 'task')) void _;
+    await expect(adapter.cancel('session-1')).resolves.toBeUndefined();
+    expect(statusReads).toBe(1);
+  });
+
+  it('keeps cancellation unconfirmed when /stop fails and run status is still running', async () => {
+    class StillRunningFallbackTransport extends FakeTransport {
+      override async request(request: HttpRequest): Promise<HttpResponse> {
+        if (request.path === '/v1/runs/run_1/stop') {
+          throw new Error('HTTP 502: bad gateway');
+        }
+        if (request.path === '/v1/runs/run_1') {
+          return { status: 200, headers: {}, text: '{"status":"running"}' };
+        }
+        return super.request(request);
+      }
+    }
+    const adapter = new HermesAdapter(
+      'hermes',
+      { id: 'hermes', kind: 'hermes', transport: 'local' },
+      new StillRunningFallbackTransport(),
+    );
+    for await (const _ of adapter.prompt('session-1', 'task')) void _;
+    await expect(adapter.cancel('session-1')).rejects.toThrow(
+      'Hermes remote stop is unconfirmed: HTTP 502: bad gateway',
+    );
+  });
+
   it('clears approval.responded/settled events and maps run.cancelled to cancelled final', async () => {
     class CancelAndRespondedTransport extends FakeTransport {
       override async stream(): Promise<IncomingMessage> {

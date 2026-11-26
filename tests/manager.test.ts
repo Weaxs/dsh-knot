@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runDoctor } from '../src/doctor.js';
 import { AgentManager } from '../src/manager.js';
-import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
+import type { AgentAdapter, AgentConfig, AgentEvent, AgentJob } from '../src/types.js';
 
 class FakeAdapter implements AgentAdapter {
   cancelled = false;
@@ -210,7 +210,7 @@ describe('AgentManager', () => {
       const job = manager.start(config.id, 'Hello', 'shared');
       await vi.waitFor(() => expect(disconnect).toBeTypeOf('function'));
       const stopping = manager.cancel(job.id);
-      expect(() => manager.releaseUnconfirmedStop(job.id)).toThrow(/unconfirmed ACP stop/);
+      expect(() => manager.releaseUnconfirmedStop(job.id)).toThrow(/Only an unconfirmed stop/);
       await expect(stopping).rejects.toThrow(/terminal response/);
       expect(await manager.wait(job.id)).toMatchObject({
         status: 'cancelled',
@@ -1114,5 +1114,214 @@ describe('AgentManager', () => {
     expect(hugeDone.thought?.length).toBe(16_000);
     expect(totalThoughtChars).toBe(16_000);
     await hugeManager.close();
+  });
+
+  it('allows releasing an unconfirmed stop locally for native Hermes exclusive sessions', async () => {
+    class NativeStopFailureAdapter extends RunningAdapter {
+      override async *prompt(
+        _sessionId: string | undefined,
+        text?: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        if (text === 'next prompt') {
+          yield { type: 'final', text: 'recovered reply' };
+          return;
+        }
+        yield* super.prompt(_sessionId, text, signal);
+      }
+    }
+    const adapter = new NativeStopFailureAdapter(config.id, 'hermes');
+    vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('Hermes remote stop is unconfirmed: timeout'));
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const job = manager.start(config.id, 'stuck turn', 'shared', undefined, true);
+      await vi.waitFor(() => expect(job.text).toBe('partial reply'));
+      await expect(manager.cancel(job.id)).rejects.toThrow(/unconfirmed/);
+      await manager.wait(job.id);
+      expect(job.remoteStop).toBe('unconfirmed');
+      expect(() => manager.start(config.id, 'next prompt', 'shared', undefined, true)).toThrow(
+        /active or cancelling job/,
+      );
+      expect(manager.releaseUnconfirmedStop(job.id).remoteStop).toBe('unconfirmed-released');
+      const next = manager.start(config.id, 'next prompt', 'shared', undefined, true);
+      expect((await manager.wait(next.id)).text).toBe('recovered reply');
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('queues follow-up messages per session in FIFO order and allows removing queued items', async () => {
+    const prompts: string[] = [];
+    const resolvers = new Map<string, () => void>();
+    class GateAdapter extends FakeAdapter {
+      override async *prompt(_sessionId: string | undefined, text?: string): AsyncIterable<AgentEvent> {
+        const msg = text ?? '';
+        prompts.push(msg);
+        await new Promise<void>((resolve) => {
+          resolvers.set(msg, resolve);
+        });
+        yield { type: 'final', text: `reply:${msg}` };
+      }
+    }
+    const adapter = new GateAdapter(config.id);
+    const cancelSpy = vi.spyOn(adapter, 'cancel');
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const first = manager.start(config.id, 'first', 'sess-q', undefined, true, undefined, true);
+      await vi.waitFor(() => expect(prompts).toEqual(['first']));
+      expect(first.queued).toBeUndefined();
+
+      const second = manager.start(config.id, 'second', 'sess-q', undefined, true, undefined, true);
+      const third = manager.start(config.id, 'third', 'sess-q', undefined, true, undefined, true);
+      const fourth = manager.start(config.id, 'fourth', 'sess-q', undefined, true, undefined, true);
+      expect(second).toMatchObject({ status: 'queued', queued: true, prompt: 'second' });
+      expect(third).toMatchObject({ status: 'queued', queued: true, prompt: 'third' });
+      expect(prompts).toEqual(['first']);
+
+      // Removing a queued message does not call adapter.cancel or interrupt the running turn
+      const removed = manager.removeQueued(second.id);
+      expect(removed).toMatchObject({ status: 'cancelled' });
+      expect(second.queued).toBeUndefined();
+      expect(cancelSpy).not.toHaveBeenCalled();
+
+      // Completing the first turn automatically starts the third turn
+      resolvers.get('first')!();
+      expect((await manager.wait(first.id)).text).toBe('reply:first');
+      await vi.waitFor(() => expect(prompts).toEqual(['first', 'third']));
+      expect(third.queued).toBeUndefined();
+      expect(manager.removeQueued(third.id)).toBeUndefined();
+      expect(cancelSpy).not.toHaveBeenCalled();
+      expect(fourth.queued).toBe(true);
+      resolvers.get('third')!();
+      expect((await manager.wait(third.id)).text).toBe('reply:third');
+      await vi.waitFor(() => expect(prompts).toEqual(['first', 'third', 'fourth']));
+      resolvers.get('fourth')!();
+      expect((await manager.wait(fourth.id)).text).toBe('reply:fourth');
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it('cancels remaining queued messages when the active turn fails or is stopped and blocks queueing while stopping', async () => {
+    let releaseFirst!: (mode: 'fail' | 'complete') => void;
+    class FailureAdapter extends FakeAdapter {
+      override async *prompt(
+        _sessionId: string | undefined,
+        text?: string,
+        signal?: AbortSignal,
+      ): AsyncIterable<AgentEvent> {
+        if (text === 'will-fail') {
+          const outcome = await new Promise<'fail' | 'complete'>((resolve) => {
+            releaseFirst = resolve;
+          });
+          if (outcome === 'fail') {
+            yield { type: 'error', text: 'upstream boom' };
+            return;
+          }
+          yield { type: 'final', text: 'ok' };
+          return;
+        }
+        await new Promise<void>((_, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+      }
+    }
+    const adapter = new FailureAdapter(config.id);
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    try {
+      const failing = manager.start(config.id, 'will-fail', 'sess-fail', undefined, true, undefined, true);
+      await vi.waitFor(() => expect(releaseFirst).toBeTypeOf('function'));
+      const queuedAfterFail = manager.start(config.id, 'follow-up', 'sess-fail', undefined, true, undefined, true);
+      releaseFirst('fail');
+      expect((await manager.wait(failing.id)).status).toBe('failed');
+      const cancelledFollowUp = await manager.wait(queuedAfterFail.id);
+      expect(cancelledFollowUp.status).toBe('cancelled');
+      expect(cancelledFollowUp.queued).toBeUndefined();
+      expect(cancelledFollowUp.error).toMatch(/previous message failed/);
+
+      // Stopping an active turn cancels queued items and prevents queueing while unconfirmed
+      vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('stop failed'));
+      const active = manager.start(config.id, 'will-stop', 'sess-stop', undefined, true, undefined, true);
+      await vi.waitFor(() => expect(active.status).toBe('running'));
+      const queuedAfterStop = manager.start(config.id, 'queued-stop', 'sess-stop', undefined, true, undefined, true);
+      await expect(manager.cancel(active.id)).rejects.toThrow('stop failed');
+      await manager.wait(active.id);
+      const stoppedFollowUp = await manager.wait(queuedAfterStop.id);
+      expect(stoppedFollowUp.status).toBe('cancelled');
+      expect(stoppedFollowUp.error).toMatch(/previous message was stopped/);
+      expect(() =>
+        manager.start(config.id, 'blocked-by-unconfirmed', 'sess-stop', undefined, true, undefined, true),
+      ).toThrow(/active or cancelling job/);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it.each(['failure', 'replacement'])('settles the correct queue after a %s', async (scenario) => {
+    let finishFirst!: (event: AgentEvent) => void;
+    let finishSecond!: (event: AgentEvent) => void;
+    const firstResult = new Promise<AgentEvent>((resolve) => {
+      finishFirst = resolve;
+    });
+    const secondResult = new Promise<AgentEvent>((resolve) => {
+      finishSecond = resolve;
+    });
+    class GateAdapter extends FakeAdapter {
+      override async *prompt(_sessionId: string | undefined, text?: string): AsyncIterable<AgentEvent> {
+        if (text === 'first') yield await firstResult;
+        else if (text === 'second') yield await secondResult;
+        else yield { type: 'final', text: 'follow-up reply' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new GateAdapter(config.id));
+    try {
+      const first = manager.start(config.id, 'first', 'same-session');
+      if (scenario === 'replacement') {
+        const oldQueued = manager.start(config.id, 'old follow-up', 'same-session', undefined, true, undefined, true);
+        await manager.upsert({ ...config, port: 9000 });
+        expect((await manager.wait(oldQueued.id)).status).toBe('cancelled');
+      }
+      const second = manager.start(config.id, 'second', 'same-session');
+      const queued = manager.start(config.id, 'follow-up', 'same-session', undefined, true, undefined, true);
+      finishFirst({ type: 'error', text: 'first failed' });
+      await manager.wait(first.id);
+      expect(queued.status).toBe(scenario === 'failure' ? 'cancelled' : 'queued');
+      finishSecond({ type: 'final', text: 'second succeeded' });
+      await manager.wait(second.id);
+      const settled = await manager.wait(queued.id);
+      if (scenario === 'failure') {
+        expect(settled).toMatchObject({ status: 'cancelled', error: 'Cancelled because the previous message failed' });
+      } else {
+        expect(settled).toMatchObject({ status: 'completed', text: 'follow-up reply' });
+      }
+    } finally {
+      finishFirst({ type: 'final' });
+      finishSecond({ type: 'final' });
+      await manager.close();
+    }
+  });
+
+  it('enforces the per-session queue limit and cancels queued turns on close', async () => {
+    const adapter = new RunningAdapter(config.id);
+    const manager = new AgentManager([config], 10_000, () => adapter);
+    const active = manager.start(config.id, 'first', 'sess-cap', undefined, true, undefined, true);
+    await vi.waitFor(() => expect(active.text).toBe('partial reply'));
+    expect(() => manager.start(config.id, '字'.repeat(22_000), 'sess-cap', undefined, true, undefined, true)).toThrow(
+      /at most 65536 bytes/,
+    );
+    const queued: AgentJob[] = [
+      manager.start(config.id, 'x'.repeat(65_536), 'sess-cap', undefined, true, undefined, true),
+    ];
+    for (let i = 1; i < 20; i++) {
+      queued.push(manager.start(config.id, `queued-${i}`, 'sess-cap', undefined, true, undefined, true));
+    }
+    expect(() => manager.start(config.id, 'overflow', 'sess-cap', undefined, true, undefined, true)).toThrow(
+      /Too many queued messages/,
+    );
+    await manager.close();
+    for (const item of queued) {
+      expect(item.status).toBe('cancelled');
+      expect(item.queued).toBeUndefined();
+    }
   });
 });
