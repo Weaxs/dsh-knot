@@ -1173,14 +1173,15 @@ describe('AgentManager', () => {
 
       const second = manager.start(config.id, 'second', 'sess-q', undefined, true, undefined, true);
       const third = manager.start(config.id, 'third', 'sess-q', undefined, true, undefined, true);
+      const fourth = manager.start(config.id, 'fourth', 'sess-q', undefined, true, undefined, true);
       expect(second).toMatchObject({ status: 'queued', queued: true, prompt: 'second' });
       expect(third).toMatchObject({ status: 'queued', queued: true, prompt: 'third' });
       expect(prompts).toEqual(['first']);
 
       // Removing a queued message does not call adapter.cancel or interrupt the running turn
-      const removed = await manager.cancel(second.id);
+      const removed = manager.removeQueued(second.id);
       expect(removed).toMatchObject({ status: 'cancelled' });
-      expect(removed.queued).toBeUndefined();
+      expect(second.queued).toBeUndefined();
       expect(cancelSpy).not.toHaveBeenCalled();
 
       // Completing the first turn automatically starts the third turn
@@ -1188,8 +1189,14 @@ describe('AgentManager', () => {
       expect((await manager.wait(first.id)).text).toBe('reply:first');
       await vi.waitFor(() => expect(prompts).toEqual(['first', 'third']));
       expect(third.queued).toBeUndefined();
+      expect(manager.removeQueued(third.id)).toBeUndefined();
+      expect(cancelSpy).not.toHaveBeenCalled();
+      expect(fourth.queued).toBe(true);
       resolvers.get('third')!();
       expect((await manager.wait(third.id)).text).toBe('reply:third');
+      await vi.waitFor(() => expect(prompts).toEqual(['first', 'third', 'fourth']));
+      resolvers.get('fourth')!();
+      expect((await manager.wait(fourth.id)).text).toBe('reply:fourth');
     } finally {
       await manager.close();
     }
@@ -1250,13 +1257,62 @@ describe('AgentManager', () => {
     }
   });
 
+  it.each(['failure', 'replacement'])('settles the correct queue after a %s', async (scenario) => {
+    let finishFirst!: (event: AgentEvent) => void;
+    let finishSecond!: (event: AgentEvent) => void;
+    const firstResult = new Promise<AgentEvent>((resolve) => {
+      finishFirst = resolve;
+    });
+    const secondResult = new Promise<AgentEvent>((resolve) => {
+      finishSecond = resolve;
+    });
+    class GateAdapter extends FakeAdapter {
+      override async *prompt(_sessionId: string | undefined, text?: string): AsyncIterable<AgentEvent> {
+        if (text === 'first') yield await firstResult;
+        else if (text === 'second') yield await secondResult;
+        else yield { type: 'final', text: 'follow-up reply' };
+      }
+    }
+    const manager = new AgentManager([config], 10_000, () => new GateAdapter(config.id));
+    try {
+      const first = manager.start(config.id, 'first', 'same-session');
+      if (scenario === 'replacement') {
+        const oldQueued = manager.start(config.id, 'old follow-up', 'same-session', undefined, true, undefined, true);
+        await manager.upsert({ ...config, port: 9000 });
+        expect((await manager.wait(oldQueued.id)).status).toBe('cancelled');
+      }
+      const second = manager.start(config.id, 'second', 'same-session');
+      const queued = manager.start(config.id, 'follow-up', 'same-session', undefined, true, undefined, true);
+      finishFirst({ type: 'error', text: 'first failed' });
+      await manager.wait(first.id);
+      expect(queued.status).toBe(scenario === 'failure' ? 'cancelled' : 'queued');
+      finishSecond({ type: 'final', text: 'second succeeded' });
+      await manager.wait(second.id);
+      const settled = await manager.wait(queued.id);
+      if (scenario === 'failure') {
+        expect(settled).toMatchObject({ status: 'cancelled', error: 'Cancelled because the previous message failed' });
+      } else {
+        expect(settled).toMatchObject({ status: 'completed', text: 'follow-up reply' });
+      }
+    } finally {
+      finishFirst({ type: 'final' });
+      finishSecond({ type: 'final' });
+      await manager.close();
+    }
+  });
+
   it('enforces the per-session queue limit and cancels queued turns on close', async () => {
     const adapter = new RunningAdapter(config.id);
     const manager = new AgentManager([config], 10_000, () => adapter);
     const active = manager.start(config.id, 'first', 'sess-cap', undefined, true, undefined, true);
     await vi.waitFor(() => expect(active.text).toBe('partial reply'));
-    const queued: AgentJob[] = [];
-    for (let i = 0; i < 20; i++) {
+    expect(() => manager.start(config.id, '字'.repeat(22_000), 'sess-cap', undefined, true, undefined, true)).toThrow(
+      /at most 65536 bytes/,
+    );
+    const queued: AgentJob[] = [
+      manager.start(config.id, 'x'.repeat(65_536), 'sess-cap', undefined, true, undefined, true),
+    ];
+    for (let i = 1; i < 20; i++) {
       queued.push(manager.start(config.id, `queued-${i}`, 'sess-cap', undefined, true, undefined, true));
     }
     expect(() => manager.start(config.id, 'overflow', 'sess-cap', undefined, true, undefined, true)).toThrow(

@@ -20,6 +20,7 @@ export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 const MAX_JOBS = 200;
 const MAX_QUEUED_PER_SESSION = 20;
+const MAX_QUEUED_PROMPT_BYTES = 64 * 1024;
 const CANCEL_TIMEOUT_MS = 12_000;
 const MAX_JOB_TOOLS = 50;
 const MAX_JOB_APPROVALS = 50;
@@ -280,6 +281,9 @@ export class AgentManager {
         if (queuedList.length >= MAX_QUEUED_PER_SESSION) {
           throw new Error(`Too many queued messages for session "${remoteSession}" (limit ${MAX_QUEUED_PER_SESSION})`);
         }
+        if (Buffer.byteLength(text) > MAX_QUEUED_PROMPT_BYTES) {
+          throw new Error(`Queued messages must be at most ${MAX_QUEUED_PROMPT_BYTES} bytes`);
+        }
         this.evictFinishedJobs();
         if (this.jobs.size >= MAX_JOBS) {
           throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
@@ -410,6 +414,12 @@ export class AgentManager {
     } finally {
       if (onAbort) signal.removeEventListener('abort', onAbort);
     }
+  }
+
+  removeQueued(id: string, signal?: AbortSignal): AgentJob | undefined {
+    signal?.throwIfAborted();
+    const job = this.get(id);
+    return this.cancelQueuedJob(job) ? job : undefined;
   }
 
   async cancel(id: string, signal?: AbortSignal): Promise<AgentJob> {
@@ -839,8 +849,8 @@ export class AgentManager {
           /* notification failures do not change the remote job */
         }
       }
-      this.settleSessionQueue(job);
     }
+    this.settleSessionQueue(job);
     return job;
   }
 
@@ -893,8 +903,13 @@ export class AgentManager {
     if (!queue?.length) return;
     const owner = this.jobOwners.get(finishedJob.id);
     const adapter = this.adapters.get(finishedJob.agentId);
-    if (!owner || owner.adapter !== adapter || this.reconfiguring.has(finishedJob.agentId)) {
-      this.cancelSessionQueue(finishedJob.agentId, sessionId, 'Cancelled because the previous message was stopped');
+    if (!owner || owner.adapter !== adapter || this.reconfiguring.has(finishedJob.agentId)) return;
+    if (finishedJob.status !== 'completed' || finishedJob.remoteStop !== undefined || owner.cancelling) {
+      const reason =
+        finishedJob.status === 'failed'
+          ? 'Cancelled because the previous message failed'
+          : 'Cancelled because the previous message was stopped';
+      this.cancelSessionQueue(finishedJob.agentId, sessionId, reason);
       return;
     }
     const otherExecuting = [...this.jobs.values()].some((candidate) => {
@@ -911,17 +926,8 @@ export class AgentManager {
       );
     });
     if (otherExecuting) return;
-    if (
-      finishedJob.status !== 'completed' ||
-      finishedJob.remoteStop !== undefined ||
-      owner.cancelling !== undefined ||
-      adapter.isSessionBusy?.(sessionId)
-    ) {
-      const reason =
-        finishedJob.status === 'failed'
-          ? 'Cancelled because the previous message failed'
-          : 'Cancelled because the previous message was stopped';
-      this.cancelSessionQueue(finishedJob.agentId, sessionId, reason);
+    if (adapter.isSessionBusy?.(sessionId)) {
+      this.cancelSessionQueue(finishedJob.agentId, sessionId, 'Cancelled because the session is still busy');
       return;
     }
     const next = queue.shift();

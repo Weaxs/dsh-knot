@@ -162,6 +162,25 @@ describe('web UI host routes & schemastery Config', () => {
       jobList.mockRestore();
     }
 
+    const queuedJobs: AgentJob[] = Array.from({ length: 60 }, (_, index) => ({
+      id: `queued-${index}`,
+      agentId: config.id,
+      sessionId: `session-${Math.floor(index / 20)}`,
+      status: 'queued',
+      queued: true,
+      createdAt: 2,
+      updatedAt: 2,
+      prompt: `Queued message ${index}`,
+      text: '',
+    }));
+    const overflowingList = vi.spyOn(manager, 'listJobs').mockReturnValue([...queuedJobs, olderStop]);
+    try {
+      const state = await post(WEB_ROUTES.state);
+      expect(state.value.jobs).toEqual([olderStop, ...queuedJobs]);
+    } finally {
+      overflowingList.mockRestore();
+    }
+
     const toggled = await post(WEB_ROUTES.mcpShare, { sessionId: 'local-1', allow: true });
     expect(toggled.ok).toBe(true);
     expect(toggled.value.allowSessions).toEqual(['local-1']);
@@ -232,7 +251,10 @@ describe('web UI host routes & schemastery Config', () => {
       queue: true,
     });
     expect(queued).toMatchObject({ ok: true, value: { status: 'queued', queued: true, prompt: 'queued turn' } });
-    const removedQueued = await post(WEB_ROUTES.cancel, { jobId: queued.value.id });
+    const staleRemoval = await post(WEB_ROUTES.cancel, { jobId: asked.value.id, queuedOnly: true });
+    expect(staleRemoval).toEqual({ ok: false, error: 'The message is no longer queued' });
+    expect(manager.get(queued.value.id).queued).toBe(true);
+    const removedQueued = await post(WEB_ROUTES.cancel, { jobId: queued.value.id, queuedOnly: true });
     expect(removedQueued).toMatchObject({ ok: true, value: { status: 'cancelled' } });
     expect(removedQueued.value.queued).toBeUndefined();
     expect(adapter.cancelled).toBe(false);
@@ -1269,14 +1291,9 @@ describe('web UI host routes & schemastery Config', () => {
           }
           if (path === WEB_ROUTES.ask) {
             const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-            if (body.queue === true) {
-              expect(body.sessionId).toBe(localJob?.sessionId);
-              expect(body.message).toBe(localJob?.prompt);
-              localJobSubmitted = true;
-              return ok(localJob);
-            }
-            expect(requestField(init, 'sessionId')).toBe(localJob?.sessionId);
-            expect(requestField(init, 'message')).toBe(localJob?.prompt);
+            expect(body.sessionId).toBe(localJob?.sessionId);
+            expect(body.message).toBe(localJob?.prompt);
+            expect(body.queue).toBe(body.sessionId ? true : undefined);
             localJobSubmitted = true;
             return ok(localJob);
           }
@@ -1289,7 +1306,11 @@ describe('web UI host routes & schemastery Config', () => {
           }
           if (path === WEB_ROUTES.cancel) {
             const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
-            if (body.jobId === localJob?.id && localJob?.queued) {
+            if (body.jobId === localJob?.id && localJob) {
+              expect(body).toEqual({ jobId: localJob.id, queuedOnly: true });
+              if (!localJob.queued) {
+                return Response.json({ ok: false, error: 'The message is no longer queued' }, { status: 409 });
+              }
               localJob = { ...localJob, status: 'cancelled', queued: undefined, updatedAt: localJob.updatedAt + 1 };
               return ok(localJob);
             }
@@ -1935,10 +1956,29 @@ describe('web UI host routes & schemastery Config', () => {
           preventDefault(): void;
         }) => void
       )({ preventDefault() {} });
+      const externalQueued = {
+        ...localJob,
+        id: 'external-queued-followup',
+        prompt: 'Queued in another tab',
+        createdAt: 21_201,
+        updatedAt: 21_201,
+      };
+      settledJobs.push(externalQueued);
       const withQueuedBar2 = await flush();
-      expect(collectText(withQueuedBar2)).toContain('待发送队列 (1)');
+      expect(collectText(withQueuedBar2)).toContain('待发送队列 (2)');
       currentJob = { ...currentJob, status: 'completed', text: 'first done', updatedAt: 21_300 };
       localJob = { ...localJob, status: 'running', queued: undefined, text: 'second streaming', updatedAt: 21_400 };
+      settledJobs[settledJobs.indexOf(externalQueued)] = {
+        ...externalQueued,
+        queued: undefined,
+        status: 'failed',
+        error: 'The gateway failed before writing history',
+        updatedAt: 21_401,
+      };
+      (findButton(withQueuedBar2, '移除')!.props.onClick as () => void)();
+      const staleRemoval = await flush();
+      expect(collectText(staleRemoval)).toContain('The message is no longer queued');
+      expect(collectText(staleRemoval).join(' ')).toContain('The gateway failed before writing history');
       await new Promise((r) => setTimeout(r, 450));
       const promoted = await flush();
       expect(collectText(promoted)).not.toContain('待发送队列 (1)');

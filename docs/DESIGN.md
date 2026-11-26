@@ -128,7 +128,7 @@ Both transports check the endpoint before sending gateway credentials. Outside l
 
 The originating Agent's `followup` receives a marked `source.kind: knot` message. Missing follow-up support does not fail the remote job.
 
-Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately. When an exclusive Remote Agents chat session already has a running turn, the user can opt in to queue follow-up messages (bounded per session); queued turns start sequentially after the previous turn completes and are cancelled automatically if the preceding turn fails or is stopped.
+Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately. When an exclusive Remote Agents chat session already has a running turn, the user can opt in to queue up to 20 follow-up messages per session, with a 64 KiB UTF-8 limit per queued message. Queued turns start sequentially after the previous turn completes and are cancelled automatically if a preceding turn fails or is stopped. Removing a queued turn only succeeds before dispatch.
 
 ## Reverse MCP endpoint
 
