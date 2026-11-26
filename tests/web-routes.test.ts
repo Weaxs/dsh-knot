@@ -1174,6 +1174,7 @@ describe('web UI host routes & schemastery Config', () => {
       prompt: string;
       status: string;
       queued?: boolean;
+      wasQueued?: true;
       sequence?: number;
       createdAt: number;
       updatedAt: number;
@@ -1207,6 +1208,7 @@ describe('web UI host routes & schemastery Config', () => {
     let fixtureAgentKind: AgentConfig['kind'] = 'hermes';
     let localReleaseRequests = 0;
     let confirmedStopJobReads = 0;
+    let queueHistory: Promise<AgentTranscriptMessage[]> | undefined;
     const settledJobs: Array<typeof currentJob> = [];
     const transcriptBySession = new Map<string, AgentTranscriptMessage[]>([
       [
@@ -1285,7 +1287,8 @@ describe('web UI host routes & schemastery Config', () => {
           }
           if (path === WEB_ROUTES.sessionMessages) {
             const sessionId = requestField(init, 'sessionId');
-            const messages = transcriptBySession.get(sessionId);
+            const messages =
+              sessionId === 'sess-queue' && queueHistory ? await queueHistory : transcriptBySession.get(sessionId);
             if (!messages) throw new Error(`Unexpected history session ${sessionId}`);
             return ok({ messages });
           }
@@ -1972,17 +1975,58 @@ describe('web UI host routes & schemastery Config', () => {
         ...externalQueued,
         queued: undefined,
         status: 'failed',
+        wasQueued: true,
         error: 'The gateway failed before writing history',
         updatedAt: 21_401,
       };
+      let finishQueueHistory!: (messages: AgentTranscriptMessage[]) => void;
+      queueHistory = new Promise<AgentTranscriptMessage[]>((resolve) => {
+        finishQueueHistory = resolve;
+      });
+      settledJobs.unshift({
+        ...externalQueued,
+        id: 'fast-completed-followup',
+        prompt: 'Fast queued message',
+        status: 'completed',
+        queued: undefined,
+        wasQueued: true,
+        historyBaseline: { length: 2, lastId: 'unanchored-assistant' },
+        createdAt: 21_402,
+        updatedAt: 21_403,
+        text: 'Fast queued reply',
+      });
+      settledJobs.push({
+        ...externalQueued,
+        id: 'completed-without-baseline',
+        prompt: 'Queued without baseline',
+        status: 'completed',
+        queued: undefined,
+        wasQueued: true,
+        createdAt: 21_401,
+        updatedAt: 21_402,
+        text: 'Unanchored queued reply',
+      });
       (findButton(withQueuedBar2, '移除')!.props.onClick as () => void)();
       const staleRemoval = await flush();
       expect(collectText(staleRemoval)).toContain('The message is no longer queued');
       expect(collectText(staleRemoval).join(' ')).toContain('The gateway failed before writing history');
+      expect(collectText(staleRemoval)).toContain('Fast queued reply');
+      finishQueueHistory([
+        { id: 'unanchored-user', role: 'user', text: 'Queued without baseline' },
+        { id: 'unanchored-assistant', role: 'assistant', text: 'Unanchored queued reply' },
+        { id: 'fast-user', role: 'user', text: 'Fast queued message' },
+        { id: 'fast-assistant', role: 'assistant', text: 'Fast queued reply', thought: 'Persisted queued thought' },
+        { id: 'later-user', role: 'user', text: 'Later external turn' },
+        { id: 'later-assistant', role: 'assistant', text: 'Later external reply' },
+      ]);
       await new Promise((r) => setTimeout(r, 450));
       const promoted = await flush();
       expect(collectText(promoted)).not.toContain('待发送队列 (1)');
       expect(collectText(promoted)).toContain('second streaming');
+      expect(collectText(promoted)).toContain('Persisted queued thought');
+      expect(collectText(promoted)).toContain('Later external reply');
+      expect(collectText(promoted).filter((text) => text === 'Fast queued reply')).toHaveLength(1);
+      expect(collectText(promoted).filter((text) => text === 'Unanchored queued reply')).toHaveLength(1);
     } finally {
       try {
         try {

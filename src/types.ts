@@ -165,6 +165,7 @@ export interface AgentJob {
   prompt?: string;
   status: JobStatus;
   queued?: boolean;
+  wasQueued?: true;
   sequence?: number;
   createdAt: number;
   updatedAt: number;

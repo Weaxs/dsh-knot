@@ -109,6 +109,7 @@ interface JobSummary {
   prompt?: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   queued?: boolean;
+  wasQueued?: true;
   sequence?: number;
   createdAt: number;
   updatedAt: number;
@@ -1427,7 +1428,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const [historyAttempts, setHistoryAttempts] = React.useState(0);
     const [turns, setTurns] = React.useState<JobSummary[]>([]);
     const [dismissedQueuedIds, setDismissedQueuedIds] = React.useState<string[]>([]);
-    const seenQueuedIds = React.useRef(new Set<string>());
     const belongsToSession = (job: JobSummary) =>
       Boolean(sessionId && job.sessionId === sessionId && job.agentId === agent.id);
     const [initialJob] = React.useState(() =>
@@ -1450,7 +1450,12 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const isAvailableAndRunning = (job?: JobSummary) =>
       Boolean(job && !unavailableJobIds.includes(job.id) && isRunning(job));
     const isExecuting = (job?: JobSummary) => isAvailableAndRunning(job) && !isQueuedJob(job);
-    const observedJobRunning = Boolean(observedJob && isExecuting(observedJob));
+    const completedQueuedJob = jobs.find((job) => belongsToSession(job) && job.wasQueued && job.status === 'completed');
+    const historyTarget =
+      completedQueuedJob && (!observedJob || compareJobOrder(completedQueuedJob, observedJob) >= 0)
+        ? completedQueuedJob
+        : observedJob;
+    const historyJobRunning = isExecuting(historyTarget);
 
     React.useEffect(() => {
       alive.current = true;
@@ -1470,7 +1475,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     React.useEffect(() => {
       if (!canReadHistory) return;
       const controller = new AbortController();
-      const jobId = observedJob?.id;
+      const jobId = historyTarget?.id;
       setHistoryError('');
       void apiPost<{ messages: TranscriptMessage[] }>(
         ctx,
@@ -1481,14 +1486,14 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       )
         .then(({ messages }) => {
           if (controller.signal.aborted) return;
-          setHistoryJob(jobId ? { id: jobId, settled: !observedJobRunning } : undefined);
+          setHistoryJob(jobId ? { id: jobId, settled: !historyJobRunning } : undefined);
           setHistory(messages);
         })
         .catch((error: unknown) => {
           if (!controller.signal.aborted) setHistoryError(errorMessage(error));
         });
       return () => controller.abort();
-    }, [agent.id, agent.revision, canReadHistory, historyAttempts, observedJobRunning, observedJob?.id, session]);
+    }, [agent.id, agent.revision, canReadHistory, historyAttempts, historyJobRunning, historyTarget?.id, session]);
 
     const ownRunning = turns.find(isExecuting);
     const listedRunning = jobs.find(
@@ -1518,16 +1523,6 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       }
     }
     const queuedJobs = [...queuedMap.values()].sort(compareJobOrder);
-    React.useEffect(() => {
-      const seen = seenQueuedIds.current;
-      for (const item of jobs) {
-        if (belongsToSession(item) && isQueuedJob(item)) seen.add(item.id);
-      }
-      while (seen.size > 50) {
-        const oldest = seen.keys().next().value;
-        if (oldest !== undefined) seen.delete(oldest);
-      }
-    }, [jobs, agent.id, sessionId]);
     const progressJob = activeJob?.remoteStop === 'unconfirmed' ? undefined : (activeJob ?? queuedJobs[0]);
     const progressId = progressJob?.id;
     const progressIsOwn = Boolean(progressId && turnById.has(progressId));
@@ -1837,17 +1832,38 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }
 
     const matchTurnInHistory = (job: JobSummary, nextJob?: JobSummary): MatchedLiveTurn | undefined => {
-      if (!historyJob || !history?.length || !job.historyBaseline) return undefined;
+      if (!historyJob || !history?.length) return undefined;
       const observed = historyJob.id === job.id;
-      // A later job's pre-run tail gives a settled local turn a separate upper bound.
-      const nextTail = nextJob?.historyBaseline?.lastId;
-      const endIndex = observed ? history.length : history.findIndex((message) => message.id === nextTail) + 1;
-      if (!endIndex || (!observed && isRunning(job))) return undefined;
+      const completedQueued = job.wasQueued && job.status === 'completed';
       const baseline = job.historyBaseline;
+      if (!baseline) {
+        if (!completedQueued || !job.prompt || !job.text) return undefined;
+        let match: MatchedLiveTurn | undefined;
+        for (let startIndex = 0; startIndex < history.length; startIndex++) {
+          const user = history[startIndex];
+          if (user?.role !== 'user' || user.text !== job.prompt) continue;
+          const nextUser = history.findIndex((message, index) => index > startIndex && message.role === 'user');
+          const endIndex = nextUser < 0 ? history.length : nextUser;
+          const response = history.slice(startIndex + 1, endIndex);
+          if (response.map(({ text }) => text).join('') !== job.text) continue;
+          if (match) return undefined;
+          match = { startIndex, endIndex, persistedTurn: [user, ...response] };
+        }
+        return match;
+      }
+      // Prefer the next job's pre-run tail even when this job triggered the history read.
+      const nextTail = nextJob?.historyBaseline?.lastId;
+      const nextBoundary = history.findIndex((message) => message.id === nextTail) + 1;
+      let endIndex = nextBoundary || (observed ? history.length : 0);
+      if (!endIndex || (!observed && isRunning(job))) return undefined;
       const boundary = history.findIndex((message) => message.id === baseline.lastId);
       if (baseline.length > 0 && boundary < 0) return undefined;
       const turnStart = history.findIndex((message, index) => index > boundary && message.role === 'user');
       if (turnStart < 0 || turnStart >= endIndex || history[turnStart]?.text !== job.prompt) return undefined;
+      if (completedQueued && !nextBoundary) {
+        const nextUser = history.findIndex((message, index) => index > turnStart && message.role === 'user');
+        if (nextUser >= 0) endIndex = nextUser;
+      }
       const lastTurnAssistant = history.slice(turnStart + 1, endIndex);
       const lastMessage = history[endIndex - 1];
       // A session may be advanced outside Knot. Multiple new prompts do not identify this job.
@@ -1880,7 +1896,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         !turnById.has(job.id) &&
         job.id !== liveJob?.id &&
         (!agent.supportsSessionMessages ||
-          (seenQueuedIds.current.has(job.id) && Boolean(job.error) && !isRunning(job))),
+          (job.wasQueued && (job.status === 'completed' || Boolean(job.error)) && !isRunning(job))),
     );
 
     type TurnSegment =

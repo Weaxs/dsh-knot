@@ -879,6 +879,7 @@ export class AgentManager {
 
   private finishCancelledQueuedEntry(entry: QueuedSessionJob, reason?: string): void {
     delete entry.job.queued;
+    entry.job.wasQueued = true;
     entry.job.status = 'cancelled';
     if (reason) entry.job.error = reason;
     entry.job.updatedAt = Date.now();
@@ -934,6 +935,7 @@ export class AgentManager {
     if (queue.length === 0) this.sessionQueues.delete(key);
     if (!next) return;
     delete next.job.queued;
+    next.job.wasQueued = true;
     next.job.updatedAt = Date.now();
     const captureHistory = Boolean(next.adapter.getSessionMessages);
     if (!captureHistory) {
