@@ -19,6 +19,8 @@ import type {
 export type AdapterFactory = (config: AgentConfig) => AgentAdapter;
 
 const MAX_JOBS = 200;
+const MAX_QUEUED_PER_SESSION = 20;
+const CANCEL_TIMEOUT_MS = 12_000;
 const MAX_JOB_TOOLS = 50;
 const MAX_JOB_APPROVALS = 50;
 const MAX_JOB_TEXT_LENGTH = 2_000_000;
@@ -26,6 +28,16 @@ const MAX_JOB_THOUGHT_LENGTH = 16_000;
 const MAX_JOB_TIMELINE = 120;
 type OutputKind = 'text' | 'thought' | 'commentary';
 const outputContexts = new WeakMap<AgentJob, Partial<Record<OutputKind, RedactionContext>>>();
+
+interface QueuedSessionJob {
+  job: AgentJob;
+  adapter: AgentAdapter;
+  text: string;
+  sessionId: string;
+  onDone?: (job: AgentJob) => void;
+  options?: AgentPromptOptions;
+  resolve: (job: AgentJob) => void;
+}
 
 export class AgentManager {
   readonly adapters = new Map<string, AgentAdapter>();
@@ -50,6 +62,7 @@ export class AgentManager {
   private readonly controllers = new Map<string, AbortController>();
   private readonly remoteCancelled = new Set<string>();
   private readonly latestSessionJob = new Map<string, string>();
+  private readonly sessionQueues = new Map<string, QueuedSessionJob[]>();
   private readonly preparingHistory = new Map<string, { ready: Promise<void>; capture: boolean }>();
   private readonly reconfiguring = new Set<string>();
   private readonly agentLocks = new Map<string, Promise<void>>();
@@ -205,6 +218,7 @@ export class AgentManager {
     onDone?: (job: AgentJob) => void,
     exclusiveSession = false,
     clientMessageId?: string,
+    queue = false,
   ): AgentJob {
     if (this.reconfiguring.has(agentId)) {
       throw new Error(`Agent "${agentId}" is currently being reconfigured or removed`);
@@ -245,6 +259,69 @@ export class AgentManager {
         );
       });
       const existingJob = activeSessionJobs.find((job) => exclusive || this.jobOwners.get(job.id)?.exclusive);
+      const hasStoppingOrUnconfirmed = activeSessionJobs.some((job) => {
+        const owner = this.jobOwners.get(job.id);
+        return (
+          owner?.cancelling !== undefined ||
+          (job.remoteStop !== 'unconfirmed-released' &&
+            (job.remoteStop !== undefined ||
+              (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id))))
+        );
+      });
+      if (
+        existingJob &&
+        queue &&
+        exclusive &&
+        !hasStoppingOrUnconfirmed &&
+        activeSessionJobs.some((job) => !job.queued)
+      ) {
+        const key = sessionKey(agentId, remoteSession);
+        const queuedList = this.sessionQueues.get(key) ?? [];
+        if (queuedList.length >= MAX_QUEUED_PER_SESSION) {
+          throw new Error(`Too many queued messages for session "${remoteSession}" (limit ${MAX_QUEUED_PER_SESSION})`);
+        }
+        this.evictFinishedJobs();
+        if (this.jobs.size >= MAX_JOBS) {
+          throw new Error(`All ${MAX_JOBS} job slots are in use. Wait for a job to finish.`);
+        }
+        const job: AgentJob = {
+          id,
+          agentId,
+          sessionId: remoteSession,
+          prompt: text.slice(0, 4_000),
+          status: 'queued',
+          queued: true,
+          sequence: ++this.jobSequence,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          text: '',
+        };
+        this.jobs.set(id, job);
+        this.jobOwners.set(id, { adapter, exclusive: true, submission });
+        let resolveCompletion!: (value: AgentJob) => void;
+        const completion = new Promise<AgentJob>((resolve) => {
+          resolveCompletion = resolve;
+        });
+        this.completions.set(id, completion);
+        completion
+          .finally(() => {
+            this.completions.delete(id);
+            this.controllers.delete(id);
+          })
+          .catch(() => {});
+        const options = clientMessageId ? { idempotencyKey: `dsh-knot:${clientMessageId}` } : undefined;
+        queuedList.push({
+          job,
+          adapter,
+          text,
+          sessionId: remoteSession,
+          onDone,
+          options,
+          resolve: resolveCompletion,
+        });
+        this.sessionQueues.set(key, queuedList);
+        return job;
+      }
       if (existingJob || (exclusive && adapter.isSessionBusy?.(remoteSession))) {
         throw new Error(
           `Session "${remoteSession}" still has an active or cancelling job (${existingJob?.id ?? remoteSession})`,
@@ -338,6 +415,7 @@ export class AgentManager {
   async cancel(id: string, signal?: AbortSignal): Promise<AgentJob> {
     const job = this.get(id);
     if (job.remoteStop === 'unconfirmed-released') return job;
+    if (this.cancelQueuedJob(job)) return job;
     if (job.status === 'completed' || (job.status === 'failed' && !job.remoteStop)) return job;
     if (job.status === 'cancelled' && this.remoteCancelled.has(id)) return job;
     const latest = job.sessionId ? this.latestSessionJob.get(sessionKey(job.agentId, job.sessionId)) : undefined;
@@ -366,6 +444,9 @@ export class AgentManager {
     delete job.pendingApproval;
     this.approvals.delete(job);
     job.updatedAt = Date.now();
+    if (job.sessionId) {
+      this.cancelSessionQueue(job.agentId, job.sessionId, 'Cancelled because the previous message was stopped');
+    }
     const controller = this.controllers.get(id);
     const confirmation = this.captureStopConfirmation(job);
     const drain = controller && !controller.signal.aborted && confirmation ? { controller, confirmation } : undefined;
@@ -381,14 +462,14 @@ export class AgentManager {
     const job = this.get(id);
     if (job.remoteStop === 'unconfirmed-released') return job;
     const owner = this.jobOwners.get(id);
-    if (job.remoteStop !== 'unconfirmed' || owner?.adapter.kind !== 'acp' || !job.sessionId) {
-      throw new Error('Only an unconfirmed ACP stop can release its local session');
+    if (job.remoteStop !== 'unconfirmed' || !owner || !job.sessionId) {
+      throw new Error('Only an unconfirmed stop can release its local session');
     }
     if (owner.adapter !== this.adapters.get(job.agentId) || !this.isLatestSessionJob(job)) {
       throw new Error('The job no longer owns this gateway session');
     }
     if (owner.cancelling || this.completions.has(id) || owner.adapter.isSessionBusy?.(job.sessionId)) {
-      throw new Error('Wait for the local ACP prompt and stop request to finish');
+      throw new Error('Wait for the local prompt and stop request to finish');
     }
     if (owner.stopConfirmation === 'received') {
       delete job.remoteStop;
@@ -427,6 +508,12 @@ export class AgentManager {
   }
 
   async close(): Promise<void> {
+    for (const key of [...this.sessionQueues.keys()]) {
+      const separator = key.indexOf('\0');
+      if (separator >= 0) {
+        this.cancelSessionQueue(key.slice(0, separator), key.slice(separator + 1), 'manager closed');
+      }
+    }
     for (const controller of this.controllers.values()) controller.abort(new Error('manager closed'));
     this.controllers.clear();
     await Promise.allSettled([...this.adapters.values()].map((adapter) => adapter.close()));
@@ -469,7 +556,7 @@ export class AgentManager {
     if (owner?.cancelling) return raceAbort(owner.cancelling, signal);
     if (owner && job.sessionId && !this.preparingHistory.has(job.id)) {
       const sessionId = job.sessionId;
-      const deadline = AbortSignal.timeout(5_000);
+      const deadline = AbortSignal.timeout(CANCEL_TIMEOUT_MS);
       const stopSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
       if (owner.exclusive || owner.stopConfirmation) job.remoteStop = 'pending';
       try {
@@ -542,6 +629,12 @@ export class AgentManager {
   }
 
   private async abortJobsForAgent(agentId: string): Promise<void> {
+    const prefix = `${agentId}\0`;
+    for (const key of [...this.sessionQueues.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.cancelSessionQueue(agentId, key.slice(prefix.length), `agent "${agentId}" reconfigured`);
+      }
+    }
     const remoteCancels: Array<Promise<void>> = [];
     const deadlineSignal = AbortSignal.timeout(5_000);
     for (const [id, job] of this.jobs) {
@@ -569,7 +662,6 @@ export class AgentManager {
         /* overall 5s deadline for remote cancellation during reconfigure */
       });
     }
-    const prefix = `${agentId}\0`;
     for (const key of this.latestSessionJob.keys()) {
       if (key.startsWith(prefix)) this.latestSessionJob.delete(key);
     }
@@ -738,6 +830,8 @@ export class AgentManager {
         );
       }
       job.updatedAt = Date.now();
+      this.completions.delete(job.id);
+      this.controllers.delete(job.id);
       if (onDone) {
         try {
           onDone({ ...job });
@@ -745,8 +839,103 @@ export class AgentManager {
           /* notification failures do not change the remote job */
         }
       }
+      this.settleSessionQueue(job);
     }
     return job;
+  }
+
+  private cancelQueuedJob(job: AgentJob, reason?: string): boolean {
+    if (!job.queued || !job.sessionId) return false;
+    const key = sessionKey(job.agentId, job.sessionId);
+    const queue = this.sessionQueues.get(key);
+    if (!queue) return false;
+    const index = queue.findIndex((entry) => entry.job.id === job.id);
+    if (index < 0) return false;
+    const [entry] = queue.splice(index, 1);
+    if (queue.length === 0) this.sessionQueues.delete(key);
+    this.finishCancelledQueuedEntry(entry!, reason);
+    return true;
+  }
+
+  private cancelSessionQueue(agentId: string, sessionId: string, reason: string): void {
+    const key = sessionKey(agentId, sessionId);
+    const queue = this.sessionQueues.get(key);
+    if (!queue?.length) return;
+    this.sessionQueues.delete(key);
+    for (const entry of queue) {
+      this.finishCancelledQueuedEntry(entry, reason);
+    }
+  }
+
+  private finishCancelledQueuedEntry(entry: QueuedSessionJob, reason?: string): void {
+    delete entry.job.queued;
+    entry.job.status = 'cancelled';
+    if (reason) entry.job.error = reason;
+    entry.job.updatedAt = Date.now();
+    this.remoteCancelled.add(entry.job.id);
+    this.completions.delete(entry.job.id);
+    this.controllers.delete(entry.job.id);
+    if (entry.onDone) {
+      try {
+        entry.onDone({ ...entry.job });
+      } catch {
+        /* notification failures do not change the remote job */
+      }
+    }
+    entry.resolve(entry.job);
+  }
+
+  private settleSessionQueue(finishedJob: AgentJob): void {
+    const sessionId = finishedJob.sessionId;
+    if (!sessionId) return;
+    const key = sessionKey(finishedJob.agentId, sessionId);
+    const queue = this.sessionQueues.get(key);
+    if (!queue?.length) return;
+    const owner = this.jobOwners.get(finishedJob.id);
+    const adapter = this.adapters.get(finishedJob.agentId);
+    if (!owner || owner.adapter !== adapter || this.reconfiguring.has(finishedJob.agentId)) {
+      this.cancelSessionQueue(finishedJob.agentId, sessionId, 'Cancelled because the previous message was stopped');
+      return;
+    }
+    const otherExecuting = [...this.jobs.values()].some((candidate) => {
+      if (candidate.id === finishedJob.id || candidate.queued) return false;
+      if (candidate.agentId !== finishedJob.agentId || candidate.sessionId !== sessionId) return false;
+      const candidateOwner = this.jobOwners.get(candidate.id);
+      if (candidateOwner?.adapter !== adapter) return false;
+      return (
+        candidate.status === 'queued' ||
+        candidate.status === 'running' ||
+        this.completions.has(candidate.id) ||
+        candidateOwner.cancelling !== undefined ||
+        (candidate.remoteStop !== undefined && candidate.remoteStop !== 'unconfirmed-released')
+      );
+    });
+    if (otherExecuting) return;
+    if (
+      finishedJob.status !== 'completed' ||
+      finishedJob.remoteStop !== undefined ||
+      owner.cancelling !== undefined ||
+      adapter.isSessionBusy?.(sessionId)
+    ) {
+      const reason =
+        finishedJob.status === 'failed'
+          ? 'Cancelled because the previous message failed'
+          : 'Cancelled because the previous message was stopped';
+      this.cancelSessionQueue(finishedJob.agentId, sessionId, reason);
+      return;
+    }
+    const next = queue.shift();
+    if (queue.length === 0) this.sessionQueues.delete(key);
+    if (!next) return;
+    delete next.job.queued;
+    next.job.updatedAt = Date.now();
+    const captureHistory = Boolean(next.adapter.getSessionMessages);
+    if (!captureHistory) {
+      this.latestSessionJob.set(key, next.job.id);
+    }
+    void this.run(next.job, next.adapter, next.text, next.sessionId, next.onDone, next.options, captureHistory).then(
+      next.resolve,
+    );
   }
 }
 

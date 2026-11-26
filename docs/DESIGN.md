@@ -60,7 +60,7 @@ The optional `dsh-knot-acp` bridge exposes `initialize`, `session/new`, `session
 
 For Hermes, dsh-knot peers negotiate interim retraction so they can stream text immediately and correct it when a commentary marker arrives. Other ACP clients receive text at classification boundaries to keep commentary out of the answer channel. If unclassified text exceeds 2,000,000 characters, the bridge discards that buffer, attempts to stop the run, and reports the limit error. If the stop is unconfirmed, the same connection must retry `session/cancel` successfully before sending another prompt to that session.
 
-The Hermes WebSocket bridge also negotiates stop recovery. It associates an opaque prompt ID with the exact native run ID in a bounded registry shared across its connections. On retry after the original request is gone, the bridge acknowledges a stop only after that run reaches a terminal state. Older peers, missing runs, and bridge restarts can leave the stop unconfirmed. Once the local prompt and stop request have ended, an explicit local release can unlock and reclaim the job while preserving the unconfirmed remote status.
+The Hermes WebSocket bridge also negotiates stop recovery. It associates an opaque prompt ID with the exact native run ID in a bounded registry shared across its connections. On retry after the original request is gone, the bridge acknowledges a stop only after that run reaches a terminal state. Older peers, missing runs, and bridge restarts can leave the stop unconfirmed. Once the local prompt and stop request have ended, an explicit local release can unlock and reclaim any exclusive job (ACP or native) while preserving the unconfirmed remote status.
 
 ACP v2, A2A, and additional UI transports are intentionally outside the current scope.
 
@@ -128,7 +128,7 @@ Both transports check the endpoint before sending gateway credentials. Outside l
 
 The originating Agent's `followup` receives a marked `source.kind: knot` message. Missing follow-up support does not fail the remote job.
 
-Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately.
+Before continuing a history-capable session, the manager gives the transcript read up to one second. The browser uses the job's own snapshot to merge a live turn with history. If the prior tail or matching next turn is uncertain, it keeps the observed turn visible separately. When an exclusive Remote Agents chat session already has a running turn, the user can opt in to queue follow-up messages (bounded per session); queued turns start sequentially after the previous turn completes and are cancelled automatically if the preceding turn fails or is stopped.
 
 ## Reverse MCP endpoint
 

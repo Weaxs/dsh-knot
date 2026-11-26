@@ -108,6 +108,7 @@ interface JobSummary {
   sessionId?: string;
   prompt?: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  queued?: boolean;
   sequence?: number;
   createdAt: number;
   updatedAt: number;
@@ -192,6 +193,7 @@ const DICTS: Record<string, Record<string, string>> = {
     wantsApproval: '请求权限确认',
     approveRemotely: '请前往远端网关确认审批',
     runningNow: '正在后台执行',
+    queuedNow: '排队等待中',
     stopTask: '停止',
     agentsHeading: '远端助手',
     agentsEmpty: '尚未配置远端助手，点击右上角「+ 添加助手」即可直接配置（推荐通过 Tailscale Serve 私网 HTTPS 转发）。',
@@ -244,8 +246,12 @@ const DICTS: Record<string, Record<string, string>> = {
     chatEmpty: '发条消息开始对话，或从历史中选择一个会话。',
     chatPlaceholder: '给远端助手发消息…',
     chatComposerHint: 'Enter 发送 · Shift+Enter 换行',
+    chatQueueHint: 'Enter 加入队列 · Shift+Enter 换行',
     chatSend: '发送',
+    chatQueue: '加入队列',
     chatSending: '发送中…',
+    chatQueueHeading: '待发送队列',
+    chatQueueRemove: '移除',
     chatFailed: '执行失败',
     chatCancelled: '已停止',
     chatStopping: '正在停止远端任务…',
@@ -306,6 +312,7 @@ const DICTS: Record<string, Record<string, string>> = {
     wantsApproval: 'requests approval',
     approveRemotely: 'Approve in remote gateway',
     runningNow: 'working in background',
+    queuedNow: 'queued',
     stopTask: 'Stop',
     agentsHeading: 'Remote Agents',
     agentsEmpty:
@@ -361,8 +368,12 @@ const DICTS: Record<string, Record<string, string>> = {
     chatEmpty: 'Send a message to start a conversation, or select one from history.',
     chatPlaceholder: 'Message remote agent…',
     chatComposerHint: 'Enter to send · Shift+Enter for newline',
+    chatQueueHint: 'Enter to queue · Shift+Enter for newline',
     chatSend: 'Send',
+    chatQueue: 'Queue message',
     chatSending: 'Sending…',
+    chatQueueHeading: 'Queued',
+    chatQueueRemove: 'Remove',
     chatFailed: 'Failed',
     chatCancelled: 'Stopped',
     chatStopping: 'Stopping the remote run…',
@@ -827,6 +838,27 @@ body[data-ds-dark-theme] .dk-root {
 /* Floating Pill/Rounded Composer */
 .dk-chat-form { width: 100%; padding: 4px 24px 18px; background: var(--dk-surface); }
 .dk-chat-form-inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+.dk-chat-queue {
+  background: var(--dk-fill);
+  border: 1px solid var(--dk-line);
+  border-radius: 14px;
+  padding: 8px 12px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.dk-chat-queue-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 11.5px; font-weight: 600; color: var(--dk-text-2);
+}
+.dk-chat-queue-list { display: flex; flex-direction: column; gap: 4px; }
+.dk-chat-queue-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 4px 6px; border-radius: 8px; background: var(--dk-surface);
+  border: 1px solid var(--dk-line-fine);
+}
+.dk-chat-queue-text {
+  min-width: 0; flex: 1; font-size: 12.5px; color: var(--dk-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .dk-chat-composer-box {
   background: var(--dk-surface);
   border: 1px solid var(--dk-line);
@@ -1111,6 +1143,10 @@ const TOOL_STATUS_LABEL: Record<ToolStatus, string> = {
   interrupted: 'chatToolInterrupted',
 };
 
+function isQueuedJob(job?: JobSummary): boolean {
+  return Boolean(job?.queued && job.status === 'queued');
+}
+
 function isRunning(job?: JobSummary): boolean {
   return (
     job?.status === 'queued' ||
@@ -1386,11 +1422,16 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const [historyJob, setHistoryJob] = React.useState<{ id: string; settled: boolean } | undefined>(undefined);
     const [historyAttempts, setHistoryAttempts] = React.useState(0);
     const [turns, setTurns] = React.useState<JobSummary[]>([]);
+    const [dismissedQueuedIds, setDismissedQueuedIds] = React.useState<string[]>([]);
     const belongsToSession = (job: JobSummary) =>
       Boolean(sessionId && job.sessionId === sessionId && job.agentId === agent.id);
-    const [initialJob] = React.useState(() => jobs.find((job) => belongsToSession(job) && isRunning(job)));
+    const [initialJob] = React.useState(() =>
+      jobs.find((job) => belongsToSession(job) && isRunning(job) && !isQueuedJob(job)),
+    );
     const [observedJob, setObservedJob] = React.useState(initialJob);
-    const latestProgress = React.useRef<JobSummary | undefined>(initialJob);
+    const latestProgressById = React.useRef(
+      new Map<string, JobSummary>(initialJob ? [[initialJob.id, initialJob]] : []),
+    );
     const [copyStatus, setCopyStatus] = React.useState('');
     const [copiedOk, setCopiedOk] = React.useState(false);
     const copyTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1402,7 +1443,8 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const followTail = React.useRef(true);
     const canReadHistory = Boolean(agent.supportsSessionMessages && session);
     const isAvailableAndRunning = (job?: JobSummary) => job?.id !== unavailableJobId && isRunning(job);
-    const observedJobRunning = Boolean(observedJob && isAvailableAndRunning(observedJob));
+    const isExecuting = (job?: JobSummary) => isAvailableAndRunning(job) && !isQueuedJob(job);
+    const observedJobRunning = Boolean(observedJob && isExecuting(observedJob));
 
     React.useEffect(() => {
       alive.current = true;
@@ -1442,29 +1484,57 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       return () => controller.abort();
     }, [agent.id, agent.revision, canReadHistory, historyAttempts, observedJobRunning, observedJob?.id, session]);
 
-    const ownRunning = turns.find(isAvailableAndRunning);
+    const ownRunning = turns.find(isExecuting);
     const listedRunning = jobs.find(
       (job) =>
         belongsToSession(job) &&
-        isAvailableAndRunning(job) &&
+        isExecuting(job) &&
         !turns.some(({ id }) => id === job.id) &&
-        (job.id !== observedJob?.id || isAvailableAndRunning(observedJob)),
+        (job.id !== observedJob?.id || isExecuting(observedJob)),
     );
-    const activeJob = ownRunning ?? (isAvailableAndRunning(observedJob) ? observedJob : listedRunning);
+    const activeJob = ownRunning ?? (isExecuting(observedJob) ? observedJob : listedRunning);
     const activeId = activeJob?.id;
-    const progressId = activeJob?.remoteStop === 'unconfirmed' ? undefined : activeId;
     const ownActiveId = ownRunning?.id;
+    const turnById = new Map(turns.map((item) => [item.id, item]));
+    const queuedMap = new Map<string, JobSummary>();
+    for (const item of turns) {
+      if (item.id !== unavailableJobId && !dismissedQueuedIds.includes(item.id) && isQueuedJob(item)) {
+        queuedMap.set(item.id, item);
+      }
+    }
+    for (const item of jobs) {
+      if (!belongsToSession(item) || item.id === unavailableJobId || dismissedQueuedIds.includes(item.id)) continue;
+      const existingTurn = turnById.get(item.id);
+      if (existingTurn && !isQueuedJob(existingTurn)) continue;
+      if (isQueuedJob(item) && (!existingTurn || item.updatedAt >= existingTurn.updatedAt)) {
+        queuedMap.set(item.id, existingTurn ? { ...item, prompt: existingTurn.prompt ?? item.prompt } : item);
+      }
+    }
+    const queuedJobs = [...queuedMap.values()].sort(compareJobOrder);
+    const progressJob = activeJob?.remoteStop === 'unconfirmed' ? undefined : (activeJob ?? queuedJobs[0]);
+    const progressId = progressJob?.id;
+    const progressIsOwn = Boolean(progressId && turnById.has(progressId));
+    const historyPending = canReadHistory && !history && !historyError;
+    const canQueue = Boolean(activeJob && sessionId && !activeJob.remoteStop);
+    const composerBlocked = Boolean(historyPending || (activeJob && !canQueue));
 
     const applyProgress = React.useCallback(
       (job: JobSummary, own: boolean) => {
         if (!alive.current) return;
-        const previous = latestProgress.current;
-        if (previous?.id === job.id && (previous.updatedAt > job.updatedAt || (!isRunning(previous) && isRunning(job))))
-          return;
-        latestProgress.current = job;
+        const previous = latestProgressById.current.get(job.id);
+        if (previous && (previous.updatedAt > job.updatedAt || (!isRunning(previous) && isRunning(job)))) return;
+        latestProgressById.current.set(job.id, job);
+        if (latestProgressById.current.size > 50) {
+          const oldest = latestProgressById.current.keys().next().value;
+          if (oldest !== undefined) latestProgressById.current.delete(oldest);
+        }
         if (own) {
-          setTurns((current) => current.map((item) => (item.id === job.id ? { ...job, prompt: item.prompt } : item)));
-        } else setObservedJob(job);
+          setTurns((current) =>
+            current.map((item) => (item.id === job.id ? { ...job, prompt: item.prompt ?? job.prompt } : item)),
+          );
+        } else if (!isQueuedJob(job)) {
+          setObservedJob(job);
+        }
         if (job.sessionId) {
           setSessionId(job.sessionId);
           onSession(job.sessionId);
@@ -1484,6 +1554,27 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     }, [activeJob, jobs, ownActiveId, applyProgress]);
 
     React.useEffect(() => {
+      if (!turns.some(isQueuedJob)) return;
+      const listedById = new Map(jobs.map((job) => [job.id, job]));
+      setTurns((current) => {
+        let changed = false;
+        const next = current.map((item) => {
+          const listed = listedById.get(item.id);
+          if (!listed) return item;
+          if (
+            (isQueuedJob(item) && !isQueuedJob(listed)) ||
+            (listed.updatedAt > item.updatedAt && (isRunning(item) || !isRunning(listed)))
+          ) {
+            changed = true;
+            return { ...listed, prompt: item.prompt ?? listed.prompt };
+          }
+          return item;
+        });
+        return changed ? next : current;
+      });
+    }, [jobs, turns]);
+
+    React.useEffect(() => {
       if (!progressId) return;
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1499,7 +1590,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           );
           if (controller.signal.aborted) return;
           setJobError('');
-          applyProgress(job, progressId === ownActiveId);
+          applyProgress(job, progressIsOwn);
           if (!isRunning(job) || job.remoteStop === 'unconfirmed') return;
         } catch (error) {
           if (controller.signal.aborted) return;
@@ -1518,16 +1609,16 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
         controller.abort();
         clearTimeout(timer);
       };
-    }, [progressId, ownActiveId, agent.id, agent.revision, applyProgress, refreshState]);
+    }, [progressId, progressIsOwn, agent.id, agent.revision, applyProgress, refreshState]);
 
     React.useEffect(() => {
       if (followTail.current && log.current) log.current.scrollTop = log.current.scrollHeight;
     }, [history, turns, observedJob]);
 
-    const historyPending = canReadHistory && !history && !historyError;
     const send = async () => {
       const message = input.trim();
-      if (!message || activeId || historyPending || sendLock.current || actionLock.current) return;
+      if (!message || composerBlocked || sendLock.current || actionLock.current) return;
+      const queueRequest = canQueue;
       const key = submissionKey(sessionId);
       let request = submissions.get(key) ?? submission.current;
       const retry = Boolean(request?.message === message && request.sessionId === sessionId);
@@ -1558,6 +1649,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             message: request.message,
             clientMessageId: request.id,
             ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+            ...(queueRequest ? { queue: true } : {}),
           },
           15_000,
         );
@@ -1571,10 +1663,10 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           return;
         }
         setTurns((current) => [
-          ...current.filter(({ id }) => id !== job.id).slice(-19),
+          ...current.filter(({ id }) => id !== job.id).slice(-29),
           { ...job, prompt: request.message },
         ]);
-        applyProgress(job, true);
+        if (!isQueuedJob(job)) applyProgress(job, true);
       } catch (error) {
         if (alive.current) setError(errorMessage(error));
       } finally {
@@ -1591,6 +1683,25 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       try {
         const updated = await apiPost<JobSummary>(ctx, `/api/dsh-knot/${path}`, { jobId: job.id, ...fields }, 15_000);
         applyProgress(updated, job.id === ownActiveId);
+      } catch (error) {
+        if (alive.current) setError(errorMessage(error));
+      } finally {
+        actionLock.current = false;
+        if (alive.current) setActing(false);
+      }
+    };
+
+    const removeQueuedJob = async (job: JobSummary) => {
+      if (actionLock.current) return;
+      actionLock.current = true;
+      setActing(true);
+      setError('');
+      try {
+        await apiPost<JobSummary>(ctx, '/api/dsh-knot/cancel', { jobId: job.id }, 15_000);
+        if (!alive.current) return;
+        setDismissedQueuedIds((current) => (current.includes(job.id) ? current : [...current.slice(-49), job.id]));
+        setTurns((current) => current.filter((item) => item.id !== job.id));
+        void refreshState();
       } catch (error) {
         if (alive.current) setError(errorMessage(error));
       } finally {
@@ -1743,12 +1854,17 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       return contentMatches ? match : undefined;
     };
 
-    const liveJob = (isAvailableAndRunning(observedJob) ? observedJob : listedRunning) ?? observedJob;
+    const liveJob = (isExecuting(observedJob) ? observedJob : listedRunning) ?? observedJob;
     const liveIsOwnTurn = Boolean(liveJob && turns.some(({ id }) => id === liveJob.id));
     const fallbackJobs =
       !agent.supportsSessionMessages && sessionId
         ? jobs.filter(
-            (job) => belongsToSession(job) && !turns.some(({ id }) => id === job.id) && job.id !== liveJob?.id,
+            (job) =>
+              belongsToSession(job) &&
+              !isQueuedJob(job) &&
+              !dismissedQueuedIds.includes(job.id) &&
+              !turns.some(({ id }) => id === job.id) &&
+              job.id !== liveJob?.id,
           )
         : [];
 
@@ -1898,7 +2014,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const renderJob = (job: JobSummary, matchedTurn?: MatchedLiveTurn) => {
       const active = isAvailableAndRunning(job);
       const approval = active ? job.pendingApproval : undefined;
-      const releaseAvailable = agent.kind === 'acp' && active && job.remoteStop === 'unconfirmed';
+      const releaseAvailable = active && job.remoteStop === 'unconfirmed';
       const released = job.remoteStop === 'unconfirmed-released';
       const status =
         job.remoteStop === 'pending'
@@ -2061,8 +2177,10 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
     const renderConversation = () => {
       const displayJobs = [
         ...fallbackJobs.sort(compareJobOrder).slice(-20),
-        ...turns,
-        ...(liveJob && !liveIsOwnTurn ? [liveJob] : []),
+        ...turns.filter((job) => !isQueuedJob(job) && !dismissedQueuedIds.includes(job.id)),
+        ...(liveJob && !liveIsOwnTurn && !isQueuedJob(liveJob) && !dismissedQueuedIds.includes(liveJob.id)
+          ? [liveJob]
+          : []),
       ].sort(compareJobOrder);
       if (!history?.length) return displayJobs.map((job) => renderJob(job));
       const boundaryJobs = [...displayJobs, ...jobs.filter(belongsToSession)]
@@ -2213,6 +2331,42 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
           error || jobError
             ? h('div', { className: 'dk-errbox', role: 'alert' }, error || `${t('chatJobError')}: ${jobError}`)
             : null,
+          queuedJobs.length > 0
+            ? h(
+                'div',
+                { className: 'dk-chat-queue', role: 'region', 'aria-label': t('chatQueueHeading') },
+                h(
+                  'div',
+                  { className: 'dk-chat-queue-head' },
+                  h('span', null, `${t('chatQueueHeading')} (${queuedJobs.length})`),
+                ),
+                h(
+                  'div',
+                  { className: 'dk-chat-queue-list' },
+                  queuedJobs.map((queuedJob) =>
+                    h(
+                      'div',
+                      { key: queuedJob.id, className: 'dk-chat-queue-item' },
+                      h(
+                        'span',
+                        { className: 'dk-chat-queue-text', title: queuedJob.prompt ?? '' },
+                        queuedJob.prompt ?? '',
+                      ),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'dk-btn dk-btn-sm dk-btn-ghost',
+                          disabled: acting,
+                          onClick: () => void removeQueuedJob(queuedJob),
+                        },
+                        t('chatQueueRemove'),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            : null,
           h(
             'div',
             { className: 'dk-chat-composer-box' },
@@ -2245,15 +2399,15 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
             h(
               'div',
               { className: 'dk-chat-composer-bar' },
-              h('span', { className: 'dk-chat-hint' }, t('chatComposerHint')),
+              h('span', { className: 'dk-chat-hint' }, t(canQueue ? 'chatQueueHint' : 'chatComposerHint')),
               h(
                 'button',
                 {
                   type: 'submit',
                   className: 'dk-send-circle',
-                  title: t(sending ? 'chatSending' : 'chatSend'),
-                  'aria-label': t(sending ? 'chatSending' : 'chatSend'),
-                  disabled: Boolean(sending || acting || activeId || historyPending || !input.trim()),
+                  title: t(sending ? 'chatSending' : canQueue ? 'chatQueue' : 'chatSend'),
+                  'aria-label': t(sending ? 'chatSending' : canQueue ? 'chatQueue' : 'chatSend'),
+                  disabled: Boolean(sending || acting || composerBlocked || !input.trim()),
                 },
                 icons.send(15),
               ),
@@ -2670,7 +2824,17 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                             'div',
                             { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
                             h('span', { className: 'dk-dot dk-dot-live', 'aria-hidden': true }),
-                            h('span', { style: { fontWeight: 500 } }, `${job.agentId} · ${t('runningNow')}`),
+                            h(
+                              'span',
+                              { style: { fontWeight: 500 } },
+                              `${job.agentId} · ${t(
+                                isQueuedJob(job)
+                                  ? 'queuedNow'
+                                  : job.remoteStop === 'unconfirmed'
+                                    ? 'chatStopUnconfirmed'
+                                    : 'runningNow',
+                              )}`,
+                            ),
                           ),
                           h(
                             'button',
@@ -2680,10 +2844,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                               onClick: () => void cancelJob(job.id),
                             },
                             icons.stop(11),
-                            t('stopTask'),
+                            t(isQueuedJob(job) ? 'chatQueueRemove' : 'stopTask'),
                           ),
                         ),
-                        job.text ? h('div', { className: 'dk-muted dk-mono' }, job.text.slice(-180)) : null,
+                        job.text || (isQueuedJob(job) && job.prompt)
+                          ? h('div', { className: 'dk-muted dk-mono' }, (job.text || job.prompt || '').slice(-180))
+                          : null,
                       ),
                 ),
               ),

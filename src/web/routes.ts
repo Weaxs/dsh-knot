@@ -214,7 +214,10 @@ export function registerWebRoutes(
         ) {
           return errorReply('Invalid clientMessageId', 400);
         }
-        const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId);
+        if (body.queue !== undefined && typeof body.queue !== 'boolean') {
+          return errorReply('queue must be a boolean', 400);
+        }
+        const job = manager.start(agentId, message, sessionId, undefined, true, clientMessageId, body.queue === true);
         return jsonReply({ ok: true, value: redactJob(manager, job) });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error), 400);

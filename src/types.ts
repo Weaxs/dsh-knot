@@ -164,6 +164,7 @@ export interface AgentJob {
   sessionId?: string;
   prompt?: string;
   status: JobStatus;
+  queued?: boolean;
   sequence?: number;
   createdAt: number;
   updatedAt: number;
