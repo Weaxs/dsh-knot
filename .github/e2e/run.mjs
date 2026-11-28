@@ -83,7 +83,10 @@ async function verify(kind) {
           });
           try {
             await raceAbort(daemon.connect(), deadline);
-            await raceAbort(daemon.refreshProvidersSnapshot({ providers: [config.paseoProvider] }), deadline);
+            await raceAbort(
+              daemon.refreshProvidersSnapshot({ providers: [config.paseoProvider], cwd: config.dshCwd }),
+              deadline,
+            );
           } finally {
             await daemon.close();
           }

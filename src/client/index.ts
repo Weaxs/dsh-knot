@@ -116,7 +116,12 @@ interface JobSummary {
   thought?: string;
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
-  pendingApproval?: { requestId: string; choices: string[]; text?: string };
+  pendingApproval?: {
+    requestId: string;
+    choices: string[];
+    text?: string;
+    questions?: Array<{ text: string; options: string[]; multiSelect?: boolean; allowEmpty?: boolean }>;
+  };
   tools?: ToolActivitySummary[];
   timeline?: TimelineEntry[];
   historyBaseline?: { length: number; lastId?: string };
@@ -191,6 +196,9 @@ const DICTS: Record<string, Record<string, string>> = {
     attentionTitle: '需要你处理与后台任务',
     attentionEmpty: '当前没有待确认的审批或运行中的后台任务。',
     wantsApproval: '请求权限确认',
+    answerQuestions: '提交回答',
+    dismissQuestions: '拒绝回答',
+    multipleAnswers: '多项答案用逗号分隔',
     approveRemotely: '请前往远端网关确认审批',
     runningNow: '正在后台执行',
     queuedNow: '排队等待中',
@@ -312,6 +320,9 @@ const DICTS: Record<string, Record<string, string>> = {
     attentionTitle: 'Needs Attention & Active Jobs',
     attentionEmpty: 'No pending approvals or running remote jobs.',
     wantsApproval: 'requests approval',
+    answerQuestions: 'Submit answers',
+    dismissQuestions: 'Dismiss questions',
+    multipleAnswers: 'Separate multiple answers with commas',
     approveRemotely: 'Approve in remote gateway',
     runningNow: 'working in background',
     queuedNow: 'queued',
@@ -1398,6 +1409,56 @@ interface ThreadProps {
   refreshState: () => Promise<void>;
 }
 
+function renderApprovalQuestions(
+  h: ReactModule['createElement'],
+  t: Translate,
+  approval: NonNullable<JobSummary['pendingApproval']>,
+  disabled: boolean,
+  respond: (choice: string) => void,
+) {
+  const questions = approval.questions ?? [];
+  return h(
+    'form',
+    {
+      key: approval.requestId,
+      className: 'dk-field',
+      onSubmit: (event: { preventDefault(): void; currentTarget: HTMLFormElement }) => {
+        event.preventDefault();
+        if (disabled) return;
+        const data = new FormData(event.currentTarget);
+        const answers = questions.map((_, index) => String(data.get(String(index)) ?? ''));
+        respond(JSON.stringify(answers));
+      },
+    },
+    ...questions.map((question, index) =>
+      h(
+        'label',
+        { key: index, className: 'dk-field' },
+        h('span', null, question.text),
+        question.options.length ? h('small', null, question.options.join(' · ')) : null,
+        h('input', {
+          name: String(index),
+          className: 'dk-input',
+          maxLength: 4000,
+          required: !question.allowEmpty,
+          disabled,
+          placeholder: question.multiSelect ? t('multipleAnswers') : undefined,
+        }),
+      ),
+    ),
+    h(
+      'div',
+      { style: { display: 'flex', gap: '6px' } },
+      h('button', { type: 'submit', className: 'dk-btn dk-btn-sm dk-btn-primary', disabled }, t('answerQuestions')),
+      h(
+        'button',
+        { type: 'button', className: 'dk-btn dk-btn-sm', disabled, onClick: () => respond('deny') },
+        t('dismissQuestions'),
+      ),
+    ),
+  );
+}
+
 function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: ChatPrimitives) {
   const h = React.createElement;
   const icons = makeIcons(React);
@@ -2166,23 +2227,31 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
               h(
                 'div',
                 { style: { display: 'flex', flexWrap: 'wrap', gap: '6px' } },
-                agent.supportsRespond !== false && approval.choices.length
-                  ? approval.choices.map((choice) =>
-                      h(
-                        'button',
-                        {
-                          key: choice,
-                          type: 'button',
-                          className: /deny|reject|no/i.test(choice)
-                            ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
-                            : 'dk-btn dk-btn-sm dk-btn-primary',
-                          disabled: acting,
-                          onClick: () => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
-                        },
-                        choice,
-                      ),
+                agent.supportsRespond !== false && approval.questions?.length
+                  ? renderApprovalQuestions(
+                      h,
+                      t,
+                      approval,
+                      acting,
+                      (choice) => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
                     )
-                  : h('div', { className: 'dk-muted' }, t('approveRemotely')),
+                  : agent.supportsRespond !== false && approval.choices.length
+                    ? approval.choices.map((choice) =>
+                        h(
+                          'button',
+                          {
+                            key: choice,
+                            type: 'button',
+                            className: /deny|reject|no/i.test(choice)
+                              ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
+                              : 'dk-btn dk-btn-sm dk-btn-primary',
+                            disabled: acting,
+                            onClick: () => void actOnJob('respond', job, { requestId: approval.requestId, choice }),
+                          },
+                          choice,
+                        ),
+                      )
+                    : h('div', { className: 'dk-muted' }, t('approveRemotely')),
               ),
             )
           : null,
@@ -2485,6 +2554,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
             form.encryptedOverlay,
             form.token,
             form.clearToken,
+            form.dshCwd,
           ])
         : '';
     const visibleCatalog = catalog?.key === catalogKey ? catalog : undefined;
@@ -2660,6 +2730,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
             encryptedOverlay: form.encryptedOverlay,
             token: form.token,
             clearToken: form.clearToken,
+            dshCwd: form.dshCwd.trim(),
           },
         );
         if (catalogRequest.current === revision) setCatalog({ key: catalogKey, providers });
@@ -2865,24 +2936,33 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                             { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
                             agents.find((a) => a.id === job.agentId)?.supportsRespond === false
                               ? h('span', { className: 'dk-muted' }, t('approveRemotely'))
-                              : (job.pendingApproval.choices.length
-                                  ? job.pendingApproval.choices
-                                  : ['approve', 'deny']
-                                ).map((choice) =>
-                                  h(
-                                    'button',
-                                    {
-                                      key: choice,
-                                      type: 'button',
-                                      className: /deny|reject|no/i.test(choice)
-                                        ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
-                                        : 'dk-btn dk-btn-sm dk-btn-primary',
-                                      onClick: () =>
-                                        void respondApproval(job.id, job.pendingApproval?.requestId ?? '', choice),
-                                    },
-                                    choice,
+                              : job.pendingApproval.questions?.length
+                                ? renderApprovalQuestions(
+                                    h,
+                                    t,
+                                    job.pendingApproval,
+                                    false,
+                                    (choice) =>
+                                      void respondApproval(job.id, job.pendingApproval?.requestId ?? '', choice),
+                                  )
+                                : (job.pendingApproval.choices.length
+                                    ? job.pendingApproval.choices
+                                    : ['approve', 'deny']
+                                  ).map((choice) =>
+                                    h(
+                                      'button',
+                                      {
+                                        key: choice,
+                                        type: 'button',
+                                        className: /deny|reject|no/i.test(choice)
+                                          ? 'dk-btn dk-btn-sm dk-btn-danger-armed'
+                                          : 'dk-btn dk-btn-sm dk-btn-primary',
+                                        onClick: () =>
+                                          void respondApproval(job.id, job.pendingApproval?.requestId ?? '', choice),
+                                      },
+                                      choice,
+                                    ),
                                   ),
-                                ),
                           ),
                         ),
                         h(

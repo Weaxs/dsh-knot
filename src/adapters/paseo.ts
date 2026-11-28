@@ -5,10 +5,42 @@ import { AsyncQueue } from '../async-queue.js';
 import { raceAbort, secret, shouldSkipRemoteCancel, urlHost } from '../config.js';
 import { requireSecureGateway } from '../policy/auth.js';
 import { redactText, toolInputPreview } from '../policy/redact.js';
-import type { AgentAdapter, AgentConfig, AgentEvent, AgentSession } from '../types.js';
+import type { AgentAdapter, AgentApprovalQuestion, AgentConfig, AgentEvent, AgentSession } from '../types.js';
 
 const OWNER_LABEL = 'dsh-knot';
 const MAX_ACTIVE_TURNS = 32;
+
+interface Permission {
+  actions: Map<string, 'allow' | 'deny'>;
+  questions: Array<AgentApprovalQuestion & { header: string }>;
+  defaultActions: boolean;
+  responding?: boolean;
+}
+
+function readQuestions(input: unknown): Permission['questions'] {
+  if (!input || typeof input !== 'object' || !('questions' in input) || !Array.isArray(input.questions)) return [];
+  return input.questions.slice(0, 20).flatMap((item: unknown) => {
+    if (!item || typeof item !== 'object' || !('question' in item) || typeof item.question !== 'string') return [];
+    return [
+      {
+        header: 'header' in item && typeof item.header === 'string' ? item.header : item.question,
+        text: item.question,
+        options:
+          'options' in item && Array.isArray(item.options)
+            ? item.options
+                .slice(0, 30)
+                .flatMap((option: unknown) =>
+                  option && typeof option === 'object' && 'label' in option && typeof option.label === 'string'
+                    ? [option.label]
+                    : [],
+                )
+            : [],
+        multiSelect: 'multiSelect' in item && item.multiSelect === true,
+        allowEmpty: 'allowEmpty' in item && item.allowEmpty === true,
+      },
+    ];
+  });
+}
 
 interface Turn {
   events: AsyncQueue<AgentEvent>;
@@ -17,13 +49,14 @@ interface Turn {
   submitted: boolean;
   finished: boolean;
   remoteId?: string;
-  permissions: Map<string, Map<string, 'allow' | 'deny'>>;
+  permissions: Map<string, Permission>;
 }
 
 export class PaseoAdapter implements AgentAdapter {
   readonly kind = 'paseo' as const;
   private readonly closing = new AbortController();
   private readonly turns = new Map<string, Turn>();
+  private readonly recoverableTurns = new Map<string, string>();
   private connection?: { daemon: DaemonClient; api: PaseoApi };
 
   constructor(
@@ -31,9 +64,9 @@ export class PaseoAdapter implements AgentAdapter {
     private readonly config: AgentConfig,
   ) {}
 
-  async listProviders(signal?: AbortSignal) {
+  async listProviders(signal?: AbortSignal, cwd?: string) {
     const { api } = await this.connect(signal);
-    const result = await raceAbort(api.providers.snapshot(), this.deadline(signal)).catch((error: unknown) => {
+    const result = await raceAbort(api.providers.snapshot({ cwd }), this.deadline(signal)).catch((error: unknown) => {
       throw this.failure(error);
     });
     return result.entries
@@ -42,7 +75,7 @@ export class PaseoAdapter implements AgentAdapter {
   }
 
   async health(signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const providers = await this.listProviders(signal);
+    const providers = await this.listProviders(signal, this.config.dshCwd);
     if (!providers.some((provider) => provider.id === this.config.paseoProvider)) {
       throw new Error('The configured provider is unavailable on this Paseo daemon');
     }
@@ -76,6 +109,7 @@ export class PaseoAdapter implements AgentAdapter {
     const id = sessionId ?? randomUUID();
     if (this.turns.has(id)) throw new Error('This Paseo session is already running a Knot turn');
     if (this.turns.size >= MAX_ACTIVE_TURNS) throw new Error('Too many active Paseo turns');
+    this.recoverableTurns.delete(id);
     const events = new AsyncQueue<AgentEvent>(1_024, 'error');
     let confirm!: () => void;
     let reject!: (error: Error) => void;
@@ -95,8 +129,18 @@ export class PaseoAdapter implements AgentAdapter {
     const finish = (error?: Error, confirmed = false, cancelled = false) => {
       if (turn.finished) return;
       turn.finished = true;
-      if (confirmed) confirm();
-      else reject(error ?? new Error('Paseo turn ended without confirmation'));
+      if (confirmed) {
+        confirm();
+      } else {
+        if (turn.remoteId && !this.closing.signal.aborted) {
+          this.recoverableTurns.set(id, turn.remoteId);
+          if (this.recoverableTurns.size > MAX_ACTIVE_TURNS) {
+            const oldest = this.recoverableTurns.keys().next().value;
+            if (oldest) this.recoverableTurns.delete(oldest);
+          }
+        }
+        reject(error ?? new Error('Paseo turn ended without confirmation'));
+      }
       if (error) events.fail(error);
       else {
         events.push({ type: 'final', stopReason: cancelled ? 'cancelled' : 'end_turn', sessionId: id });
@@ -172,12 +216,26 @@ export class PaseoAdapter implements AgentAdapter {
           }
           const request = event.request;
           const actions = new Map((request.actions ?? []).map((action) => [action.id, action.behavior]));
-          turn.permissions.set(request.id, actions);
+          const questions = request.kind === 'question' ? readQuestions(request.input) : [];
+          const defaultActions = !actions.size;
+          if (defaultActions && !questions.length) {
+            if (request.kind !== 'question') actions.set('approve', 'allow');
+            actions.set('deny', 'deny');
+          }
+          turn.permissions.set(request.id, { actions, questions, defaultActions });
           events.push({
             type: 'approval',
             requestId: request.id,
             text: request.title ?? request.name,
-            choices: [...actions.keys()],
+            choices: questions.length ? [] : [...actions.keys()],
+            questions: questions.length
+              ? questions.map(({ text, options, multiSelect, allowEmpty }) => ({
+                  text,
+                  options,
+                  multiSelect,
+                  allowEmpty,
+                }))
+              : undefined,
           });
           break;
         }
@@ -283,7 +341,10 @@ export class PaseoAdapter implements AgentAdapter {
 
   async cancel(id: string, signal?: AbortSignal): Promise<void> {
     const turn = this.turns.get(id);
-    if (!turn?.submitted) return;
+    if (!turn?.submitted) {
+      if (this.hasUnconfirmedTurn(id)) await this.recoverStop(id, signal);
+      return;
+    }
     const operation = this.deadline(signal);
     await raceAbort(Promise.race([turn.started, turn.terminal]), operation);
     const { daemon, api } = await this.connect(operation);
@@ -308,29 +369,102 @@ export class PaseoAdapter implements AgentAdapter {
     });
   }
 
-  async respond(id: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
-    const turn = this.turns.get(id);
-    const actions = turn?.permissions.get(requestId);
-    const behavior = actions?.get(choice);
-    if (!turn || !actions || !behavior) throw new Error('No matching Paseo permission');
-    const { daemon } = await this.connect(signal);
+  hasUnconfirmedTurn(id: string): boolean {
+    return this.recoverableTurns.has(id);
+  }
+
+  private async recoverStop(id: string, signal?: AbortSignal): Promise<void> {
+    const turnId = this.recoverableTurns.get(id);
+    if (!turnId) throw new Error('The original Paseo turn is no longer tracked');
     const operation = this.deadline(signal);
-    operation.throwIfAborted();
-    if (turn.permissions.get(requestId) !== actions) throw new Error('The Paseo permission is no longer pending');
-    turn.permissions.delete(requestId);
     try {
-      await raceAbort(
-        daemon.respondToPermissionAndWait(id, requestId, { behavior, selectedActionId: choice }),
-        operation,
-      );
+      const { daemon, api } = await this.connect(operation);
+      const agent = api.agents.ref(id);
+      const getAgent = async () => {
+        const snapshot = (await raceAbort(agent.refresh(), operation))?.agent;
+        if (!snapshot || !this.owns(snapshot) || (snapshot.status === 'running' && !snapshot.activeTurn)) {
+          throw new Error('Cannot verify the original Paseo session');
+        }
+        operation.throwIfAborted();
+        return snapshot;
+      };
+      const before = await getAgent();
+      if (this.recoverableTurns.get(id) !== turnId || this.turns.has(id)) {
+        throw new Error('The original Paseo turn is no longer tracked');
+      }
+      if (before.activeTurn?.turnId === turnId) {
+        await raceAbort(daemon.cancelAgent(id), operation);
+        const after = await getAgent();
+        if (after.activeTurn?.turnId === turnId) throw new Error('The original Paseo turn is still running');
+      }
+      this.recoverableTurns.delete(id);
     } catch (error) {
-      if (!operation.aborted && this.turns.get(id) === turn) turn.permissions.set(requestId, actions);
       throw this.failure(error);
     }
   }
 
+  async respond(id: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void> {
+    const turn = this.turns.get(id);
+    const permission = turn?.permissions.get(requestId);
+    if (!turn || !permission) throw new Error('No matching Paseo permission');
+    type Response = Parameters<DaemonClient['respondToPermissionAndWait']>[2];
+    let response: Response;
+    const behavior = permission.actions.get(choice);
+    if (permission.questions.length && choice !== 'deny') {
+      let answers: unknown;
+      try {
+        answers = JSON.parse(choice);
+      } catch {
+        throw new Error('Provide a JSON array of answers in question order');
+      }
+      const questions = permission.questions;
+      if (
+        !Array.isArray(answers) ||
+        answers.length !== questions.length ||
+        !answers.every(
+          (answer, index) =>
+            typeof answer === 'string' && answer.length <= 4_000 && (answer.trim() || questions[index]?.allowEmpty),
+        )
+      ) {
+        throw new Error('Provide one answer for each Paseo question');
+      }
+      response = {
+        behavior: 'allow',
+        updatedInput: {
+          answers: Object.fromEntries(questions.map((question, index) => [question.header, answers[index]])),
+        },
+      };
+    } else if (permission.questions.length && choice === 'deny') {
+      response = { behavior: 'deny' };
+    } else {
+      if (!behavior) throw new Error('No matching Paseo permission choice');
+      response = permission.defaultActions ? { behavior } : { behavior, selectedActionId: choice };
+    }
+    const { daemon } = await this.connect(signal);
+    const operation = this.deadline(signal);
+    operation.throwIfAborted();
+    if (turn.permissions.get(requestId) !== permission) throw new Error('The Paseo permission is no longer pending');
+    if (permission.responding) throw new Error('A response to this Paseo permission is already in progress');
+    permission.responding = true;
+    const submission = daemon
+      .respondToPermissionAndWait(id, requestId, response, this.config.connectTimeoutMs ?? 15_000)
+      .then(() => {
+        if (turn.permissions.get(requestId) === permission) {
+          turn.permissions.delete(requestId);
+          turn.events.push({ type: 'approval', phase: 'end', requestId });
+        }
+      })
+      .finally(() => {
+        permission.responding = false;
+      });
+    await raceAbort(submission, operation).catch((error: unknown) => {
+      throw this.failure(error);
+    });
+  }
+
   async close(): Promise<void> {
     this.closing.abort(new Error('Paseo adapter closed'));
+    this.recoverableTurns.clear();
     const connection = this.connection;
     this.connection = undefined;
     if (connection) {

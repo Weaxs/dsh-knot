@@ -309,7 +309,7 @@ describe('web UI host routes & schemastery Config', () => {
 
     const providers = vi
       .spyOn(PaseoAdapter.prototype, 'listProviders')
-      .mockResolvedValueOnce([{ id: 'hermes', label: 'Hermes' }]);
+      .mockResolvedValue([{ id: 'hermes', label: 'Hermes' }]);
     try {
       const catalog = await post(WEB_ROUTES.paseoProviders, {
         endpoint: 'wss://paseo.example/ws',
@@ -331,6 +331,16 @@ describe('web UI host routes & schemastery Config', () => {
         hasToken: true,
       });
       expect(JSON.stringify(paseo)).not.toContain('daemon-password');
+      await post(WEB_ROUTES.paseoProviders, {
+        id: 'paseo-agent',
+        endpoint: 'wss://paseo.example/ws',
+        encryptedOverlay: true,
+      });
+      expect(providers.mock.contexts.at(-1)).toEqual(
+        expect.objectContaining({
+          config: expect.objectContaining({ token: 'daemon-password', encryptedOverlay: undefined }),
+        }),
+      );
     } finally {
       providers.mockRestore();
     }

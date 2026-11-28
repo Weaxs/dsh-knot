@@ -54,6 +54,13 @@ export interface PluginConfig {
   jobTimeoutMs?: number;
 }
 
+export interface AgentApprovalQuestion {
+  text: string;
+  options: string[];
+  multiSelect?: boolean;
+  allowEmpty?: boolean;
+}
+
 export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
@@ -67,6 +74,7 @@ export interface AgentEvent {
   inputPreview?: string;
   requestId?: string;
   choices?: string[];
+  questions?: AgentApprovalQuestion[];
   stopReason?: string;
   sessionId?: string;
 }
@@ -104,6 +112,7 @@ export interface AgentAdapter {
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
+  hasUnconfirmedTurn?(sessionId: string): boolean;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;
@@ -171,5 +180,5 @@ export interface AgentJob {
   historyBaseline?: SessionHistoryBaseline;
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
-  pendingApproval?: { requestId: string; choices: string[]; text?: string };
+  pendingApproval?: { requestId: string; choices: string[]; questions?: AgentApprovalQuestion[]; text?: string };
 }

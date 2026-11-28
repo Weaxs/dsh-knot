@@ -352,6 +352,7 @@ export function registerWebRoutes(
       let adapter: PaseoAdapter | undefined;
       try {
         const body = await parseBody(request);
+        const cwd = typeof body.dshCwd === 'string' ? body.dshCwd.trim() || undefined : undefined;
         const existing = typeof body.id === 'string' ? manager.getConfig(body.id) : undefined;
         const candidate = normalizeConfig({
           agents: [
@@ -368,7 +369,7 @@ export function registerWebRoutes(
               port: body.port === undefined || body.port === '' ? undefined : Number(body.port),
               encryptedOverlay: body.encryptedOverlay === true,
               paseoProvider: 'catalog',
-              dshCwd: '/',
+              dshCwd: cwd ?? '/',
             },
           ],
         }).agents[0]!;
@@ -388,7 +389,7 @@ export function registerWebRoutes(
           candidate.encryptedOverlay = existing.encryptedOverlay;
         }
         adapter = new PaseoAdapter(candidate.id, candidate);
-        return jsonReply({ ok: true, value: { providers: await adapter.listProviders(request.signal) } });
+        return jsonReply({ ok: true, value: { providers: await adapter.listProviders(request.signal, cwd) } });
       } catch (error) {
         return errorReply(error instanceof Error ? error.message : String(error));
       } finally {

@@ -1,12 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PaseoAdapter } from '../src/adapters/paseo.js';
+import { AgentManager } from '../src/manager.js';
 
 const sdk = vi.hoisted(() => ({
   daemon: {
     connect: vi.fn(),
-    subscribeConnectionStatus: vi.fn(() => () => {}),
+    subscribeConnectionStatus: vi.fn(),
     createAgent: vi.fn(),
     cancelAgent: vi.fn(),
+    respondToPermissionAndWait: vi.fn(),
     close: vi.fn(),
   },
   agent: {
@@ -37,6 +39,7 @@ vi.mock('@getpaseo/client/internal/daemon-client', () => ({
 describe('Paseo adapter', () => {
   let adapter: PaseoAdapter;
   let emit: (update: unknown) => void;
+  let disconnect: () => void;
   const config = {
     id: 'agent',
     kind: 'paseo',
@@ -54,12 +57,16 @@ describe('Paseo adapter', () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
-    sdk.daemon.subscribeConnectionStatus.mockImplementation(() => () => {});
+    sdk.daemon.subscribeConnectionStatus.mockImplementation((listener) => {
+      disconnect = () => listener({ status: 'disconnected' });
+      return () => {};
+    });
     sdk.agent.timeline.subscribe.mockImplementation((listener) => {
       emit = (event) => listener({ event });
       return Object.assign(() => {}, { ready: Promise.resolve() });
     });
     sdk.agent.refresh.mockResolvedValue({ agent: idleAgent });
+    sdk.daemon.respondToPermissionAndWait.mockResolvedValue(undefined);
     adapter = new PaseoAdapter(config.id, config);
   });
 
@@ -144,6 +151,76 @@ describe('Paseo adapter', () => {
     } finally {
       await adapter.close();
       await stream.return?.();
+    }
+  });
+
+  it('resends an unanswered question after the caller cancels and the first send fails', async () => {
+    const stream = adapter.prompt(undefined, 'hello')[Symbol.asyncIterator]();
+    try {
+      const { value } = await stream.next();
+      sdk.agent.send.mockImplementation((_text, { messageId }) => {
+        emit({ type: 'timeline', turnId: 'ours', item: { type: 'user_message', clientMessageId: messageId } });
+        emit({
+          type: 'permission_requested',
+          request: {
+            id: 'question',
+            kind: 'question',
+            input: { questions: [{ header: 'Theme', question: 'Pick a theme', options: [{ label: 'Dark' }] }] },
+          },
+        });
+      });
+      await expect(stream.next()).resolves.toMatchObject({
+        value: { type: 'approval', choices: [], questions: [{ text: 'Pick a theme', options: ['Dark'] }] },
+      });
+      const controller = new AbortController();
+      let fail!: (error: Error) => void;
+      sdk.daemon.respondToPermissionAndWait.mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            fail = reject;
+            queueMicrotask(() => controller.abort(new Error('Caller cancelled')));
+          }),
+      );
+      await expect(adapter.respond(value.sessionId, 'question', '["Dark"]', controller.signal)).rejects.toThrow(
+        'Caller cancelled',
+      );
+      fail(new Error('No acknowledgement'));
+      await vi.waitFor(async () => {
+        await expect(adapter.respond(value.sessionId, 'question', '["Dark"]')).resolves.toBeUndefined();
+      });
+      expect(sdk.daemon.respondToPermissionAndWait).toHaveBeenLastCalledWith(
+        value.sessionId,
+        'question',
+        { behavior: 'allow', updatedInput: { answers: { Theme: 'Dark' } } },
+        15_000,
+      );
+      await expect(stream.next()).resolves.toMatchObject({ value: { type: 'approval', phase: 'end' } });
+      emit({ type: 'turn_completed', turnId: 'ours' });
+      await stream.next();
+    } finally {
+      await adapter.close();
+      await stream.return?.();
+    }
+  });
+
+  it.each([true, false])('recovers a disconnected job (original turn still active: %s)', async (stillActive) => {
+    const manager = new AgentManager([config], 5_000, () => adapter);
+    try {
+      sdk.agent.send.mockImplementation((_text, { messageId }) => {
+        emit({ type: 'timeline', turnId: 'ours', item: { type: 'user_message', clientMessageId: messageId } });
+        disconnect();
+      });
+      const job = manager.start(config.id, 'hello', undefined);
+      const failed = await manager.wait(job.id);
+      expect(failed).toMatchObject({ status: 'failed', remoteStop: 'unconfirmed' });
+      sdk.agent.refresh.mockResolvedValueOnce({
+        agent: { ...idleAgent, activeTurn: { turnId: stillActive ? 'ours' : 'newer' } },
+      });
+      const recovered = await manager.cancel(job.id);
+      expect(recovered.remoteStop).toBeUndefined();
+      expect(sdk.daemon.cancelAgent).toHaveBeenCalledTimes(stillActive ? 1 : 0);
+    } finally {
+      await manager.close();
     }
   });
 

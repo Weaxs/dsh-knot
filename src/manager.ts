@@ -569,6 +569,11 @@ export class AgentManager {
         owner.cancelling = raceAbort(
           (async () => {
             const recovering = !drain && owner.stopConfirmation === 'pending';
+            if (recovering && owner.adapter.hasUnconfirmedTurn?.(sessionId)) {
+              await owner.adapter.cancel(sessionId, stopSignal);
+              owner.stopConfirmation = 'received';
+              return;
+            }
             const originalPromptBusy = recovering && owner.adapter.isSessionBusy?.(sessionId);
             if (!recovering || originalPromptBusy) {
               await owner.adapter.cancel(sessionId, stopSignal);
@@ -782,7 +787,7 @@ export class AgentManager {
           const requestId = event.requestId ?? '';
           if (event.phase === 'end') this.removeApproval(job, requestId);
           else {
-            const pending = { requestId, choices: event.choices ?? [], text: event.text };
+            const pending = { requestId, choices: event.choices ?? [], questions: event.questions, text: event.text };
             const approvals = this.approvals.get(job) ?? new Map();
             if (!approvals.delete(requestId) && approvals.size >= MAX_JOB_APPROVALS) {
               approvalOverflow = true;
@@ -817,6 +822,11 @@ export class AgentManager {
     } catch (error) {
       job.status = controller.signal.aborted || job.status === 'cancelled' ? 'cancelled' : 'failed';
       job.error = error instanceof Error ? error.message : String(error);
+      if (job.sessionId && adapter.hasUnconfirmedTurn?.(job.sessionId) && this.isLatestSessionJob(job)) {
+        const owner = this.jobOwners.get(job.id);
+        if (owner) owner.stopConfirmation = 'pending';
+        job.remoteStop = 'unconfirmed';
+      }
     } finally {
       clearTimeout(timer);
       delete job.pendingApproval;
