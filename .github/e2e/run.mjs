@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
+import { raceAbort } from '../../dist/config.js';
 import { AgentManager } from '../../dist/manager.js';
 
 const mode = process.env.E2E_TRANSPORT ?? 'local';
@@ -53,7 +55,7 @@ async function verify(kind) {
   const startedAt = Date.now();
   try {
     console.log(`[e2e] ${label}/${kind}: health check`);
-    const deadline = Date.now() + 90_000;
+    const deadline = AbortSignal.timeout(120_000);
     let waitingReason = '';
     while (true) {
       try {
@@ -66,10 +68,26 @@ async function verify(kind) {
           /ETIMEDOUT|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|socket hang up|failed to connect|transport closed|connection closed|configured provider is unavailable|timed out|timeout/i.test(
             message,
           );
-        if ((!pairing && !transient) || Date.now() >= deadline) throw error;
+        if ((!pairing && !transient) || deadline.aborted) throw error;
         const reason = pairing ? 'waiting for OpenClaw device approval' : 'waiting for the transport to become ready';
         if (waitingReason !== reason) console.log(`[e2e] ${label}/${kind}: ${reason}`);
         waitingReason = reason;
+        if (config.kind === 'paseo' && /configured provider is unavailable/.test(message)) {
+          // The first ACP probe can fail before the isolated OpenClaw approver runs.
+          const daemon = new DaemonClient({
+            url: `ws://127.0.0.1:${config.port}/ws`,
+            password: config.token,
+            clientId: `dsh-knot-e2e-${randomUUID()}`,
+            clientType: 'cli',
+            reconnect: { enabled: false },
+          });
+          try {
+            await raceAbort(daemon.connect(), deadline);
+            await raceAbort(daemon.refreshProvidersSnapshot({ providers: [config.paseoProvider] }), deadline);
+          } finally {
+            await daemon.close();
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, 2_000));
       }
     }

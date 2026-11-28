@@ -24,7 +24,7 @@ project="dsh-knot-e2e-$mode-$target-$E2E_PROTOCOL"
 openclaw_client_dir=""
 paseo_test_dir=""
 paseo_test_pid=""
-files=(-f .github/e2e/compose.yml -f ".github/e2e/compose.$mode.yml")
+files=(-f "$root/.github/e2e/compose.yml" -f "$root/.github/e2e/compose.$mode.yml")
 compose=(docker compose -p "$project" "${files[@]}")
 
 cleanup() {
@@ -151,7 +151,12 @@ fi
 
 case "$target" in
   hermes)
-    acp_command=(docker compose -p "$project" "${files[@]}" exec -T hermes /opt/hermes/.venv/bin/hermes acp)
+    "${compose[@]}" exec -T --user hermes hermes sh -ec '
+      mkdir -p /tmp/knot-hermes
+      cp /tmp/knot-hermes-config.yaml /tmp/knot-hermes/config.yaml
+    '
+    acp_command=(docker compose -p "$project" "${files[@]}" exec -T --user hermes -w /tmp
+      -e HOME=/tmp/knot-hermes -e HERMES_HOME=/tmp/knot-hermes hermes /opt/hermes/.venv/bin/hermes acp)
     ;;
   openclaw)
     openclaw_client_dir="$(mktemp -d)"

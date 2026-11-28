@@ -945,7 +945,7 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   const callId = event.requestId ? normalizeToolCallId(event.requestId) : undefined;
   const index = callId
     ? tools.findIndex((tool) => tool.id === callId)
-    : event.phase === 'end'
+    : event.phase === 'end' || event.phase === 'interrupted'
       ? tools.findIndex((tool) => tool.status === 'running' && tool.name === (name || 'tool'))
       : -1;
   const previous = tools[index];

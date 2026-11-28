@@ -88,11 +88,6 @@ jobs:
             message="Model E2E credentials are not configured (OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL_NAME)."
             if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message Transport integration jobs will be skipped."; fi
           fi
-          if [[ "$model" == true && "$tailscale" != true ]]; then
-            message="TAILSCALE_AUTHKEY must be a reusable, ephemeral pre-auth key (tskey-auth-...). Tailscale jobs will be skipped."
-            if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" == tailscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
-          fi
-
           transport_filter="${{ inputs.transport || 'all' }}"
           target_filter="${{ inputs.target || 'all' }}"
           protocol_filter="${{ inputs.protocol || 'all' }}"
@@ -100,7 +95,6 @@ jobs:
           matrix='{"include":['
           for transport in local tailscale headscale; do
             if [[ "$transport_filter" != all && "$transport_filter" != "$transport" ]]; then continue; fi
-            if [[ "$transport" == tailscale && "$tailscale" != true ]]; then continue; fi
             for target in hermes openclaw dsh; do
               if [[ "$target_filter" != all && "$target_filter" != "$target" ]]; then continue; fi
               if [[ "$model" != true ]]; then continue; fi
@@ -108,6 +102,12 @@ jobs:
               for protocol in native paseo; do
                 if [[ "$target" == dsh && "$protocol" != native ]] || [[ "$target" != dsh && "$protocol" != paseo ]]; then continue; fi
                 if [[ "$protocol_filter" != all && "$protocol_filter" != "$protocol" ]]; then continue; fi
+                if [[ "$transport" == tailscale && "$tailscale" != true ]]; then
+                  message="TAILSCALE_AUTHKEY must be a reusable, ephemeral pre-auth key (tskey-auth-...)."
+                  if [[ "${{ github.event_name }}" == workflow_dispatch ]]; then echo "::error::$message"; exit 1; fi
+                  echo "::warning::$message Skipping $target Tailscale E2E."
+                  continue
+                fi
                 matrix+="{\"transport\":\"$transport\",\"target\":\"$target\",\"protocol\":\"$protocol\"},"
                 has_work=true
               done

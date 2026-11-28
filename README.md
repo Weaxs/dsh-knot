@@ -93,7 +93,7 @@ Then add the absolute repository directory through **Plugins → Add plugin** an
 2. Click **`+ Add Agent` / `+ 添加助手`**.
 3. Select **Paseo** or **Remote DSH** and enter the daemon or gateway address.
 4. For Paseo, enter the daemon password if required, click **Load providers**, select a provider, and enter a working directory on the Paseo host.
-5. Save the connection. The panel stores settings under `$DSH_HOME/knot/agents.json` with `0600` permissions.
+5. Save the connection. The panel stores settings in `$DSH_KNOT_STATE_DIR/agents.json` when set, otherwise in `$DSH_HOME/knot/agents.json` (default `~/.dsh/knot/agents.json`). The file has `0600` permissions.
 
 Saved entries for the retired direct Hermes, OpenClaw, and ACP kinds are skipped. Recreate them as Paseo connections.
 

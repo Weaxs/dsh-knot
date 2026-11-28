@@ -8,14 +8,14 @@ services:
     profiles: [hermes]
     dns: [223.5.5.5, 119.29.29.29]
     extra_hosts: ["${E2E_MODEL_HOST}:${E2E_MODEL_IP}"]
-    command: gateway run
+    command: ["sleep", "infinity"]
     environment:
       <<: *openai-environment
       TERMINAL_ENV: local
     volumes:
-      - ./generated/hermes-config.yaml:/opt/data/config.yaml
+      - ./generated/hermes-config.yaml:/tmp/knot-hermes-config.yaml:ro
     healthcheck:
-      test: ["CMD", "/opt/hermes/.venv/bin/hermes", "acp", "--check"]
+      test: ["CMD", "test", "-x", "/opt/hermes/.venv/bin/hermes"]
       interval: 5s
       timeout: 10s
       retries: 24

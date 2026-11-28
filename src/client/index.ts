@@ -3447,7 +3447,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                     {
                       type: 'button',
                       className: 'dk-btn',
-                      disabled: saving || (form.kind === 'paseo' && (!form.paseoProvider || !form.dshCwd.trim())),
+                      disabled: saving,
                       onClick: () => setForm(null),
                     },
                     t('cancelBtn'),

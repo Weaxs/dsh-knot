@@ -378,10 +378,15 @@ export function registerWebRoutes(
           existing.port === candidate.port &&
           Boolean(existing.tls) === Boolean(candidate.tls) &&
           existing.basePath === candidate.basePath;
-        candidate.token =
-          body.clearToken === true
-            ? ''
-            : (typeof body.token === 'string' ? body.token.trim() : '') || (sameEndpoint ? secret(existing) : '') || '';
+        const suppliedToken = typeof body.token === 'string' ? body.token.trim() : '';
+        if (body.clearToken === true) {
+          candidate.token = '';
+        } else if (suppliedToken || !sameEndpoint) {
+          candidate.token = suppliedToken;
+        } else {
+          candidate.token = secret(existing) ?? '';
+          candidate.encryptedOverlay = existing.encryptedOverlay;
+        }
         adapter = new PaseoAdapter(candidate.id, candidate);
         return jsonReply({ ok: true, value: { providers: await adapter.listProviders(request.signal) } });
       } catch (error) {

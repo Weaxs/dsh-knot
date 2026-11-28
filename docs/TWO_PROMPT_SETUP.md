@@ -129,7 +129,6 @@ Task steps:
      - Agent ID: `agent_id`
      - Protocol (`kind`): `protocol` (`dsh` or `paseo`)
      - Transport: `direct` for networked URLs (Tailscale/Headscale/WireGuard/LAN), or `local` for loopback.
-     - For Paseo, load providers and choose `paseo_provider` (`paseoProvider` in config). Set the working directory from `working_directory` (`dshCwd` in config).
      - Endpoint URL: clean `endpoint_url` with no credentials, query string, or fragment.
      - For HTTP or WS over a verified, authenticated encrypted private network, select the encrypted private network checkbox or set `encryptedOverlay: true` via `agent-save` or declarative configuration. For an ordinary LAN gateway carrying credentials, use HTTPS or WSS.
    - For network endpoints, handle credentials as follows.
@@ -142,6 +141,7 @@ Task steps:
      - **Env-only declarative config path (optional)**:
        - If I prefer not to store the token in the local state file (`$DSH_KNOT_STATE_DIR/agents.json` when `DSH_KNOT_STATE_DIR` is set in the active `dsh` process, otherwise `$DSH_HOME/knot/agents.json`, default `~/.dsh/knot/agents.json`), configure the agent declaratively in plugin settings with `tokenEnv` (for example `tokenEnv: DSH_KNOT_PASEO_PASSWORD`) and omit `token`, ensure that env var is present in the running `dsh` process environment, and reload/restart `dsh` for the declarative config to take effect (do not overwrite it with an empty-token save through Remote Agents).
        - **Important when switching an existing `agent_id` to `tokenEnv`**: entries already stored in the active `agents.json` state file (`agents`) override declarative plugin config entries with the same ID on reload, and previously deleted IDs (`deletedIds`) suppress them. Resolve the active state directory from the running `dsh` process (`DSH_KNOT_STATE_DIR` takes precedence over `DSH_HOME/knot` and `~/.dsh/knot`), then either choose a fresh `agent_id` or remove the matching entry from `agents` and `deletedIds` in that active `agents.json` before reloading `dsh`.
+   - For Paseo, set the daemon password first if required, then load providers and choose `paseo_provider` (`paseoProvider` in config). Set the working directory from `working_directory` (`dshCwd` in config).
    - Save or update the agent in **Remote Agents** (using the active `dsh` instance's Remote Agents state/API so it appears immediately in the **Remote Agents / 远端助手** panel, unless using the declarative `tokenEnv` path above).
 
 5. Run connection diagnostics:
