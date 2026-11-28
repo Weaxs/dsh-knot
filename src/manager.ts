@@ -481,6 +481,7 @@ export class AgentManager {
       delete job.remoteStop;
       this.remoteCancelled.add(id);
     } else {
+      owner.adapter.releaseUnconfirmedTurn?.(job.sessionId);
       job.remoteStop = 'unconfirmed-released';
     }
     job.updatedAt = Date.now();

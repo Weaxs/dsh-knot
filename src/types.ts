@@ -113,6 +113,7 @@ export interface AgentAdapter {
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
   hasUnconfirmedTurn?(sessionId: string): boolean;
+  releaseUnconfirmedTurn?(sessionId: string): void;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;

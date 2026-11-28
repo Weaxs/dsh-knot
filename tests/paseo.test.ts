@@ -224,6 +224,51 @@ describe('Paseo adapter', () => {
     }
   });
 
+  it('keeps the oldest turn recoverable at capacity and frees slots on stop or release', async () => {
+    const manager = new AgentManager([config], 5_000, () => adapter);
+    try {
+      sdk.agent.send.mockImplementation((_text, { messageId }) => {
+        emit({ type: 'timeline', turnId: messageId, item: { type: 'user_message', clientMessageId: messageId } });
+        disconnect();
+      });
+      const jobs = [];
+      for (let index = 0; index < 32; index++) {
+        const job = manager.start(config.id, 'hello', undefined);
+        jobs.push(await manager.wait(job.id));
+      }
+      expect(jobs.every((job) => job.remoteStop === 'unconfirmed')).toBe(true);
+
+      const overflow = manager.start(config.id, 'overflow', undefined);
+      await expect(manager.wait(overflow.id)).resolves.toMatchObject({
+        status: 'failed',
+        error: 'Too many active or unconfirmed Paseo turns',
+      });
+      expect(sdk.daemon.createAgent).toHaveBeenCalledTimes(32);
+
+      const [oldest, second] = jobs;
+      expect(oldest?.sessionId).toBeDefined();
+      expect(second?.sessionId).toBeDefined();
+      expect(adapter.hasUnconfirmedTurn(oldest!.sessionId!)).toBe(true);
+      const firstMessageId = sdk.agent.send.mock.calls[0]?.[1].messageId;
+      sdk.agent.refresh.mockResolvedValueOnce({ agent: { ...idleAgent, activeTurn: { turnId: firstMessageId } } });
+      const stopped = await manager.cancel(oldest!.id);
+      expect(stopped.remoteStop).toBeUndefined();
+      expect(sdk.daemon.cancelAgent).toHaveBeenCalledWith(oldest!.sessionId);
+
+      const released = manager.releaseUnconfirmedStop(second!.id);
+      expect(released.remoteStop).toBe('unconfirmed-released');
+      expect(adapter.hasUnconfirmedTurn(second!.sessionId!)).toBe(false);
+
+      for (let index = 0; index < 2; index++) {
+        const job = manager.start(config.id, 'new turn', undefined);
+        await expect(manager.wait(job.id)).resolves.toMatchObject({ remoteStop: 'unconfirmed' });
+      }
+      expect(sdk.daemon.createAgent).toHaveBeenCalledTimes(34);
+    } finally {
+      await manager.close();
+    }
+  });
+
   it('releases a message that the daemon accepts without starting a turn', async () => {
     adapter = new PaseoAdapter(config.id, { ...config, connectTimeoutMs: 50 });
     const stream = adapter.prompt(undefined, 'out-of-band command')[Symbol.asyncIterator]();

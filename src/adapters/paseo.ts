@@ -8,7 +8,7 @@ import { redactText, toolInputPreview } from '../policy/redact.js';
 import type { AgentAdapter, AgentApprovalQuestion, AgentConfig, AgentEvent, AgentSession } from '../types.js';
 
 const OWNER_LABEL = 'dsh-knot';
-const MAX_ACTIVE_TURNS = 32;
+const MAX_TRACKED_TURNS = 32;
 
 interface Permission {
   actions: Map<string, 'allow' | 'deny'>;
@@ -48,6 +48,7 @@ interface Turn {
   started: Promise<void>;
   submitted: boolean;
   finished: boolean;
+  confirmed?: boolean;
   remoteId?: string;
   permissions: Map<string, Permission>;
 }
@@ -108,8 +109,10 @@ export class PaseoAdapter implements AgentAdapter {
     const setup = this.deadline(operation);
     const id = sessionId ?? randomUUID();
     if (this.turns.has(id)) throw new Error('This Paseo session is already running a Knot turn');
-    if (this.turns.size >= MAX_ACTIVE_TURNS) throw new Error('Too many active Paseo turns');
-    this.recoverableTurns.delete(id);
+    if (this.hasUnconfirmedTurn(id)) throw new Error('Recover or release the previous Paseo turn first');
+    if (this.turns.size + this.recoverableTurns.size >= MAX_TRACKED_TURNS) {
+      throw new Error('Too many active or unconfirmed Paseo turns');
+    }
     const events = new AsyncQueue<AgentEvent>(1_024, 'error');
     let confirm!: () => void;
     let reject!: (error: Error) => void;
@@ -129,18 +132,9 @@ export class PaseoAdapter implements AgentAdapter {
     const finish = (error?: Error, confirmed = false, cancelled = false) => {
       if (turn.finished) return;
       turn.finished = true;
-      if (confirmed) {
-        confirm();
-      } else {
-        if (turn.remoteId && !this.closing.signal.aborted) {
-          this.recoverableTurns.set(id, turn.remoteId);
-          if (this.recoverableTurns.size > MAX_ACTIVE_TURNS) {
-            const oldest = this.recoverableTurns.keys().next().value;
-            if (oldest) this.recoverableTurns.delete(oldest);
-          }
-        }
-        reject(error ?? new Error('Paseo turn ended without confirmation'));
-      }
+      turn.confirmed = confirmed;
+      if (confirmed) confirm();
+      else reject(error ?? new Error('Paseo turn ended without confirmation'));
       if (error) events.fail(error);
       else {
         events.push({ type: 'final', stopReason: cancelled ? 'cancelled' : 'end_turn', sessionId: id });
@@ -305,6 +299,9 @@ export class PaseoAdapter implements AgentAdapter {
       const cleanup = () => {
         finish(new Error('Paseo turn observation ended'));
         this.turns.delete(id);
+        if (!turn.confirmed && turn.remoteId && !this.closing.signal.aborted) {
+          this.recoverableTurns.set(id, turn.remoteId);
+        }
         removeStatus();
         unsubscribe?.();
       };
@@ -371,6 +368,10 @@ export class PaseoAdapter implements AgentAdapter {
 
   hasUnconfirmedTurn(id: string): boolean {
     return this.recoverableTurns.has(id);
+  }
+
+  releaseUnconfirmedTurn(id: string): void {
+    this.recoverableTurns.delete(id);
   }
 
   private async recoverStop(id: string, signal?: AbortSignal): Promise<void> {
