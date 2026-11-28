@@ -1,6 +1,6 @@
 {
   "name": "@weaxs/dsh-knot",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Connect DeepSeek Harness to Paseo agents and remote dsh instances over private networks or loopback.",
   "type": "module",
   "main": "./dist/index.js",
