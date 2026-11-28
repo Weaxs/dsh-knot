@@ -51,6 +51,8 @@ No tools are enabled for the test task. Containers use AliDNS (`223.5.5.5`) and 
 
 If `OPENAI_BASE_URL` points to `127.0.0.1` or `localhost`, the generated container configuration rewrites the host to `host.docker.internal`. On Linux, Compose maps that name through `host-gateway`.
 
+Hermes starts its profile gateway inside the Compose container. Paseo launches Hermes ACP under the same user and profile. For OpenClaw, Paseo probes the provider from the configured working directory and refreshes that catalog after test-device approval.
+
 ## OpenClaw device approval
 
 - Local connections use OpenClaw's trusted loopback auto-approval behavior.

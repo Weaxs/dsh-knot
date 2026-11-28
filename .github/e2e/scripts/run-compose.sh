@@ -151,12 +151,15 @@ fi
 
 case "$target" in
   hermes)
-    "${compose[@]}" exec -T --user hermes hermes sh -ec '
-      mkdir -p /tmp/knot-hermes
-      cp /tmp/knot-hermes-config.yaml /tmp/knot-hermes/config.yaml
+    "${compose[@]}" exec -T --user root hermes sh -ec '
+      install -m 640 -o hermes -g hermes /tmp/knot-hermes-config.yaml /opt/data/config.yaml
+      if [ -d /opt/data/installs ]; then chown -R hermes:hermes /opt/data/installs; fi
     '
-    acp_command=(docker compose -p "$project" "${files[@]}" exec -T --user hermes -w /tmp
-      -e HOME=/tmp/knot-hermes -e HERMES_HOME=/tmp/knot-hermes hermes /opt/hermes/.venv/bin/hermes acp)
+    # The ACP process attaches to the profile gateway as the same OS user.
+    hermes_command=(docker compose -p "$project" "${files[@]}" exec -T --user hermes -w /tmp
+      -e HOME=/opt/data -e HERMES_HOME=/opt/data hermes /opt/hermes/.venv/bin/hermes)
+    "${hermes_command[@]}" gateway ensure
+    acp_command=("${hermes_command[@]}" acp)
     ;;
   openclaw)
     openclaw_client_dir="$(mktemp -d)"

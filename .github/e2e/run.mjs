@@ -57,18 +57,16 @@ async function verify(kind) {
     console.log(`[e2e] ${label}/${kind}: health check`);
     const deadline = AbortSignal.timeout(120_000);
     let waitingReason = '';
+    const transientError =
+      /ETIMEDOUT|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|socket hang up|failed to connect|transport closed|connection closed|configured provider is unavailable|timed out|timeout/i;
     while (true) {
       try {
-        await manager.adapter(config.id).health();
+        await manager.adapter(config.id).health(deadline);
         break;
       } catch (error) {
         const message = `${String(error?.message ?? error)} ${String(error?.data?.details ?? '')}`;
         const pairing = /pairing|not approved|not-paired/i.test(message);
-        const transient =
-          /ETIMEDOUT|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|socket hang up|failed to connect|transport closed|connection closed|configured provider is unavailable|timed out|timeout/i.test(
-            message,
-          );
-        if ((!pairing && !transient) || deadline.aborted) throw error;
+        if ((!pairing && !transientError.test(message)) || deadline.aborted) throw error;
         const reason = pairing ? 'waiting for OpenClaw device approval' : 'waiting for the transport to become ready';
         if (waitingReason !== reason) console.log(`[e2e] ${label}/${kind}: ${reason}`);
         waitingReason = reason;
@@ -87,6 +85,8 @@ async function verify(kind) {
               daemon.refreshProvidersSnapshot({ providers: [config.paseoProvider], cwd: config.dshCwd }),
               deadline,
             );
+          } catch (refreshError) {
+            if (deadline.aborted || !transientError.test(String(refreshError))) throw refreshError;
           } finally {
             await daemon.close();
           }
