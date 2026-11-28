@@ -7,7 +7,7 @@ class FakeAdapter implements AgentAdapter {
   cancelled = false;
   constructor(
     readonly id: string,
-    readonly kind: AgentAdapter['kind'] = 'hermes',
+    readonly kind: AgentAdapter['kind'] = 'dsh',
   ) {}
   async health() {
     return { ok: true };
@@ -30,7 +30,7 @@ class FakeAdapter implements AgentAdapter {
   async close() {}
 }
 
-const config: AgentConfig = { id: 'remote', kind: 'hermes', transport: 'local' };
+const config: AgentConfig = { id: 'remote', kind: 'dsh', transport: 'local' };
 
 class RunningAdapter extends FakeAdapter {
   override async *prompt(
@@ -203,9 +203,9 @@ describe('AgentManager', () => {
       }
     }
 
-    const adapter = new DisconnectedAdapter(config.id, 'acp');
+    const adapter = new DisconnectedAdapter(config.id, 'paseo');
     const cancel = vi.spyOn(adapter, 'cancel');
-    const manager = new AgentManager([{ ...config, kind: 'acp' }], 10_000, () => adapter);
+    const manager = new AgentManager([{ ...config, kind: 'paseo' }], 10_000, () => adapter);
     try {
       const job = manager.start(config.id, 'Hello', 'shared');
       await vi.waitFor(() => expect(disconnect).toBeTypeOf('function'));
@@ -237,54 +237,7 @@ describe('AgentManager', () => {
     }
   });
 
-  it('retains exact ACP stop recovery when a job times out before the terminal response', async () => {
-    let rejectTerminal!: (error: Error) => void;
-    const terminal = new Promise<unknown>((_, reject) => {
-      rejectTerminal = reject;
-    });
-    const recover = vi.fn(async () => {});
-    class TimedOutAdapter extends RunningAdapter {
-      private started = false;
-
-      override async *prompt(
-        session: string | undefined,
-        text?: string,
-        signal?: AbortSignal,
-      ): AsyncIterable<AgentEvent> {
-        this.started = true;
-        yield* super.prompt(session, text, signal);
-      }
-
-      isSessionBusy() {
-        return this.started && !this.cancelled;
-      }
-      promptTerminalForCancel() {
-        return terminal;
-      }
-      recoverPromptStopForCancel() {
-        return recover;
-      }
-      override async cancel() {
-        this.cancelled = true;
-        rejectTerminal(new Error('ACP connection closed'));
-      }
-    }
-    const adapter = new TimedOutAdapter(config.id, 'acp');
-    const manager = new AgentManager([{ ...config, kind: 'acp' }], 20, () => adapter);
-    try {
-      const job = manager.start(config.id, 'Hello', 'shared');
-      await manager.wait(job.id);
-      await vi.waitFor(() => expect(job.remoteStop).toBe('unconfirmed'));
-      expect(recover).not.toHaveBeenCalled();
-      await manager.cancel(job.id);
-      expect(recover).toHaveBeenCalledOnce();
-      expect(job.remoteStop).toBeUndefined();
-    } finally {
-      await manager.close();
-    }
-  });
-
-  it.each(['hermes', 'acp', 'openclaw'] as const)(
+  it.each(['dsh', 'paseo'] as const)(
     'keeps an exclusive %s session locked until a remote stop retry succeeds',
     async (kind) => {
       const adapter = new RunningAdapter(config.id, kind);
@@ -369,7 +322,7 @@ describe('AgentManager', () => {
     });
     class ApprovalAdapter extends FakeAdapter {
       override async *prompt(): AsyncIterable<AgentEvent> {
-        yield { type: 'text', text: 'part ' };
+        yield { type: 'text', text: 'part ', sessionId: 'remote-assigned-id' };
         yield { type: 'approval', requestId: 'r1', choices: ['once', 'deny'], text: 'Run bash?' };
         await finished;
         yield { type: 'final', text: 'part done' };
@@ -382,8 +335,8 @@ describe('AgentManager', () => {
       notified = true;
     });
     try {
-      expect(job.sessionId).toMatch(/^dsh_/);
       await vi.waitFor(() => expect(job.pendingApproval?.requestId).toBe('r1'));
+      expect(job.sessionId).toBe('remote-assigned-id');
       await expect(manager.respond(job.id, 'once', undefined, 'wrong-request')).rejects.toThrow(/no longer pending/);
       await expect(manager.respond(job.id, 'bogus-choice', undefined, 'r1')).rejects.toThrow(/Invalid approval choice/);
       await manager.respond(job.id, 'once', undefined, 'r1');
@@ -681,9 +634,9 @@ describe('AgentManager', () => {
 
   it('rejects an overlapping ACP job before overwriting session ownership so the active job remains cancellable', async () => {
     let cancelledSession: string | undefined;
-    const acpConfig: AgentConfig = { id: 'acp-remote', kind: 'acp', transport: 'local' };
-    class HangingAcpAdapter implements AgentAdapter {
-      readonly kind = 'acp' as const;
+    const acpConfig: AgentConfig = { id: 'acp-remote', kind: 'paseo', transport: 'local' };
+    class HangingPaseoAdapter implements AgentAdapter {
+      readonly kind = 'paseo' as const;
       constructor(readonly id: string) {}
       async health() {
         return { ok: true };
@@ -704,7 +657,7 @@ describe('AgentManager', () => {
       }
       async close() {}
     }
-    const manager = new AgentManager([acpConfig], 10_000, () => new HangingAcpAdapter('acp-remote'));
+    const manager = new AgentManager([acpConfig], 10_000, () => new HangingPaseoAdapter('acp-remote'));
     const first = manager.start('acp-remote', 'turn 1', undefined);
     await new Promise((r) => setTimeout(r, 10));
     expect(first.sessionId).toBe('acp-sess-1');
@@ -719,9 +672,9 @@ describe('AgentManager', () => {
     let cancelAttempts = 0;
     let releaseFirstCancel!: () => void;
     let releaseStreamCleanup!: () => void;
-    const acpConfig: AgentConfig = { id: 'acp-flaky', kind: 'acp', transport: 'local' };
-    class FlakyAcpAdapter implements AgentAdapter {
-      readonly kind = 'acp' as const;
+    const acpConfig: AgentConfig = { id: 'acp-flaky', kind: 'paseo', transport: 'local' };
+    class FlakyPaseoAdapter implements AgentAdapter {
+      readonly kind = 'paseo' as const;
       constructor(readonly id: string) {}
       async health() {
         return { ok: true };
@@ -755,7 +708,7 @@ describe('AgentManager', () => {
       }
       async close() {}
     }
-    const manager = new AgentManager([acpConfig], 10_000, () => new FlakyAcpAdapter('acp-flaky'));
+    const manager = new AgentManager([acpConfig], 10_000, () => new FlakyPaseoAdapter('acp-flaky'));
     const first = manager.start('acp-flaky', 'turn 1', undefined);
     await new Promise((r) => setTimeout(r, 10));
 
@@ -787,9 +740,9 @@ describe('AgentManager', () => {
 
   it('preserves cancel retry after failed timeout cancel and releases session locks when ACP agent config is replaced', async () => {
     let cancelCalls = 0;
-    const acpConfig: AgentConfig = { id: 'acp-reconfig', kind: 'acp', transport: 'local' };
+    const acpConfig: AgentConfig = { id: 'acp-reconfig', kind: 'paseo', transport: 'local' };
     class TimeoutCancelAdapter implements AgentAdapter {
-      readonly kind = 'acp' as const;
+      readonly kind = 'paseo' as const;
       constructor(readonly id: string) {}
       async health() {
         return { ok: true };
@@ -1130,7 +1083,7 @@ describe('AgentManager', () => {
         yield* super.prompt(_sessionId, text, signal);
       }
     }
-    const adapter = new NativeStopFailureAdapter(config.id, 'hermes');
+    const adapter = new NativeStopFailureAdapter(config.id, 'dsh');
     vi.spyOn(adapter, 'cancel').mockRejectedValueOnce(new Error('Hermes remote stop is unconfirmed: timeout'));
     const manager = new AgentManager([config], 10_000, () => adapter);
     try {

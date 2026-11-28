@@ -123,7 +123,12 @@ export function registerTools(ctx: Context, manager: AgentManager): void {
           required: true,
           description: 'The exact pendingApproval.requestId from agent_status.',
         },
-        choice: { type: 'string', required: true, description: 'The exact choice offered by the remote agent.' },
+        choice: {
+          type: 'string',
+          required: true,
+          description:
+            'The exact offered choice. For questions, use a JSON array of user-confirmed answer strings in question order, or deny to dismiss. Separate multiple selections with commas.',
+        },
       },
       output,
       async execute(args, exec) {

@@ -1,7 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 
 export type TransportKind = 'direct' | 'local';
-export type AgentKind = 'hermes' | 'openclaw' | 'dsh' | 'acp';
+export type AgentKind = 'dsh' | 'paseo';
 
 export interface AgentConfig {
   id: string;
@@ -14,15 +14,11 @@ export interface AgentConfig {
   basePath?: string;
   token?: string;
   tokenEnv?: string;
-  origin?: string;
   model?: string;
-  openclawAgentId?: string;
   dshProvider?: string;
   dshCwd?: string;
   reasoningEffort?: string;
-  acpTransport?: 'websocket' | 'stdio';
-  acpCommand?: string;
-  acpArgs?: string[];
+  paseoProvider?: string;
   connectTimeoutMs?: number;
 }
 
@@ -58,6 +54,13 @@ export interface PluginConfig {
   jobTimeoutMs?: number;
 }
 
+export interface AgentApprovalQuestion {
+  text: string;
+  options: string[];
+  multiSelect?: boolean;
+  allowEmpty?: boolean;
+}
+
 export interface AgentEvent {
   type: 'text' | 'thought' | 'tool' | 'approval' | 'final' | 'error';
   text?: string;
@@ -66,11 +69,12 @@ export interface AgentEvent {
   retractText?: string;
   name?: string;
   title?: string;
-  phase?: 'pending' | 'start' | 'end';
+  phase?: 'pending' | 'start' | 'end' | 'interrupted';
   failed?: boolean;
   inputPreview?: string;
   requestId?: string;
   choices?: string[];
+  questions?: AgentApprovalQuestion[];
   stopReason?: string;
   sessionId?: string;
 }
@@ -108,7 +112,8 @@ export interface AgentAdapter {
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
-  recoverPromptStopForCancel?(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined;
+  hasUnconfirmedTurn?(sessionId: string): boolean;
+  releaseUnconfirmedTurn?(sessionId: string): void;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;
@@ -176,5 +181,5 @@ export interface AgentJob {
   historyBaseline?: SessionHistoryBaseline;
   error?: string;
   remoteStop?: 'pending' | 'unconfirmed' | 'unconfirmed-released';
-  pendingApproval?: { requestId: string; choices: string[]; text?: string };
+  pendingApproval?: { requestId: string; choices: string[]; questions?: AgentApprovalQuestion[]; text?: string };
 }

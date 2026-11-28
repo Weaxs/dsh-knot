@@ -12,17 +12,6 @@ x-tailscale-service: &tailscale-service
     - /dev/net/tun
 
 services:
-  hermes-tailscale:
-    <<: *tailscale-service
-    profiles: [hermes]
-    network_mode: service:hermes
-    depends_on:
-      hermes:
-        condition: service_healthy
-    environment:
-      <<: *tailscale-environment
-      TS_HOSTNAME: hermes-e2e-${E2E_NODE_SUFFIX}
-
   openclaw-tailscale:
     <<: *tailscale-service
     profiles: [openclaw]

@@ -7,34 +7,33 @@
     <img src="https://github.com/Weaxs/dsh-knot/actions/workflows/ci.yml/badge.svg" alt="CI" />
   </a>
   <a href="https://github.com/Weaxs/dsh-knot/actions/workflows/e2e.yml">
-    <img src="https://github.com/Weaxs/dsh-knot/actions/workflows/e2e.yml/badge.svg" alt="18-Job E2E" />
+    <img src="https://github.com/Weaxs/dsh-knot/actions/workflows/e2e.yml/badge.svg" alt="Transport E2E" />
   </a>
   <a href="https://www.npmjs.com/package/@weaxs/dsh-knot">
     <img src="https://img.shields.io/npm/v/@weaxs/dsh-knot?color=4F7DF3&label=npm" alt="npm version" />
   </a>
   <img src="https://img.shields.io/badge/node-%3E%3D22.13-339933" alt="Node >= 22.13" />
-  <img src="https://img.shields.io/badge/protocol-ACP%20v1%20%2B%20MCP-6366F1" alt="ACP v1 + MCP" />
+  <img src="https://img.shields.io/badge/protocol-Paseo%20%2B%20MCP-6366F1" alt="Paseo + MCP" />
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" />
   </a>
 </p>
 
 <p align="center">
-  Connect <strong>DeepSeek Harness (dsh)</strong> directly with <strong>ACP v1 agents</strong>, <strong>Hermes</strong>, <strong>OpenClaw</strong>, and remote <strong>dsh</strong> instances on the same host or over a private network, with a built-in dsh Web UI and read-only MCP session sharing. <strong>No cloud relay, no broker, and no remote plugin required.</strong>
+  Connect <strong>DeepSeek Harness (dsh)</strong> directly with <strong>Paseo agents</strong>, including Hermes and OpenClaw, and remote <strong>dsh</strong> instances on the same host or over a private network, with a built-in dsh Web UI and read-only MCP session sharing.
 </p>
 
 ---
 
 ## Highlights
 
-| Capability                   | What you get                                                                                                                                                                                              |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Universal ACP v1**         | Connect to an ACP v1 WebSocket endpoint or launch a local NDJSON stdio agent.                                                                                                                             |
-| **Native Drivers**           | First-class native adapters for **Hermes** (`/v1/runs` + SSE), **OpenClaw** (Gateway WebSocket v4 + Ed25519 pairing), and **remote dsh** (`/api/session/*` RPC), plus the optional `dsh-knot-acp` bridge. |
-| **Built-in dsh Web UI**      | Chat with remote agents, browse sessions, review approvals, cancel jobs, test connections, and manage read-only MCP sharing.                                                                              |
-| **Zero-Config GUI Settings** | Exports a `@deepseek-ai/schemastery` Config schema so `dsh Settings → Plugins` renders a visual form automatically.                                                                                       |
-| **Read-Only MCP Export**     | Expose explicitly allow-listed local dsh sessions to remote agents on a separate loopback/tailnet port with deny-by-default access, constant-time bearer auth, and recursive secret redaction.            |
-| **Live E2E**                 | 18-job real model-backed E2E matrix across Local, Tailscale, and Headscale.                                                                                                                               |
+| Capability              | What you get                                                                                                      |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Paseo**               | Discover ready providers on a Paseo daemon. Paseo owns agent processes and provider compatibility.                |
+| **Remote DSH**          | Connect to the native `dsh web` RPC API.                                                                          |
+| **Built-in dsh Web UI** | Chat with remote agents, browse sessions, review approvals, cancel jobs, and manage read-only MCP sharing.        |
+| **Read-only MCP**       | Share explicitly allow-listed local dsh sessions on a separate authenticated listener.                            |
+| **Live E2E**            | Model-backed checks cover Hermes and OpenClaw via Paseo, and Remote DSH. See the [transport matrix](docs/E2E.md). |
 
 ---
 
@@ -48,7 +47,7 @@ When loaded in `dsh web`, **dsh-knot** registers the **Remote Agents / 远端助
 
 - **Approve or cancel in one click**: Remote approval prompts and active background jobs appear at the top of the panel.
 - **Inspect connections**: Run `knot_doctor` across all configured agents or expand per-agent gateway checks.
-- Click **Chat** on an assistant to open its conversation view. Expand **Thinking** or **Activity** when the agent reports reasoning or tool activity. Queue follow-up messages while a turn is running (queued turns execute in order after the current turn completes and can be removed before dispatch). Reopen a remote session to continue it. Hermes loads recent messages directly from its API server. To display reasoning from OpenClaw, enable reasoning visibility for the session. [OpenClaw reasoning settings](https://docs.openclaw.ai/tools/thinking#reasoning-visibility-reasoning)
+- Click **Chat** on an assistant to open its conversation view. Expand **Thinking** or **Activity** when the agent reports reasoning or tool activity. Queue follow-up messages while a turn is running (queued turns execute in order after the current turn completes and can be removed before dispatch). Reopen a listed remote session to continue it. The panel displays turns observed by Knot. To display reasoning from OpenClaw, enable reasoning visibility for the session. [OpenClaw reasoning settings](https://docs.openclaw.ai/tools/thinking#reasoning-visibility-reasoning)
 - **Control local sharing**: Toggle which local dsh sessions are visible over the separate read-only MCP listener.
 
 ---
@@ -92,69 +91,38 @@ Then add the absolute repository directory through **Plugins → Add plugin** an
 
 1. Open **Remote Agents / 远端助手** in the left sidebar of `dsh web`.
 2. Click **`+ Add Agent` / `+ 添加助手`**.
-3. Choose the protocol (**ACP v1**, **Hermes**, **OpenClaw**, or **Remote DSH**). Use **Direct / Tailscale** with the gateway's full endpoint URL, or **Local** for a gateway or ACP stdio agent on the dsh host. Enter the gateway token where required.
-4. Click **Save** to activate the agent and check connectivity. The panel stores settings under `$DSH_HOME/knot/agents.json` with `0600` permissions.
+3. Select **Paseo** or **Remote DSH** and enter the daemon or gateway address.
+4. For Paseo, enter a working directory and the daemon password if required, then click **Load providers** and select a provider. The directory must exist wherever the provider runs.
+5. Save the connection. The panel stores settings in `$DSH_KNOT_STATE_DIR/agents.json` when set, otherwise in `$DSH_HOME/knot/agents.json` (default `~/.dsh/knot/agents.json`). The file has `0600` permissions.
 
-### Hermes
+Saved entries for the retired direct Hermes, OpenClaw, and ACP kinds are skipped and dropped on the next state write. Recreate them as Paseo connections. Keep a copy of the original state file if you need to roll back to a version that uses the old connection kinds.
 
-Set these variables in the Hermes gateway service account's active profile `.env` (`~/.hermes/.env` for the default profile):
+### Paseo
 
-```dotenv
-API_SERVER_ENABLED=true
-API_SERVER_HOST=127.0.0.1
-API_SERVER_PORT=8642
-API_SERVER_KEY=<your-random-token>
-```
+Run a Paseo daemon on the machine that runs the agents. For a same-host setup, use `ws://127.0.0.1:6767/ws`. For a remote daemon, use an authenticated private WSS address or a verified encrypted private network. Install, enable, and authenticate providers in Paseo before loading the list in Knot. [Paseo setup](https://github.com/getpaseo/paseo/blob/v0.18.1/README.md) · [Paseo provider setup](https://github.com/getpaseo/paseo/blob/v0.18.1/public-docs/providers.md)
 
-Restart the gateway with `hermes gateway restart` for that account and profile. Set **Kind** to **Hermes** and use the same `API_SERVER_KEY` as the DSH Knot token. On the same host use `http://127.0.0.1:8642`. For help with profiles and services, see [Hermes API Server](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server).
+For Hermes, activate Paseo's bundled Hermes provider. For OpenClaw, add a custom ACP provider to Paseo that runs the official `openclaw acp` command. For a remote Gateway, add `--url` and `--token-file` to that provider's command in Paseo. [Paseo custom providers](https://github.com/getpaseo/paseo/blob/v0.18.1/docs/custom-providers.md) · [OpenClaw ACP setup](https://docs.openclaw.ai/cli/acp)
 
-Connection checks require the authenticated [Runs API capabilities](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server#v1-capabilities). Hermes history in DSH Knot lists sessions created through the API Server, which the Runs API can continue.
-
-### OpenClaw
-
-Run the authenticated OpenClaw Gateway on `127.0.0.1:18789` with `gateway.auth.mode` set to `token`. Set **Kind** to **OpenClaw** and use its gateway token. On the same host use `ws://127.0.0.1:18789`. If the first connection requires pairing, run `openclaw devices list` and `openclaw devices approve <requestId>` on the gateway host, then rerun the connection test. DSH Knot stores its device key under `$DSH_HOME/knot/devices` with `0600` permissions. See [OpenClaw gateway configuration](https://docs.openclaw.ai/gateway/config-gateway) and [device approval](https://docs.openclaw.ai/cli/devices).
-
-### Tailscale Serve
-
-Join the dsh device and both gateway hosts to the same tailnet, and enable HTTPS there. Keep each gateway listening on loopback.
-
-- **Hermes**: Run `tailscale serve --bg http://127.0.0.1:8642` on the Hermes host.
-- **OpenClaw**: Set `gateway.tailscale.mode` to `serve` in the OpenClaw configuration and restart the Gateway. For an existing external Serve route, follow [OpenClaw's proxy attribution requirements](https://docs.openclaw.ai/gateway/tailscale#externally-managed-serve-and-funnel).
-
-In Remote Agents, choose **Direct / Tailscale**, then paste each host's HTTPS URL and enter its gateway token. For ACP WebSocket endpoints, paste the full WebSocket URL (for example, `wss://agent.example-tailnet.ts.net/acp`). See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
-
-Tailscale's hosted service coordinates devices, which connect peer to peer when the network permits. Headscale offers self-hosted coordination. For direct HTTP or WebSocket access over Tailscale, Headscale, or WireGuard, verify that the endpoint is reached through the encrypted private network and select the encrypted private network checkbox in Remote Agents. See [Tailscale connection types](https://tailscale.com/docs/reference/connection-types) and [Headscale setup](https://headscale.net/stable/setup/requirements/).
-
-### Alternative: Declarative `cordis.patch.yml`
-
-If you prefer declarative configuration, add agents under `knot` in `cordis.patch.yml` (each agent can specify its own `token` or an optional `tokenEnv` fallback):
+### Declarative configuration
 
 ```yaml
 - id: knot
   name: "@weaxs/dsh-knot"
   config:
     agents:
-      - id: claude-local
-        kind: acp
+      - id: hermes-via-paseo
+        kind: paseo
         transport: local
-        acpTransport: stdio
-        acpCommand: /usr/local/bin/claude-code-acp
-      - id: hermes-gpu
-        kind: hermes
-        transport: direct
-        host: https://hermes-host.example-tailnet.ts.net
-        tokenEnv: HERMES_API_KEY
-      - id: claw-prod
-        kind: openclaw
-        transport: direct
-        host: https://claw-host.example-tailnet.ts.net
-        tokenEnv: OPENCLAW_GATEWAY_TOKEN
+        paseoProvider: hermes
+        dshCwd: /home/agent/work
       - id: dsh-remote
         kind: dsh
         transport: direct
         host: https://dsh-host.example-tailnet.ts.net
         tokenEnv: DSH_GATEWAY_TOKEN
 ```
+
+The Paseo configuration accepts a provider ID, an optional model override, and the daemon password via `token` or `tokenEnv` (default `DSH_KNOT_PASEO_PASSWORD`). The provider's own credentials and launch settings belong in Paseo.
 
 ### Verify with `knot_doctor`
 
@@ -225,11 +193,9 @@ mcp_servers:
 | Transport          | Best for                          | Notes                                                        |
 | ------------------ | --------------------------------- | ------------------------------------------------------------ |
 | `direct` (default) | Tailscale, Headscale, private LAN | Provide a full endpoint URL or a `host` and optional `port`. |
-| `local`            | Agents on the same machine        | Defaults to `127.0.0.1` and supports ACP stdio subprocesses. |
+| `local`            | Agents on the same machine        | Defaults to `127.0.0.1`.                                     |
 
 Credentialed connections require HTTPS or WSS outside loopback. For a verified encrypted overlay, select the encrypted private network checkbox in Remote Agents or set `encryptedOverlay: true` for the endpoint in `cordis.patch.yml`. If a saved HTTP or WebSocket connection is blocked after upgrading, edit its URL to use HTTPS or WSS, or select the checkbox after verifying the encrypted route. Ordinary private LANs require HTTPS or WSS.
-
-For `dsh-knot-acp`, the same rules apply to its connection to the native gateway. Set `DSH_KNOT_NATIVE_HOST` to an HTTPS or WSS URL, or set `DSH_KNOT_NATIVE_TLS=1` with a hostname. Use `DSH_KNOT_NATIVE_ENCRYPTED_OVERLAY=1` only for a verified encrypted private route to that gateway.
 
 ---
 

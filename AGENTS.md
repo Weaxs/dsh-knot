@@ -8,8 +8,8 @@
 
 ## Read by task
 
-- For **protocol, transport, job, or MCP changes**, read the matching sections of [DESIGN.md](docs/DESIGN.md). Adapters own protocol messages and emit normalized `AgentEvent`s. Transports own connectivity. Use the shared ACP v1 provider for compatible endpoints. The ACP bridge reuses native adapters through normalized events.
-- For **protocol verification**, exercise the affected transport. Use the [OpenClaw WebSocket tests](tests/gateway-ws.test.ts) for OpenClaw wire changes. Exercise both WebSocket and stdio in the [ACP tests](tests/acp.test.ts) when the change affects both.
+- For **protocol, transport, job, or MCP changes**, read the matching sections of [DESIGN.md](docs/DESIGN.md). Adapters own protocol messages and emit normalized `AgentEvent`s. Transports own connectivity. Use the Paseo SDK for daemon-managed providers.
+- For **protocol verification**, exercise the affected transport. Exercise the daemon connection, provider discovery, and live timeline when changing Paseo integration.
 - For **dsh host integration**, start with the [plugin entry](src/index.ts) and the affected host call, such as [model tool registration](src/tools.ts). Verify changed calls against installed `@deepseek-ai/*` types or matching host source, including `defineTool` and `sessionController` methods `list`, `events`, and `follow` as applicable.
 - For **native DSH authentication changes**, read the [native RPC contract](docs/DESIGN.md#remote-dsh). Exercise the launch-token exchange and the retry after a rejected API cookie.
 - For **Remote Agents UI**, read the [dashboard behavior](README.md#web-ui-dashboard), then trace the affected operation through the [client](src/client/index.ts) and [Web routes](src/web/routes.ts). Use the [job and transcript semantics](docs/DESIGN.md#jobs-and-model-tools) for chat state changes. Start with the [UI and route tests](tests/web-routes.test.ts) and exercise the changed interaction in `dsh web` when available.
@@ -24,7 +24,7 @@
 
 ## Guardrails
 
-- Keep connections direct and private. A relay, cloud broker, or mandatory remote plugin requires an explicit request. Preserve [credential transport](docs/DESIGN.md#transports) and [ACP bridge authentication](docs/DESIGN.md#acp-v1-provider-and-bridge).
+- Keep connections direct and private. A relay, cloud broker, or mandatory remote plugin requires an explicit request. Preserve [credential transport](docs/DESIGN.md#transports) and [Paseo session and cancellation semantics](docs/DESIGN.md#paseo-provider).
 - Keep MCP on a [separate, read-only listener](docs/DESIGN.md#reverse-mcp-endpoint). Fail closed on a missing bearer token, reject wildcard binds, and check the session allow-list before reading data. An empty list shares nothing. Use `verifyBearerToken` for constant-time comparison. Redact MCP payloads recursively before returning them, with circular-reference protection. Keep credentials, full remote configs, and session contents out of logs.
 - Surface structured gateway errors, partial output, and approval requests. Wait for the user's decision on remote approvals and scope pending permissions by session. Use documented fallbacks for the failures they cover. Limit ignored errors to best-effort cleanup and notification delivery, and explain those exceptions at the error handler.
 - Register dsh tools with `defineTool`. Preserve tool names and the single JSON text block unless changing the public contract deliberately. Forward `exec.signal` to tool-initiated network calls, waits, diagnostics, and cancellation. Keep `Agent.followup()` optional and best-effort. Use `ctx.effect()` to abort active jobs and release plugin resources on unload. Keep dsh host dependencies as peers.

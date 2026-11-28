@@ -23,19 +23,6 @@ services:
       - "28080:8080"
       - "3478:3478/udp"
 
-  hermes-tailscale:
-    <<: *headscale-client-service
-    profiles: [hermes]
-    network_mode: service:hermes
-    depends_on:
-      hermes:
-        condition: service_healthy
-    environment:
-      <<: *headscale-client-environment
-      TS_HOSTNAME: hermes-e2e-${E2E_NODE_SUFFIX}
-    volumes:
-      - hermes-tailscale-state:/var/lib/tailscale
-
   openclaw-tailscale:
     <<: *headscale-client-service
     profiles: [openclaw]
@@ -64,6 +51,5 @@ services:
 
 volumes:
   headscale-data:
-  hermes-tailscale-state:
   openclaw-tailscale-state:
   dsh-tailscale-state:

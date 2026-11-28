@@ -30,13 +30,13 @@
 
     <text x="80" y="38" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="38" font-weight="700" letter-spacing="-0.8">dsh-knot</text>
     <rect x="262" y="13" width="84" height="24" rx="12" fill="#4F7DF3" fill-opacity="0.18" stroke="#7C9BFF" stroke-opacity="0.45"/>
-    <text x="304" y="29" text-anchor="middle" fill="#A5BEFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600">ACP v1</text>
+    <text x="304" y="29" text-anchor="middle" fill="#A5BEFF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5" font-weight="600">Paseo</text>
 
     <text x="0" y="96" fill="#CBD5E1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="17">
       Direct multi-agent bridge for DeepSeek Harness — zero cloud relays.
     </text>
     <text x="0" y="124" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="14.5">
-      Hermes · OpenClaw · Remote DSH · Any ACP v1 Agent · Read-Only MCP · Built-in Web UI
+      Paseo Providers · Remote DSH · Read-Only MCP · Built-in Web UI
     </text>
 
     <!-- Bottom Feature Chips -->
@@ -51,7 +51,7 @@
       <text x="333" y="18" text-anchor="middle" fill="#E2E8F0">Read-Only MCP</text>
 
       <rect x="410" y="0" width="144" height="28" rx="7" fill="#FFFFFF" fill-opacity="0.06" stroke="#FFFFFF" stroke-opacity="0.12"/>
-      <text x="482" y="18" text-anchor="middle" fill="#E2E8F0">18-Job Live E2E</text>
+      <text x="482" y="18" text-anchor="middle" fill="#E2E8F0">Live Model E2E</text>
     </g>
   </g>
 
@@ -70,13 +70,13 @@
 
     <!-- Remote targets -->
     <rect x="212" y="8" width="136" height="38" rx="9" fill="#151D36" stroke="#FFFFFF" stroke-opacity="0.16"/>
-    <text x="280" y="31" text-anchor="middle" fill="#E2E8F0" font-size="12">ACP v1 Agents</text>
+    <text x="280" y="31" text-anchor="middle" fill="#E2E8F0" font-size="12">Paseo Daemon</text>
 
     <rect x="212" y="60" width="136" height="38" rx="9" fill="#151D36" stroke="#FFFFFF" stroke-opacity="0.16"/>
-    <text x="280" y="83" text-anchor="middle" fill="#E2E8F0" font-size="12">Hermes API</text>
+    <text x="280" y="83" text-anchor="middle" fill="#E2E8F0" font-size="12">Hermes via Paseo</text>
 
     <rect x="212" y="112" width="136" height="38" rx="9" fill="#151D36" stroke="#FFFFFF" stroke-opacity="0.16"/>
-    <text x="280" y="135" text-anchor="middle" fill="#E2E8F0" font-size="12">OpenClaw WS</text>
+    <text x="280" y="135" text-anchor="middle" fill="#E2E8F0" font-size="12">OpenClaw via Paseo</text>
 
     <rect x="212" y="164" width="136" height="38" rx="9" fill="#151D36" stroke="#C45FA0" stroke-opacity="0.45"/>
     <text x="280" y="187" text-anchor="middle" fill="#F1C2DF" font-size="12">Remote DSH</text>

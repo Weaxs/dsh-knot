@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { runDoctor } from '../src/doctor.js';
 import { apply } from '../src/index.js';
 import { AgentManager } from '../src/manager.js';
@@ -6,7 +9,7 @@ import { registerTools } from '../src/tools.js';
 import type { AgentAdapter, AgentConfig, AgentEvent } from '../src/types.js';
 
 class MockAdapter implements AgentAdapter {
-  readonly kind = 'hermes' as const;
+  readonly kind = 'dsh' as const;
   lastSignal?: AbortSignal;
   closed = false;
   constructor(readonly id: string) {}
@@ -40,8 +43,8 @@ describe('plugin entry, tools and doctor', () => {
     const ctx = {
       tools: { register: (tool: any) => registered.set(tool.name, tool) },
     } as any;
-    const config: AgentConfig = { id: 'local-hermes', kind: 'hermes', transport: 'local', port: 8642 };
-    const adapter = new MockAdapter('local-hermes');
+    const config: AgentConfig = { id: 'local-dsh', kind: 'dsh', transport: 'local', port: 18790 };
+    const adapter = new MockAdapter('local-dsh');
     const manager = new AgentManager([config], 10_000, () => adapter);
     registerTools(ctx, manager);
 
@@ -57,12 +60,12 @@ describe('plugin entry, tools and doctor', () => {
 
     const controller = new AbortController();
     const listResult = await registered.get('agent_list').execute({ health: true }, { signal: controller.signal });
-    expect(listResult.agents[0].health).toEqual({ ok: true, id: 'local-hermes' });
+    expect(listResult.agents[0].health).toEqual({ ok: true, id: 'local-dsh' });
     expect(adapter.lastSignal).toBe(controller.signal);
 
     const followups: unknown[] = [];
     const asked = await registered.get('agent_ask').execute(
-      { agent: 'local-hermes', task: 'hello', wait: true },
+      { agent: 'local-dsh', task: 'hello', wait: true },
       {
         signal: controller.signal,
         agent: { followup: (msg: unknown) => followups.push(msg) },
@@ -80,7 +83,7 @@ describe('plugin entry, tools and doctor', () => {
     expect(JSON.stringify(followups)).not.toContain('UI-only title');
     expect(JSON.stringify(followups)).not.toContain('UI-only thought');
 
-    const doctorResult = await runDoctor(manager, 'local-hermes', controller.signal);
+    const doctorResult = await runDoctor(manager, 'local-dsh', controller.signal);
     expect(doctorResult.agents[0]?.steps.every((step) => step.ok)).toBe(true);
   });
 
@@ -92,11 +95,27 @@ describe('plugin entry, tools and doctor', () => {
       effect: (fn: () => () => Promise<void>) => cleanups.push(fn()),
     } as any;
 
-    await apply(ctx, { agents: [{ id: 'a', kind: 'hermes', transport: 'local' }] });
-    expect(registered).toHaveLength(7);
-    expect(cleanups).toHaveLength(1);
-    await cleanups[0]!();
+    const stateDir = mkdtempSync(join(tmpdir(), 'dsh-knot-plugin-'));
+    vi.stubEnv('DSH_KNOT_STATE_DIR', stateDir);
+    writeFileSync(
+      join(stateDir, 'agents.json'),
+      JSON.stringify({
+        agents: [
+          { id: 'old-hermes', kind: 'hermes' },
+          { id: 'kept', kind: 'paseo', host: '127.0.0.1', paseoProvider: 'test', dshCwd: '/work' },
+        ],
+      }),
+    );
+    try {
+      await apply(ctx, { agents: [{ id: 'a', kind: 'dsh', transport: 'local' }] });
+      expect(registered).toHaveLength(7);
+      expect(cleanups).toHaveLength(1);
+      await cleanups[0]!();
 
-    await expect(apply(ctx, { mcp: { enabled: true, token: 'tok' } })).rejects.toThrow(/sessionController/);
+      await expect(apply(ctx, { mcp: { enabled: true, token: 'tok' } })).rejects.toThrow(/sessionController/);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });

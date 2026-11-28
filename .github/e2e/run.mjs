@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { DaemonClient } from '@getpaseo/client/internal/daemon-client';
+import { raceAbort } from '../../dist/config.js';
 import { AgentManager } from '../../dist/manager.js';
 
 const mode = process.env.E2E_TRANSPORT ?? 'local';
@@ -14,64 +16,81 @@ for (const name of ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL_NAME']) {
   if (!process.env[name]) throw new Error(`${name} is required for real model-backed E2E tests`);
 }
 
-function agentConfig(kind) {
-  const upper = kind.toUpperCase();
-  const transport = mode;
-  const host = process.env[`${upper}_HOST`] ?? '127.0.0.1';
-  if (protocol === 'acp') {
+function agentConfig(target) {
+  if (target !== 'dsh') {
+    if (!process.env.E2E_PASEO_PORT || !process.env.E2E_PASEO_PROVIDER || !process.env.E2E_PASEO_CWD) {
+      throw new Error('A test Paseo daemon must be configured by run-compose.sh');
+    }
     return {
-      id: `acp-${kind}-${label}`,
-      kind: 'acp',
-      transport,
-      host,
-      encryptedOverlay,
-      port: 18792,
-      token: 'e2e-acp-token',
-      dshCwd: '/tmp',
+      id: `${target}-${label}`,
+      kind: 'paseo',
+      transport: 'local',
+      port: Number(process.env.E2E_PASEO_PORT),
+      token: process.env.E2E_PASEO_PASSWORD,
+      paseoProvider: process.env.E2E_PASEO_PROVIDER,
+      dshCwd: process.env.E2E_PASEO_CWD,
       connectTimeoutMs: 30_000,
     };
   }
   return {
-    id: `${kind}-${label}`,
-    kind,
-    transport,
-    host,
+    id: `dsh-${label}`,
+    kind: 'dsh',
+    transport: mode,
+    host: process.env.DSH_HOST ?? '127.0.0.1',
+    port: Number(process.env.DSH_PORT ?? 18790),
     encryptedOverlay,
-    port: Number(process.env[`${upper}_PORT`] ?? (kind === 'hermes' ? 8642 : kind === 'openclaw' ? 18789 : 18790)),
-    token:
-      process.env[
-        kind === 'hermes' ? 'HERMES_API_KEY' : kind === 'openclaw' ? 'OPENCLAW_GATEWAY_TOKEN' : 'DSH_GATEWAY_TOKEN'
-      ],
-    ...(kind === 'openclaw' ? { origin: 'http://127.0.0.1:18789', openclawAgentId: 'main' } : {}),
-    ...(kind === 'dsh'
-      ? { model: process.env.OPENAI_MODEL_NAME, dshProvider: 'openai', dshCwd: '/tmp', reasoningEffort: 'low' }
-      : {}),
+    token: process.env.DSH_GATEWAY_TOKEN,
+    model: process.env.OPENAI_MODEL_NAME,
+    dshProvider: 'openai',
+    dshCwd: '/tmp',
+    reasoningEffort: 'low',
     connectTimeoutMs: 30_000,
   };
 }
 
 async function verify(kind) {
   const config = agentConfig(kind);
-  const manager = new AgentManager([config], timeoutMs);
+  let manager = new AgentManager([config], timeoutMs);
   const marker = `AL-${randomUUID().slice(0, 8).toUpperCase()}`;
   const startedAt = Date.now();
   try {
     console.log(`[e2e] ${label}/${kind}: health check`);
-    const deadline = Date.now() + 90_000;
+    const deadline = AbortSignal.timeout(120_000);
     let waitingReason = '';
+    const transientError =
+      /ETIMEDOUT|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|socket hang up|failed to connect|transport closed|connection closed|configured provider is unavailable|timed out|timeout/i;
     while (true) {
       try {
-        await manager.adapter(config.id).health();
+        await manager.adapter(config.id).health(deadline);
         break;
       } catch (error) {
         const message = `${String(error?.message ?? error)} ${String(error?.data?.details ?? '')}`;
         const pairing = /pairing|not approved|not-paired/i.test(message);
-        const transient =
-          /ETIMEDOUT|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|socket hang up|timed out|timeout/i.test(message);
-        if ((!pairing && !transient) || Date.now() >= deadline) throw error;
+        if ((!pairing && !transientError.test(message)) || deadline.aborted) throw error;
         const reason = pairing ? 'waiting for OpenClaw device approval' : 'waiting for the transport to become ready';
         if (waitingReason !== reason) console.log(`[e2e] ${label}/${kind}: ${reason}`);
         waitingReason = reason;
+        if (config.kind === 'paseo' && /configured provider is unavailable/.test(message)) {
+          // The first ACP probe can fail before the isolated OpenClaw approver runs.
+          const daemon = new DaemonClient({
+            url: `ws://127.0.0.1:${config.port}/ws`,
+            password: config.token,
+            clientId: `dsh-knot-e2e-${randomUUID()}`,
+            clientType: 'cli',
+            reconnect: { enabled: false },
+          });
+          try {
+            await raceAbort(daemon.connect(), deadline);
+            await raceAbort(
+              daemon.refreshProvidersSnapshot({ providers: [config.paseoProvider], cwd: config.dshCwd }),
+              deadline,
+            );
+          } catch (refreshError) {
+            if (deadline.aborted || !transientError.test(String(refreshError))) throw refreshError;
+          } finally {
+            await daemon.close();
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, 2_000));
       }
     }
@@ -84,20 +103,24 @@ async function verify(kind) {
     const firstResult = await manager.wait(first.id);
     assertCompleted(firstResult, marker, 'initial task');
 
+    const sessions = await manager.adapter(config.id).listSessions();
+    if (config.kind === 'paseo' && !sessions.some((session) => session.id === firstResult.sessionId)) {
+      throw new Error(`${kind} did not list the Paseo session created by the test`);
+    }
+    await manager.close();
+    manager = new AgentManager([config], timeoutMs);
     const second = manager.start(
       config.id,
       `Repeat the token I asked you to remember. Reply with only that token and no other text. Do not call any tools.`,
-      first.sessionId,
+      firstResult.sessionId,
     );
     const secondResult = await manager.wait(second.id);
-    assertCompleted(secondResult, marker, 'same-session continuation');
-
-    const sessions = await manager.adapter(config.id).listSessions();
-    if (kind === 'hermes' && !sessions.some((session) => session.id === firstResult.sessionId)) {
-      throw new Error('Hermes did not list the API session created by the test');
+    assertCompleted(secondResult, marker, 'same-session continuation after reconnect');
+    if (secondResult.sessionId !== firstResult.sessionId) {
+      throw new Error(`${kind} did not reopen the original session`);
     }
     console.log(`[e2e] ${label}/${kind}: ${sessions.length} visible session(s) after the task`);
-    console.log(`E2E_PASS ${label}/${kind} session=${first.sessionId} elapsedMs=${Date.now() - startedAt}`);
+    console.log(`E2E_PASS ${label}/${kind} session=${firstResult.sessionId} elapsedMs=${Date.now() - startedAt}`);
   } finally {
     await manager.close();
   }
@@ -113,7 +136,7 @@ function assertCompleted(job, marker, stage) {
 }
 
 const failures = [];
-const targets = (process.env.E2E_TARGET ?? 'hermes,openclaw').split(',').filter(Boolean);
+const targets = (process.env.E2E_TARGET ?? 'dsh').split(',').filter(Boolean);
 for (const kind of targets) {
   try {
     await verify(kind);

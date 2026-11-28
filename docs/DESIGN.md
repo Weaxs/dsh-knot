@@ -1,33 +1,18 @@
 # DSH Knot design
 
-The real model-backed E2E matrix covers native and ACP v1 paths across 18 network, target, and protocol combinations.
-
 ## Goals
 
-1. Let a dsh session run tasks on remote Hermes, OpenClaw, and dsh agents, continue those sessions, stream results, answer approvals where supported, and cancel work.
-2. Let remote agents read and watch explicitly shared local dsh sessions through MCP.
-3. Avoid third-party relays and avoid installing adapters on every remote harness.
-4. Keep protocol details behind adapters and network details behind transports.
-
-The current release intentionally does not write to local dsh sessions through MCP, mirror complete sessions, provide a cloud relay, or perform WebRTC NAT traversal.
+1. Let a dsh session run and continue tasks on Paseo agents and on remote dsh.
+2. Stream output, surface remote approvals, and cancel the owned turn.
+3. Let remote agents read and watch explicitly shared local dsh sessions through a separate MCP listener.
+4. Keep private connectivity and protocol handling behind adapters.
 
 ## Layers
 
 ```text
-┌──────────────────────── local dsh ────────────────────────┐
-│ dsh-knot                                                  │
-│  adapters/    ACP provider + native compatibility drivers │
-│  transports/  direct (default), local                   │
-│  tools/       agent_list / agent_ask / agent_continue / … │
-│  manager      jobs, output, cancellation, notifications   │
-│  mcp/         read-only session export                    │
-│  policy/      allow-list, bearer authentication, redaction│
-└────────────┬────────────────────────────────▲─────────────┘
-             │ forward: dsh → Agent            │ reverse: Agent → dsh MCP
-     ┌───────▼────────┐                ┌───────┴─────────┐
-     │ Hermes API     │                │ OpenClaw Gateway│
-     │ Server         │                │ WebSocket       │
-     └────────────────┘                └─────────────────┘
+dsh tools / Remote Agents → AgentManager → Paseo SDK → Paseo daemon → registered provider
+                                        → DshAdapter        → dsh web HTTP RPC
+remote agent              → read-only MCP listener           → shared local dsh sessions
 ```
 
 Adapters own message semantics. Transports own connectivity. Neither layer contains the other layer's configuration or protocol assumptions.
@@ -39,7 +24,7 @@ Adapters own message semantics. Transports own connectivity. Neither layer conta
 ```ts
 interface AgentAdapter {
   id: string;
-  kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
+  kind: 'dsh' | 'paseo';
   health(signal?): Promise<Record<string, unknown>>;
   listSessions(signal?): Promise<AgentSession[]>;
   getSessionMessages?(sessionId: string, signal?): Promise<AgentTranscriptMessage[]>;
@@ -52,48 +37,13 @@ interface AgentAdapter {
 
 `AgentEvent` normalizes reply text, streamed thought text, tool activity, approvals, final results, and errors. The Remote Agents chat displays bounded thought text and, when a gateway reports tool input, a bounded, redacted preview. Model tools receive reply text, tool names, and status.
 
-### ACP v1 provider and bridge
+### Paseo provider
 
-The `acp` kind is the single provider for ACP-compatible endpoints. The official TypeScript SDK negotiates stable protocol v1 and carries JSON-RPC messages over WebSocket or standard NDJSON stdio for local subprocesses. Session aliases are mapped to the actual ACP `sessionId`, so subsequent prompts continue the same conversation. The client uses the SDK's `ActiveSession` plus one event queue to preserve update/stop ordering without losing permission events to abandoned race waiters.
+Knot connects directly to an authenticated Paseo daemon with `@getpaseo/client`. The provider list comes from the daemon's live catalog. Paseo owns provider configuration, executable launch, session persistence, and harness-specific behavior. Knot creates labeled agents and treats their Paseo agent IDs as session IDs. Only active, non-archived agents with the connection's label and provider appear in the session list.
 
-The optional `dsh-knot-acp` bridge exposes `initialize`, `session/new`, `session/list`, `session/prompt`, `session/cancel`, `session/update`, and `session/request_permission` over WebSocket or `DSH_KNOT_ACP_STDIO=1` stdio mode. Each bridge connection constructs a native adapter for Hermes, OpenClaw, or remote DSH and translates only that adapter's normalized events. A native ACP endpoint bypasses the bridge entirely. Non-loopback bridge listeners require `DSH_KNOT_ACP_TOKEN`; native gateway credentials and ACP bearer tokens remain separate.
+Knot subscribes to live timeline events before sending a prompt. It matches the user-message ID to the submitted prompt, follows the accepted turn's output, and treats its terminal event as confirmation. Permission responses use the daemon's acknowledgements. For stop, Knot checks the live agent and original turn ID before calling the daemon's cancel operation. Disconnect before terminal confirmation leaves the remote stop unconfirmed. Knot retains the original turn ID so Stop can reconnect and check that turn again. Active turns and unconfirmed stops share a 32-turn limit per connection. Confirming a stop or explicitly releasing the local session frees a slot. Paseo questions are answered with the daemon's structured approval response. Use Knot to drive turns on agents created by Knot. Paseo 0.18.1 exposes an agent-level stop and accepts new messages by agent ID, so a concurrent send from another Paseo client can race Knot's turn check.
 
-For Hermes, dsh-knot peers negotiate interim retraction so they can stream text immediately and correct it when a commentary marker arrives. Other ACP clients receive text at classification boundaries to keep commentary out of the answer channel. If unclassified text exceeds 2,000,000 characters, the bridge discards that buffer, attempts to stop the run, and reports the limit error. If the stop is unconfirmed, the same connection must retry `session/cancel` successfully before sending another prompt to that session.
-
-The Hermes WebSocket bridge also negotiates stop recovery. It associates an opaque prompt ID with the exact native run ID in a bounded registry shared across its connections. On retry after the original request is gone, the bridge acknowledges a stop only after that run reaches a terminal state. Older peers, missing runs, and bridge restarts can leave the stop unconfirmed. Once the local prompt and stop request have ended, an explicit local release can unlock and reclaim any exclusive job (ACP or native) while preserving the unconfirmed remote status.
-
-ACP v2, A2A, and additional UI transports are intentionally outside the current scope.
-
-### Hermes
-
-The adapter uses the native API Server:
-
-- `POST /v1/runs` with `{ input, session_id, model? }` and an `Idempotency-Key`.
-- `GET /v1/runs/{id}/events` for Server-Sent Events.
-- `GET /v1/runs/{id}` as a terminal-status fallback.
-- `POST /v1/runs/{id}/approval` for approval responses.
-- `POST /v1/runs/{id}/stop` for cancellation.
-- Authenticated `GET /v1/capabilities` and `GET /health` for readiness.
-- `GET /api/sessions?source=api_server` for resumable history.
-- `GET /api/sessions/{id}/messages?inline_images=false` for the recent text transcript in Remote Agents.
-
-Authentication uses `Authorization: Bearer …`, read from `token` or `tokenEnv` (default `HERMES_API_KEY`). The token is not logged.
-
-### OpenClaw
-
-The adapter opens a Gateway WebSocket with subprotocol `json`, negotiates protocol version 4, waits for `connect.challenge`, and sends a `connect` request containing:
-
-- the `cli` client descriptor with `cli` mode, operator role, and the actual host platform,
-- operator role and scopes,
-- the gateway token,
-- a persistent Ed25519 device identity and a signature over the v2 claim,
-- the server nonce and the challenge's `ts` as `device.signedAt`.
-
-Device keys live under `$DSH_HOME/knot/devices` with mode `0600`. The device ID is the SHA-256 hash of the public key's raw x coordinate. The signing format is isolated in `openclaw-identity.ts` so upstream protocol changes have one review point.
-
-After pairing, the adapter uses `health`, `sessions.list`, `agent`, repeated `agent.wait` calls while a run is pending, and `sessions.abort` with the session `key`. RPC envelopes use `{ type: 'req', id, method, params }`, responses use `type: 'res'`, and streamed agent updates use `type: 'event'`. Reverse requests receive an explicit unsupported-method error instead of hanging.
-
-OpenClaw protocol behavior still needs validation against every target deployment version. `knot_doctor` is the first compatibility check.
+The pinned SDK's package root provides the catalog, agent handles, and timeline subscription. The adapter uses the same SDK's low-level client for create with a daemon-selected default model, acknowledgement of permission responses, and cancellation.
 
 ### Remote DSH
 
@@ -111,7 +61,7 @@ Remote deployments should keep the native listener on loopback behind a private 
 
 ### Local
 
-`local` uses `127.0.0.1` as the default host and also supports ACP stdio subprocesses.
+`local` uses `127.0.0.1` as the default host for both Paseo and Remote DSH.
 
 Both transports check the endpoint before sending gateway credentials. Outside loopback, HTTPS or WSS is required unless `encryptedOverlay: true` declares a verified, authenticated encrypted private route for that endpoint. Existing blocked entries remain editable. The [transport guide](../README.md#transports) covers setup and migration.
 
@@ -164,7 +114,7 @@ The current release has no `dsh_session_post` tool. Adding write access later re
 
 ## Validation and milestones
 
-Implemented checks cover configuration, redaction, Hermes API/SSE normalization, OpenClaw pairing over a real WebSocket, device identity persistence, native DSH Session RPC, ACP prompt/continuation/tool/permission/cancel flows over the official WebSocket transport and a real NDJSON stdio subprocess, job lifecycle, HTTP transport, and MCP authorization/read/watch behavior. The transport matrix requires real model-backed initial tasks and same-session continuations for Hermes, OpenClaw, and remote DSH over Local, Tailscale, and Headscale.
+Tests exercise provider discovery and configuration in the panel, job lifecycle, Remote DSH RPC, and MCP access. The [model-backed matrix](E2E.md) uses a real Paseo daemon for Hermes and OpenClaw.
 
 Remaining deployment milestones:
 
@@ -174,9 +124,7 @@ Remaining deployment milestones:
 
 ## Repository references
 
-- [Agent Client Protocol](https://agentclientprotocol.com)
-- [Official ACP TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk)
-- [Hermes programmatic integration](https://hermes-agent.nousresearch.com/docs/developer-guide/programmatic-integration)
-- [ODSH-Bridge OpenClaw pairing reference](https://github.com/Mikoribbit/odsh-bridge)
-- [OpenClaw Gateway handshake](https://docs.openclaw.ai/gateway/protocol/handshake)
+- [Paseo TypeScript SDK](https://github.com/getpaseo/paseo/blob/v0.18.1/public-docs/sdk/index.md)
+- [Hermes ACP](https://hermes-agent.nousresearch.com/docs/user-guide/features/acp)
+- [OpenClaw ACP](https://docs.openclaw.ai/cli/acp)
 - [Transport integration test infrastructure](E2E.md)
