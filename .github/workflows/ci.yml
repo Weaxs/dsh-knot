@@ -22,8 +22,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: Version sync
-        run: node scripts/sync-version.mjs --check "v$(node -p 'require("./package.json").version')"
+      - name: Verify the source package version
+        run: node scripts/sync-version.mjs --check v0.1.0
       - name: Biome
         run: npm run lint
       - name: TypeScript

@@ -31,8 +31,16 @@ jobs:
           node-version: 24
           cache: npm
           registry-url: https://registry.npmjs.org
-      - name: Verify tag matches package version
-        run: node scripts/sync-version.mjs --check "$RELEASE_TAG"
+      - name: Set package version from the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "::error::Expected a release tag in the form v<version>."
+            exit 1
+          fi
+          npm run release -- "${RELEASE_TAG#v}"
+          node scripts/sync-version.mjs --check "$RELEASE_TAG"
       - run: npm ci
       - run: npm run check
       - name: Publish scoped and unscoped packages
