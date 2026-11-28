@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '@deepseek-ai/cordis';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PaseoAdapter } from '../src/adapters/paseo.js';
 import * as plugin from '../src/index.js';
 
 import { apply, Config } from '../src/index.js';
@@ -24,7 +25,7 @@ import type {
 import { registerWebRoutes, WEB_ROUTES } from '../src/web/routes.js';
 
 class StubAdapter implements AgentAdapter {
-  readonly kind = 'hermes' as const;
+  readonly kind = 'dsh' as const;
   responded?: string;
   cancelled = false;
   constructor(readonly id: string) {}
@@ -82,13 +83,13 @@ describe('web UI host routes & schemastery Config', () => {
     expect(parsed.agents).toEqual([]);
     expect(parsed.jobTimeoutMs).toBe(1_800_000);
     expect(parsed.mcp?.enabled).toBe(false);
-    expect(Config({ agents: [{ id: 'overlay', kind: 'hermes', encryptedOverlay: true }] }).agents?.[0]).toMatchObject({
+    expect(Config({ agents: [{ id: 'overlay', kind: 'dsh', encryptedOverlay: true }] }).agents?.[0]).toMatchObject({
       encryptedOverlay: true,
     });
   });
 
   it('serves state, doctor, sessions, respond, cancel, and live mcp-share toggles', async () => {
-    const config: AgentConfig = { id: 'hermes-local', kind: 'hermes', transport: 'local', port: 8642 };
+    const config: AgentConfig = { id: 'hermes-local', kind: 'dsh', transport: 'local', port: 8642 };
     const adapter = new StubAdapter('hermes-local');
     const manager = new AgentManager([config], 10_000, () => adapter);
     mcp = new McpServer({ port: 0, token: 'secret-tok', allowSessions: [] }, sessionsController);
@@ -283,12 +284,12 @@ describe('web UI host routes & schemastery Config', () => {
 
     const saved = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'direct',
       host: '100.64.0.2',
       tls: true,
       token: 'per-agent-secret-token',
-      acpArgs: ['--flag'],
+      dshCwd: '/work',
     });
     expect(saved.ok).toBe(true);
     expect(saved.value.agents.map((a: any) => [a.id, a.hasToken, a.tls])).toContainEqual(['hermes-second', true, true]);
@@ -297,19 +298,47 @@ describe('web UI host routes & schemastery Config', () => {
     // Editing without changing token or advanced fields preserves both
     const edited = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'direct',
       model: 'deepseek-chat',
     });
     expect(edited.ok).toBe(true);
     expect(manager.getConfig('hermes-second')?.token).toBe('per-agent-secret-token');
     expect(manager.getConfig('hermes-second')?.tls).toBe(true);
-    expect(manager.getConfig('hermes-second')?.acpArgs).toEqual(['--flag']);
+    expect(manager.getConfig('hermes-second')?.dshCwd).toBe('/work');
+
+    const providers = vi
+      .spyOn(PaseoAdapter.prototype, 'listProviders')
+      .mockResolvedValueOnce([{ id: 'hermes', label: 'Hermes' }]);
+    try {
+      const catalog = await post(WEB_ROUTES.paseoProviders, {
+        endpoint: 'wss://paseo.example/ws',
+        token: 'daemon-password',
+      });
+      expect(catalog).toEqual({ ok: true, value: { providers: [{ id: 'hermes', label: 'Hermes' }] } });
+      const paseo = await post(WEB_ROUTES.agentSave, {
+        id: 'paseo-agent',
+        kind: 'paseo',
+        endpoint: 'wss://paseo.example/ws',
+        paseoProvider: 'hermes',
+        dshCwd: '/work',
+        token: 'daemon-password',
+      });
+      expect(paseo.value.agents.find((entry: { id: string }) => entry.id === 'paseo-agent')).toMatchObject({
+        kind: 'paseo',
+        paseoProvider: 'hermes',
+        dshCwd: '/work',
+        hasToken: true,
+      });
+      expect(JSON.stringify(paseo)).not.toContain('daemon-password');
+    } finally {
+      providers.mockRestore();
+    }
 
     const overlayId = 'hermes-overlay';
     const overlaySaved = await post(WEB_ROUTES.agentSave, {
       id: overlayId,
-      kind: 'hermes',
+      kind: 'dsh',
       endpoint: 'http://100.64.0.3:8642',
       token: 'overlay-gateway-token',
       encryptedOverlay: true,
@@ -338,11 +367,11 @@ describe('web UI host routes & schemastery Config', () => {
       token: 'new-gateway-token',
     });
 
-    vi.stubEnv('HERMES_API_KEY', 'ambient-secret');
+    vi.stubEnv('DSH_GATEWAY_TOKEN', 'ambient-secret');
     // Switching gateways clears the saved token and suppresses the ambient fallback.
     const cleared = await post(WEB_ROUTES.agentSave, {
       id: 'hermes-second',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'local',
     });
     expect(cleared.ok).toBe(true);
@@ -360,8 +389,8 @@ describe('web UI host routes & schemastery Config', () => {
 
     // Concurrent saves preserve both agents without clobbering each other
     const [s1, s2] = await Promise.all([
-      post(WEB_ROUTES.agentSave, { id: 'concurrent-a', kind: 'hermes', transport: 'local' }),
-      post(WEB_ROUTES.agentSave, { id: 'concurrent-b', kind: 'hermes', transport: 'local' }),
+      post(WEB_ROUTES.agentSave, { id: 'concurrent-a', kind: 'dsh', transport: 'local' }),
+      post(WEB_ROUTES.agentSave, { id: 'concurrent-b', kind: 'dsh', transport: 'local' }),
     ]);
     expect(s1.ok).toBe(true);
     expect(s2.ok).toBe(true);
@@ -372,13 +401,13 @@ describe('web UI host routes & schemastery Config', () => {
     // An endpoint URL owns the port, including when switching from an older HTTP endpoint.
     const oldEndpoint = await post(WEB_ROUTES.agentSave, {
       id: 'aws-tailscale',
-      kind: 'hermes',
+      kind: 'dsh',
       endpoint: 'http://aws-box.tail1234.ts.net:8642/legacy',
     });
     expect(oldEndpoint.ok).toBe(true);
     const tsSaved = await post(WEB_ROUTES.agentSave, {
       id: 'aws-tailscale',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'direct',
       endpoint: 'https://aws-box.tail1234.ts.net/hermes',
       port: 8642,
@@ -394,7 +423,7 @@ describe('web UI host routes & schemastery Config', () => {
 
     const openclaw = await post(WEB_ROUTES.agentSave, {
       id: 'openclaw',
-      kind: 'openclaw',
+      kind: 'dsh',
       endpoint: 'https://claw.tailnet.ts.net',
       token: 'claw-test-secret',
     });
@@ -484,7 +513,7 @@ describe('web UI host routes & schemastery Config', () => {
         yield { type: 'text', text: `${marker} after.` };
       }
     }
-    const config: AgentConfig = { id: 'split-output', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'split-output', kind: 'dsh', transport: 'local' };
     const manager = new AgentManager([config], 10_000, () => new SplitOutputAdapter(config.id));
     const routes = new Map<string, (req: Request) => Promise<Response>>();
     const ctx = {
@@ -581,7 +610,7 @@ describe('web UI host routes & schemastery Config', () => {
         yield { type: 'text', text: 'VisibleAnswer' };
       }
     }
-    const config: AgentConfig = { id: 'truncated-output', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'truncated-output', kind: 'dsh', transport: 'local' };
     const manager = new AgentManager([config], 10_000, () => new TruncatedOutputAdapter(config.id));
     const routes = new Map<string, (req: Request) => Promise<Response>>();
     registerWebRoutes(
@@ -676,7 +705,7 @@ describe('web UI host routes & schemastery Config', () => {
         yield { type: 'final', text: 'done' };
       }
     }
-    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'history', kind: 'dsh', transport: 'local' };
     const manager = new AgentManager([config], 10_000, () => new HistoryAdapter(config.id));
     const routes = new Map<string, (req: Request) => Promise<Response>>();
     const ctx = {
@@ -725,7 +754,7 @@ describe('web UI host routes & schemastery Config', () => {
     const history = new Promise<AgentTranscriptMessage[]>((resolve) => {
       releaseHistory = resolve;
     });
-    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'history', kind: 'dsh', transport: 'local' };
     const adapter = new StubAdapter(config.id);
     vi.spyOn(adapter, 'getSessionMessages').mockReturnValue(history);
     const prompt = vi.spyOn(adapter, 'prompt');
@@ -759,7 +788,7 @@ describe('web UI host routes & schemastery Config', () => {
         yield { type: 'final', text: 'done' };
       }
     }
-    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'history', kind: 'dsh', transport: 'local' };
     const adapter = new ConcurrentAdapter(config.id);
     const manager = new AgentManager([config], 10_000, () => adapter);
     try {
@@ -804,7 +833,7 @@ describe('web UI host routes & schemastery Config', () => {
         yield { type: 'final', stopReason: 'cancelled' };
       }
     }
-    const config: AgentConfig = { id: 'history', kind: 'hermes', transport: 'local' };
+    const config: AgentConfig = { id: 'history', kind: 'dsh', transport: 'local' };
     const adapter = new ConcurrentAdapter(config.id);
     const manager = new AgentManager([config], 10_000, () => adapter);
     try {
@@ -829,7 +858,7 @@ describe('web UI host routes & schemastery Config', () => {
   it('bounds hanging sessions requests and records failedStep on doctor errors', async () => {
     const hangingAdapter: AgentAdapter = {
       id: 'slow-hermes',
-      kind: 'hermes',
+      kind: 'dsh',
       async health() {
         throw new Error('socket hang up');
       },
@@ -843,7 +872,7 @@ describe('web UI host routes & schemastery Config', () => {
       async close() {},
     };
     const manager = new AgentManager(
-      [{ id: 'slow-hermes', kind: 'hermes', transport: 'local', port: 8642, connectTimeoutMs: 120 }],
+      [{ id: 'slow-hermes', kind: 'dsh', transport: 'local', port: 8642, connectTimeoutMs: 120 }],
       10_000,
       () => hangingAdapter,
     );
@@ -894,7 +923,7 @@ describe('web UI host routes & schemastery Config', () => {
     await manager.close();
   });
 
-  it.each(['acp', 'hermes'] as const)(
+  it.each(['paseo', 'dsh'] as const)(
     'releases an unconfirmed %s stop locally through the cancel route',
     async (kind) => {
       const cancel = vi.fn(async () => {
@@ -1205,7 +1234,7 @@ describe('web UI host routes & schemastery Config', () => {
     };
     let localJob: typeof currentJob | undefined;
     let localJobSubmitted = false;
-    let fixtureAgentKind: AgentConfig['kind'] = 'hermes';
+    let fixtureAgentKind: AgentConfig['kind'] = 'dsh';
     let localReleaseRequests = 0;
     let confirmedStopJobReads = 0;
     let queueHistory: Promise<AgentTranscriptMessage[]> | undefined;
@@ -1262,13 +1291,16 @@ describe('web UI host routes & schemastery Config', () => {
                   host: '127.0.0.1',
                   port: 8642,
                   supportsRespond: true,
-                  supportsSessionMessages: fixtureAgentKind === 'hermes',
+                  supportsSessionMessages: fixtureAgentKind === 'dsh',
                   connection: { status: 'connected' },
                 },
               ],
               jobs: [currentJob, ...(localJob && localJobSubmitted ? [localJob] : []), ...settledJobs],
               mcp: { enabled: false, address: null, allowSessions: [], localSessions: [] },
             });
+          }
+          if (path === WEB_ROUTES.paseoProviders) {
+            return ok({ providers: [{ id: 'hermes', label: 'Hermes' }] });
           }
           if (path === WEB_ROUTES.sessions) {
             return ok({
@@ -1278,8 +1310,8 @@ describe('web UI host routes & schemastery Config', () => {
                 { id: 'sess-3', title: 'Live session 3' },
                 { id: 'sess-4', title: 'Live session 4' },
                 { id: 'sess-5', title: 'Live session 5' },
-                { id: 'sess-release', title: 'Unconfirmed ACP session' },
-                { id: 'sess-stop', title: 'Externally stopped ACP session' },
+                { id: 'sess-release', title: 'Unconfirmed Paseo session' },
+                { id: 'sess-stop', title: 'Externally stopped Paseo session' },
                 { id: 'sess-hermes-release', title: 'Unconfirmed Hermes session' },
                 { id: 'sess-queue', title: 'Queued chat session' },
               ],
@@ -1376,9 +1408,9 @@ describe('web UI host routes & schemastery Config', () => {
         'http://LOCALHOST:8642',
         'http://127.7.8.9:8642',
         '127.7.8.9:8642',
-        'ws://[::1]:18792/acp',
+        'ws://[::1]:6767/ws',
         '0:0:0:0:0:0:0:1',
-        'ws://[::ffff:127.7.8.9]:18792/acp',
+        'ws://[::ffff:127.7.8.9]:6767/ws',
       ]) {
         enterEndpoint(address);
         expect(overlayInput(await flush()), address).toBeUndefined();
@@ -1393,7 +1425,11 @@ describe('web UI host routes & schemastery Config', () => {
       enterEndpoint('http://192.0.2.5:8642');
       expect(overlayInput(await flush())?.props.checked).toBe(false);
       enterEndpoint('https://my-vm.tailnet.ts.net');
-      expect(overlayInput(await flush())).toBeUndefined();
+      const readyForm = await flush();
+      expect(overlayInput(readyForm)).toBeUndefined();
+      (findButton(readyForm, '读取 provider')!.props.onClick as () => void)();
+      const providerForm = await flush();
+      expect(findNode(providerForm, (node) => node.type === 'option' && node.props.value === 'hermes')).toBeDefined();
       const close = findNode(dialog, (vnode) => vnode.props['aria-label'] === '关闭')!;
       (close.props.onClick as () => void)();
       dashboard = await flush();
@@ -1812,7 +1848,7 @@ describe('web UI host routes & schemastery Config', () => {
       expect(nextTexts.indexOf('partial prompt')).toBeLessThan(nextTexts.indexOf('partial reply'));
       expect(nextTexts.indexOf('partial reply')).toBeLessThan(nextTexts.indexOf('latest remote prompt'));
 
-      fixtureAgentKind = 'acp';
+      fixtureAgentKind = 'paseo';
       currentJob = {
         id: 'release-job',
         agentId: 'hermes-remote',
@@ -1825,7 +1861,7 @@ describe('web UI host routes & schemastery Config', () => {
         text: '',
       };
       const beforeRelease = await flush();
-      (findButton(beforeRelease, 'Unconfirmed ACP session')!.props.onClick as () => void)();
+      (findButton(beforeRelease, 'Unconfirmed Paseo session')!.props.onClick as () => void)();
       const unconfirmed = await flush();
       expect(localReleaseRequests).toBe(0);
       expect(findButton(unconfirmed, '停止')).toBeDefined();
@@ -1852,7 +1888,7 @@ describe('web UI host routes & schemastery Config', () => {
         remoteStop: 'unconfirmed',
         updatedAt: currentJob.updatedAt + 1,
       };
-      (findButton(await flush(), 'Externally stopped ACP session')!.props.onClick as () => void)();
+      (findButton(await flush(), 'Externally stopped Paseo session')!.props.onClick as () => void)();
       const externalUnconfirmed = await flush();
       const externalInput = findNode(externalUnconfirmed, (vnode) => vnode.type === 'textarea')!;
       (externalInput.props.onInput as (event: { target: { value: string } }) => void)({
@@ -1866,13 +1902,13 @@ describe('web UI host routes & schemastery Config', () => {
       expect(collectText(confirmed)).toContain('已停止');
       expect(collectText(confirmed)).not.toContain('尚未确认远端任务已停止');
       expect(findButton(confirmed, '释放本地会话')).toBeUndefined();
-      expect(findButton(confirmed, 'Externally stopped ACP session')?.props['aria-current']).toBe('true');
+      expect(findButton(confirmed, 'Externally stopped Paseo session')?.props['aria-current']).toBe('true');
       expect(sendButton(confirmed)?.props.disabled).toBe(false);
       expect(confirmedStopJobReads).toBe(0);
       expect(localReleaseRequests).toBe(1);
 
       // Native Hermes also offers local release when remote stop is unconfirmed
-      fixtureAgentKind = 'hermes';
+      fixtureAgentKind = 'dsh';
       transcriptBySession.set('sess-hermes-release', []);
       currentJob = {
         id: 'hermes-release-job',

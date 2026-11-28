@@ -36,18 +36,18 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
     throw new ConfigError(`invalid agent id: ${String(agent.id)}`);
   if (ids.has(agent.id)) throw new ConfigError(`duplicate agent id: ${agent.id}`);
   ids.add(agent.id);
-  if (!['hermes', 'openclaw', 'dsh', 'acp'].includes(agent.kind))
-    throw new ConfigError(`${agent.id}: kind must be hermes, openclaw, dsh, or acp`);
+  if (!['dsh', 'paseo'].includes(agent.kind)) throw new ConfigError(`${agent.id}: kind must be dsh or paseo`);
   const transport = agent.transport ?? 'direct';
   if (transport !== 'direct' && transport !== 'local') throw new ConfigError(`${agent.id}: invalid transport`);
   if (agent.encryptedOverlay !== undefined && typeof agent.encryptedOverlay !== 'boolean') {
     throw new ConfigError(`${agent.id}: encryptedOverlay must be a boolean`);
   }
-  if (agent.acpTransport === 'stdio') {
-    if (agent.kind !== 'acp') throw new ConfigError(`${agent.id}: acpTransport requires kind acp`);
-    if (transport !== 'local') throw new ConfigError(`${agent.id}: ACP stdio requires local transport`);
-    if (typeof agent.acpCommand !== 'string' || !agent.acpCommand.trim()) {
-      throw new ConfigError(`${agent.id}: ACP stdio requires acpCommand`);
+  if (agent.kind === 'paseo') {
+    if (typeof agent.paseoProvider !== 'string' || !agent.paseoProvider.trim()) {
+      throw new ConfigError(`${agent.id}: Paseo requires a provider ID`);
+    }
+    if (typeof agent.dshCwd !== 'string' || !agent.dshCwd.trim()) {
+      throw new ConfigError(`${agent.id}: Paseo requires a working directory on the daemon host`);
     }
   }
 
@@ -56,7 +56,7 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   let parsedPort = agent.port;
   let parsedTls = agent.tls;
   let parsedBasePath = agent.basePath;
-  const isWebSocket = agent.kind === 'acp' || agent.kind === 'openclaw';
+  const isWebSocket = agent.kind === 'paseo';
 
   if (/^(https?|wss?):\/\//i.test(parsedHost)) {
     let url: URL;
@@ -87,22 +87,11 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
     if (trimmed && (!trimmed.startsWith('/') || /[\s?#\\]/.test(trimmed))) {
       throw new ConfigError(`${agent.id}: basePath must be a URL path starting with "/"`);
     }
-    parsedBasePath =
-      (isWebSocket && !(agent.kind === 'openclaw' && trimmed === '/') ? trimmed : trimmed.replace(/\/+$/, '')) ||
-      undefined;
+    parsedBasePath = (isWebSocket ? trimmed : trimmed.replace(/\/+$/, '')) || undefined;
   }
-  if (agent.kind === 'acp' && agent.acpTransport !== 'stdio') parsedBasePath ??= '/acp';
+  if (agent.kind === 'paseo') parsedBasePath ??= '/ws';
 
-  const defaultPort =
-    parsedTls === true
-      ? 443
-      : agent.kind === 'openclaw'
-        ? 18_789
-        : agent.kind === 'dsh'
-          ? 18_790
-          : agent.kind === 'acp'
-            ? 18_792
-            : 8_642;
+  const defaultPort = parsedTls ? 443 : agent.kind === 'paseo' ? 6767 : 18_790;
   const result: AgentConfig = {
     ...agent,
     transport,
@@ -113,12 +102,6 @@ function normalizeAgent(agent: AgentConfig, ids: Set<string>): AgentConfig {
   };
   if (result.basePath === undefined) delete result.basePath;
   port(result.port!, `${agent.id}.port`);
-  if (
-    result.acpArgs !== undefined &&
-    (!Array.isArray(result.acpArgs) || result.acpArgs.some((arg) => typeof arg !== 'string'))
-  ) {
-    throw new ConfigError(`${agent.id}: acpArgs must be strings`);
-  }
   if (
     result.connectTimeoutMs !== undefined &&
     (!Number.isInteger(result.connectTimeoutMs) ||
@@ -139,14 +122,7 @@ export function urlHost(host: string): string {
 }
 
 export function secret(agent: AgentConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const fallback =
-    agent.kind === 'openclaw'
-      ? 'OPENCLAW_GATEWAY_TOKEN'
-      : agent.kind === 'dsh'
-        ? 'DSH_GATEWAY_TOKEN'
-        : agent.kind === 'acp'
-          ? 'DSH_KNOT_ACP_TOKEN'
-          : 'HERMES_API_KEY';
+  const fallback = agent.kind === 'paseo' ? 'DSH_KNOT_PASEO_PASSWORD' : 'DSH_GATEWAY_TOKEN';
   return agent.token ?? env[agent.tokenEnv ?? fallback];
 }
 
@@ -171,16 +147,6 @@ export function stripTrailingText(source: string, suffix: string): string {
     return trimmedSource.slice(0, -trimmedSuffix.length);
   }
   return source;
-}
-
-export function matchStreamedInterim(streamed: string, interim: string): string {
-  if (!streamed || !interim) return '';
-  const normalizedStreamed = streamed.trim().replace(/\s+/g, ' ');
-  const normalizedInterim = interim.trim().replace(/\s+/g, ' ');
-  if (!normalizedStreamed || !normalizedInterim) return '';
-  if (normalizedInterim.startsWith(normalizedStreamed)) return streamed;
-  const remaining = stripTrailingText(streamed, interim);
-  return remaining !== streamed ? streamed.slice(remaining.length) : '';
 }
 
 export async function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

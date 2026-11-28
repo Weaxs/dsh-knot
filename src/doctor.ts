@@ -17,13 +17,10 @@ export async function runDoctor(
     agents: await Promise.all(
       configs.map(async (config) => {
         const steps: DoctorStep[] = [];
-        const isWebSocket = config.kind === 'openclaw' || config.kind === 'acp';
+        const isWebSocket = config.kind === 'paseo';
         const scheme = `${isWebSocket ? 'ws' : 'http'}${config.tls ? 's' : ''}`;
         const host = urlHost(config.host ?? '127.0.0.1');
-        const detail =
-          config.acpTransport === 'stdio'
-            ? 'Starting a local ACP process.'
-            : `Connecting to ${scheme}://${host}:${config.port}${config.basePath ?? ''}.`;
+        const detail = `Connecting to ${scheme}://${host}:${config.port}${config.basePath ?? ''}.`;
         steps.push({ name: `${config.transport ?? 'direct'}-transport`, ok: true, detail });
         const timeout = AbortSignal.timeout(config.connectTimeoutMs ?? 15_000);
         const healthSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
@@ -50,13 +47,9 @@ function gatewayHint(config: AgentConfig, detail: string): string {
   if (value.includes('gateway credentials require https/wss')) {
     return 'Use an HTTPS/WSS endpoint, or enable the encrypted overlay setting after verifying the private network.';
   }
-  if (config.kind === 'openclaw' && /pairing.required|device.approval/.test(value)) {
-    return 'Approve this device in OpenClaw, then run the check again.';
-  }
-  if (/http 40[13]|unauthorized|token|api.key/.test(value)) {
-    if (config.kind === 'hermes') return 'Enter the Hermes API server key (API_SERVER_KEY) as the gateway token.';
+  if (/http 40[13]|unauthorized|password|authentication|token|api.key/.test(value)) {
     if (config.kind === 'dsh') return 'Enter the launch token printed by the remote dsh web command.';
-    return 'Verify the gateway token in the agent settings.';
+    return 'Verify the Paseo daemon password in the agent settings.';
   }
   if (/certificate|self.signed|altname|wrong version number/.test(value)) {
     return 'Check the endpoint scheme and hostname, and verify the TLS certificate is trusted.';
@@ -67,6 +60,5 @@ function gatewayHint(config: AgentConfig, detail: string): string {
   if (/timed out|timeout|econnrefused|connection refused|socket hang up/.test(value)) {
     return 'Verify the gateway is running and this device can reach the endpoint through the private network or proxy.';
   }
-  if (config.acpTransport === 'stdio') return 'Check that the local command is installed and executable.';
   return 'Verify that the endpoint serves this agent protocol.';
 }

@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis';
-import { normalizeConfig } from '../config.js';
+import { PaseoAdapter } from '../adapters/paseo.js';
+import { normalizeConfig, secret } from '../config.js';
 import { runDoctor } from '../doctor.js';
 import type { AgentManager } from '../manager.js';
 import type { McpServer } from '../mcp/server.js';
@@ -31,6 +32,7 @@ export const WEB_ROUTES = {
   sessionMessages: '/api/dsh-knot/session-messages',
   mcpShare: '/api/dsh-knot/mcp-share',
   agentSave: '/api/dsh-knot/agent-save',
+  paseoProviders: '/api/dsh-knot/paseo-providers',
   agentDelete: '/api/dsh-knot/agent-delete',
 } as const;
 
@@ -346,6 +348,49 @@ export function registerWebRoutes(
       }
     });
 
+    register(WEB_ROUTES.paseoProviders, async (request) => {
+      let adapter: PaseoAdapter | undefined;
+      try {
+        const body = await parseBody(request);
+        const existing = typeof body.id === 'string' ? manager.getConfig(body.id) : undefined;
+        const candidate = normalizeConfig({
+          agents: [
+            {
+              id: 'paseo-catalog',
+              kind: 'paseo',
+              transport: body.transport === 'local' ? 'local' : 'direct',
+              host:
+                typeof body.endpoint === 'string'
+                  ? body.endpoint
+                  : typeof body.host === 'string'
+                    ? body.host
+                    : undefined,
+              port: body.port === undefined || body.port === '' ? undefined : Number(body.port),
+              encryptedOverlay: body.encryptedOverlay === true,
+              paseoProvider: 'catalog',
+              dshCwd: '/',
+            },
+          ],
+        }).agents[0]!;
+        const sameEndpoint =
+          existing?.kind === 'paseo' &&
+          existing.host === candidate.host &&
+          existing.port === candidate.port &&
+          Boolean(existing.tls) === Boolean(candidate.tls) &&
+          existing.basePath === candidate.basePath;
+        candidate.token =
+          body.clearToken === true
+            ? ''
+            : (typeof body.token === 'string' ? body.token.trim() : '') || (sameEndpoint ? secret(existing) : '') || '';
+        adapter = new PaseoAdapter(candidate.id, candidate);
+        return jsonReply({ ok: true, value: { providers: await adapter.listProviders(request.signal) } });
+      } catch (error) {
+        return errorReply(error instanceof Error ? error.message : String(error));
+      } finally {
+        await adapter?.close();
+      }
+    });
+
     register(WEB_ROUTES.agentSave, async (request) => {
       try {
         const body = await parseBody(request);
@@ -386,22 +431,6 @@ export function registerWebRoutes(
               : endpointInput === undefined && sameTransport
                 ? existing?.basePath
                 : undefined;
-          const acpTransport =
-            kind === 'acp'
-              ? body.acpTransport === 'stdio' || body.acpTransport === 'websocket'
-                ? body.acpTransport
-                : sameTransport
-                  ? existing?.acpTransport
-                  : undefined
-              : undefined;
-          const acpCommand =
-            kind === 'acp' && acpTransport === 'stdio'
-              ? typeof body.acpCommand === 'string'
-                ? body.acpCommand.trim() || undefined
-                : sameTransport
-                  ? existing?.acpCommand
-                  : undefined
-              : undefined;
           const candidate: AgentConfig = {
             ...existing,
             id,
@@ -413,9 +442,13 @@ export function registerWebRoutes(
             encryptedOverlay,
             basePath: resolvedBasePath,
             model: typeof body.model === 'string' ? body.model.trim() || undefined : existing?.model,
-            acpTransport,
-            acpCommand,
-            ...(Array.isArray(body.acpArgs) ? { acpArgs: body.acpArgs.map(String) } : {}),
+            dshCwd: typeof body.dshCwd === 'string' ? body.dshCwd.trim() || undefined : existing?.dshCwd,
+            paseoProvider:
+              kind === 'paseo'
+                ? typeof body.paseoProvider === 'string'
+                  ? body.paseoProvider.trim()
+                  : existing?.paseoProvider
+                : undefined,
           };
           for (const key of Object.keys(candidate) as Array<keyof AgentConfig>) {
             if (candidate[key] === undefined) delete candidate[key];
@@ -428,8 +461,7 @@ export function registerWebRoutes(
             existing.host === normalized.host &&
             existing.port === normalized.port &&
             Boolean(existing.tls) === Boolean(normalized.tls) &&
-            existing.basePath === normalized.basePath &&
-            (existing.acpTransport ?? 'websocket') === (normalized.acpTransport ?? 'websocket');
+            existing.basePath === normalized.basePath;
           if (sameGateway && encryptedOverlay === undefined && existing.encryptedOverlay !== undefined) {
             normalized.encryptedOverlay = existing.encryptedOverlay;
           }

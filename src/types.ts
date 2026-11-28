@@ -1,7 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 
 export type TransportKind = 'direct' | 'local';
-export type AgentKind = 'hermes' | 'openclaw' | 'dsh' | 'acp';
+export type AgentKind = 'dsh' | 'paseo';
 
 export interface AgentConfig {
   id: string;
@@ -14,15 +14,11 @@ export interface AgentConfig {
   basePath?: string;
   token?: string;
   tokenEnv?: string;
-  origin?: string;
   model?: string;
-  openclawAgentId?: string;
   dshProvider?: string;
   dshCwd?: string;
   reasoningEffort?: string;
-  acpTransport?: 'websocket' | 'stdio';
-  acpCommand?: string;
-  acpArgs?: string[];
+  paseoProvider?: string;
   connectTimeoutMs?: number;
 }
 
@@ -66,7 +62,7 @@ export interface AgentEvent {
   retractText?: string;
   name?: string;
   title?: string;
-  phase?: 'pending' | 'start' | 'end';
+  phase?: 'pending' | 'start' | 'end' | 'interrupted';
   failed?: boolean;
   inputPreview?: string;
   requestId?: string;
@@ -108,7 +104,6 @@ export interface AgentAdapter {
   ): AsyncIterable<AgentEvent>;
   cancel(sessionId: string, signal?: AbortSignal): Promise<void>;
   promptTerminalForCancel?(sessionId: string): Promise<unknown> | undefined;
-  recoverPromptStopForCancel?(sessionId: string): ((signal: AbortSignal) => Promise<void>) | undefined;
   respond?(sessionId: string, requestId: string, choice: string, signal?: AbortSignal): Promise<void>;
   isSessionBusy?(sessionId: string): boolean;
   close(): Promise<void>;

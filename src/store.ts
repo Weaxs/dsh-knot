@@ -27,7 +27,7 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
   const raw = JSON.parse(text) as unknown;
   if (Array.isArray(raw)) {
     return {
-      agents: normalizeConfig({ agents: raw as AgentConfig[] }).agents,
+      agents: storedAgents(raw),
       deletedIds: [],
     };
   }
@@ -35,7 +35,7 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
     throw new Error(`Invalid state format in ${file}`);
   }
   const record = raw as { agents?: unknown; deletedIds?: unknown; allowSessions?: unknown };
-  const agents = Array.isArray(record.agents) ? normalizeConfig({ agents: record.agents as AgentConfig[] }).agents : [];
+  const agents = Array.isArray(record.agents) ? storedAgents(record.agents) : [];
   const deletedIds = Array.isArray(record.deletedIds)
     ? [...new Set(record.deletedIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))]
     : [];
@@ -43,6 +43,15 @@ export function loadStoredState(file = defaultAgentsFile()): StoredKnotState {
     ? [...new Set(record.allowSessions.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))]
     : undefined;
   return { agents, deletedIds, ...(allowSessions !== undefined ? { allowSessions } : {}) };
+}
+
+function storedAgents(entries: unknown[]): AgentConfig[] {
+  // The retired kinds have no conversion. Other saved agents and MCP state can still load.
+  const agents = (entries as AgentConfig[]).filter((agent) => {
+    const kind: unknown = agent?.kind;
+    return kind !== 'hermes' && kind !== 'openclaw' && kind !== 'acp';
+  });
+  return normalizeConfig({ agents }).agents;
 }
 
 export function saveStoredState(state: StoredKnotState, file = defaultAgentsFile()): StoredKnotState {

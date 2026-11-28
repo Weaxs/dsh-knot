@@ -20,7 +20,7 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, native, acp]
+        options: [all, native, paseo]
   push:
     branches: [main]
     paths:
@@ -57,7 +57,6 @@ env:
   OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
   OPENAI_MODEL_NAME: ${{ secrets.OPENAI_MODEL_NAME }}
-  HERMES_API_KEY: e2e-hermes-gateway-token
   OPENCLAW_GATEWAY_TOKEN: e2e-openclaw-gateway-token
   # Regional-DNS fallback for the configured OpenAI-compatible endpoint.
   E2E_MODEL_HOST: ka.vipbigmodel.cn
@@ -91,7 +90,7 @@ jobs:
           fi
           if [[ "$model" == true && "$tailscale" != true ]]; then
             message="TAILSCALE_AUTHKEY must be a reusable, ephemeral pre-auth key (tskey-auth-...). Tailscale jobs will be skipped."
-            if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" != local && "${{ inputs.transport }}" != headscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
+            if [[ "${{ github.event_name }}" == workflow_dispatch && "${{ inputs.transport }}" == tailscale ]]; then echo "::error::$message"; exit 1; else echo "::warning::$message"; fi
           fi
 
           transport_filter="${{ inputs.transport || 'all' }}"
@@ -105,13 +104,19 @@ jobs:
             for target in hermes openclaw dsh; do
               if [[ "$target_filter" != all && "$target_filter" != "$target" ]]; then continue; fi
               if [[ "$model" != true ]]; then continue; fi
-              for protocol in native acp; do
+              if [[ "$target" == hermes && "$transport" != local ]]; then continue; fi
+              for protocol in native paseo; do
+                if [[ "$target" == dsh && "$protocol" != native ]] || [[ "$target" != dsh && "$protocol" != paseo ]]; then continue; fi
                 if [[ "$protocol_filter" != all && "$protocol_filter" != "$protocol" ]]; then continue; fi
                 matrix+="{\"transport\":\"$transport\",\"target\":\"$target\",\"protocol\":\"$protocol\"},"
                 has_work=true
               done
             done
           done
+          if [[ "$has_work" != true && "${{ github.event_name }}" == workflow_dispatch ]]; then
+            echo "::error::No supported E2E cases match the selected target, transport, and protocol."
+            exit 1
+          fi
           echo "matrix=${matrix%,}]}" >> "$GITHUB_OUTPUT"
           echo "has_work=$has_work" >> "$GITHUB_OUTPUT"
 
@@ -146,3 +151,4 @@ jobs:
             .github/e2e/generated/e2e-${{ matrix.transport }}-${{ matrix.target }}-${{ matrix.protocol }}.log
             .github/e2e/generated/adapter-${{ matrix.transport }}-${{ matrix.target }}-${{ matrix.protocol }}.log
             .github/e2e/generated/headscale-${{ matrix.target }}-${{ matrix.protocol }}-daemon.log
+            .github/e2e/generated/paseo-${{ matrix.transport }}-${{ matrix.target }}-daemon.log

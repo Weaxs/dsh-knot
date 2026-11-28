@@ -11,25 +11,14 @@ services:
     command: gateway run
     environment:
       <<: *openai-environment
-      API_SERVER_ENABLED: "true"
-      API_SERVER_HOST: 0.0.0.0
-      API_SERVER_PORT: "8642"
-      API_SERVER_KEY: ${HERMES_API_KEY}
-      API_SERVER_MODEL_NAME: ${OPENAI_MODEL_NAME}
       TERMINAL_ENV: local
     volumes:
       - ./generated/hermes-config.yaml:/opt/data/config.yaml
     healthcheck:
-      test:
-        [
-          "CMD",
-          "/opt/hermes/.venv/bin/python",
-          "-c",
-          "import socket; s=socket.create_connection(('127.0.0.1',8642),2); s.close()",
-        ]
-      interval: 3s
-      timeout: 3s
-      retries: 60
+      test: ["CMD", "/opt/hermes/.venv/bin/hermes", "acp", "--check"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
 
   openclaw:
     image: openclaw/openclaw:latest
@@ -95,39 +84,3 @@ services:
       interval: 3s
       timeout: 3s
       retries: 80
-
-  acp:
-    build:
-      context: ../..
-      dockerfile: .github/e2e/acp/Dockerfile
-    profiles: [acp]
-    network_mode: service:${E2E_TARGET}
-    depends_on:
-      - ${E2E_TARGET}
-    init: true
-    environment:
-      DSH_KNOT_NATIVE_KIND: ${E2E_TARGET}
-      DSH_KNOT_NATIVE_HOST: 127.0.0.1
-      DSH_KNOT_NATIVE_PORT: ${E2E_NATIVE_PORT}
-      DSH_KNOT_NATIVE_TOKEN: ${E2E_NATIVE_TOKEN}
-      DSH_KNOT_NATIVE_CWD: /tmp
-      DSH_KNOT_DSH_PROVIDER: openai
-      DSH_KNOT_OPENCLAW_AGENT_ID: main
-      DSH_KNOT_REASONING_EFFORT: low
-      DSH_KNOT_ACP_HOST: 0.0.0.0
-      DSH_KNOT_ACP_PORT: 18792
-      DSH_KNOT_ACP_TOKEN: e2e-acp-token
-      OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME}
-    volumes:
-      - ./generated/dsh:/tmp/dsh-e2e
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "node",
-          "-e",
-          "fetch('http://127.0.0.1:18792/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
-        ]
-      interval: 3s
-      timeout: 3s
-      retries: 60

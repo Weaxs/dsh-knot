@@ -52,15 +52,15 @@ interface AgentConnectionState {
 interface AgentSummary {
   id: string;
   revision: string;
-  kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
+  kind: 'dsh' | 'paseo';
   transport?: 'direct' | 'local';
   host?: string;
   basePath?: string;
   port?: number;
   tls?: boolean;
   encryptedOverlay?: boolean;
-  acpTransport?: 'websocket' | 'stdio';
-  acpCommand?: string;
+  dshCwd?: string;
+  paseoProvider?: string;
   model?: string;
   hasToken?: boolean;
   supportsRespond?: boolean;
@@ -73,7 +73,7 @@ interface AgentFormState {
   hasToken: boolean;
   clearToken: boolean;
   id: string;
-  kind: 'hermes' | 'openclaw' | 'dsh' | 'acp';
+  kind: 'dsh' | 'paseo';
   transport: 'direct' | 'local';
   endpoint: string;
   host: string;
@@ -81,9 +81,8 @@ interface AgentFormState {
   encryptedOverlay: boolean;
   token: string;
   model: string;
-  acpTransport: 'websocket' | 'stdio';
-  acpCommand: string;
-  acpArgsText: string;
+  dshCwd: string;
+  paseoProvider: string;
 }
 
 type ToolStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
@@ -170,7 +169,7 @@ const STYLE_ID = 'dsh-knot-client-styles';
 const DICTS: Record<string, Record<string, string>> = {
   'zh-CN': {
     title: '远端助手',
-    subtitle: '直连远端 Hermes、OpenClaw、DSH 与 ACP 网关，无需云端中转。',
+    subtitle: '在私网连接 Paseo 助手和远端 DSH。',
     replyTag: '回复',
     liveTag: '运行中',
     youTag: '你',
@@ -212,8 +211,6 @@ const DICTS: Record<string, Record<string, string>> = {
     transportDirectOpt: '私网 HTTPS / Tailscale Serve（推荐）',
     transportLocalOpt: '本机 Local (127.0.0.1)',
     directSetupTip: '将网关通过私网入口提供给本机，再填写完整地址和网关令牌。',
-    hermesSetupTip: '在 Hermes 所在主机启用 API Server，用 Tailscale Serve 转发 8642 端口，并填写 API_SERVER_KEY。',
-    openclawSetupTip: '在 OpenClaw 启用自带的 Tailscale Serve，填写 HTTPS 地址和网关令牌，首次连接时批准设备配对。',
     fieldEndpoint: '网关地址（HTTPS、HTTP 或 WebSocket）',
     fieldHost: '主机地址（IP 或 Tailscale 域名）',
     fieldPort: '本机网关端口（可选）',
@@ -222,9 +219,13 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldTokenKeep: '地址不变时留空可保留令牌',
     fieldClearToken: '清空已保存的 Token',
     fieldModel: '默认模型（可选）',
-    fieldAcpTransport: 'ACP 传输方式',
-    fieldAcpCommand: 'ACP stdio 命令（如 hermes 或绝对路径）',
-    fieldAcpArgs: 'ACP 命令参数（空格分隔，如 acp）',
+    fieldPaseoProvider: 'Paseo provider',
+    loadPaseoProviders: '读取 provider',
+    loadingPaseoProviders: '读取中…',
+    noPaseoProviders: '此 daemon 暂无可用 provider',
+    choosePaseoProvider: '选择 provider',
+    fieldPaseoPassword: 'Paseo daemon 密码',
+    fieldPaseoCwd: 'Paseo 主机上的工作目录',
     tokenConfigured: '已配密钥',
     savingAgent: '保存中…',
     savedAgentToast: '已保存配置，正在验证连接…',
@@ -289,7 +290,7 @@ const DICTS: Record<string, Record<string, string>> = {
   },
   en: {
     title: 'Remote Agents',
-    subtitle: 'Direct links to Hermes, OpenClaw, remote dsh, and ACP gateways — no cloud relay.',
+    subtitle: 'Connect to Paseo agents and remote dsh over a private network.',
     replyTag: 'REPLY',
     liveTag: 'LIVE',
     youTag: 'YOU',
@@ -332,9 +333,6 @@ const DICTS: Record<string, Record<string, string>> = {
     transportDirectOpt: 'Private HTTPS / Tailscale Serve (Recommended)',
     transportLocalOpt: 'Local (127.0.0.1)',
     directSetupTip: 'Use a private gateway endpoint. Enter the full URL and gateway token below.',
-    hermesSetupTip: 'Enable the Hermes API Server, forward port 8642 using Tailscale Serve, and enter API_SERVER_KEY.',
-    openclawSetupTip:
-      'Enable OpenClaw-managed Tailscale Serve. Enter the HTTPS URL and gateway token, then approve the first device pairing in OpenClaw.',
     fieldEndpoint: 'Gateway URL (HTTPS, HTTP, or WebSocket)',
     fieldHost: 'Host (IP or Tailscale hostname)',
     fieldPort: 'Local gateway port (optional)',
@@ -344,9 +342,13 @@ const DICTS: Record<string, Record<string, string>> = {
     fieldTokenKeep: 'Leave blank to keep the token for the same endpoint',
     fieldClearToken: 'Clear saved token',
     fieldModel: 'Model override (optional)',
-    fieldAcpTransport: 'ACP Transport',
-    fieldAcpCommand: 'ACP stdio command (e.g. hermes or full path)',
-    fieldAcpArgs: 'ACP args (space-separated, e.g. acp)',
+    fieldPaseoProvider: 'Paseo provider',
+    loadPaseoProviders: 'Load providers',
+    loadingPaseoProviders: 'Loading…',
+    noPaseoProviders: 'No ready providers on this daemon',
+    choosePaseoProvider: 'Select a provider',
+    fieldPaseoPassword: 'Paseo daemon password',
+    fieldPaseoCwd: 'Working directory on the Paseo host',
     tokenConfigured: 'Token set',
     savingAgent: 'Saving…',
     savedAgentToast: 'Agent saved — verifying connection…',
@@ -1104,7 +1106,7 @@ async function apiPost<T>(
 }
 
 function defaultPortForKind(kind: AgentFormState['kind']): string {
-  return kind === 'openclaw' ? '18789' : kind === 'dsh' ? '18790' : kind === 'acp' ? '18792' : '8642';
+  return kind === 'dsh' ? '18790' : '6767';
 }
 
 function formatDirectEndpoint(agent: AgentSummary): string {
@@ -2270,7 +2272,7 @@ function makeChatThread(React: ReactModule, ctx: ClientContext, primitives: Chat
       return items;
     };
 
-    const endpoint = agent.acpTransport === 'stdio' ? 'Local stdio' : formatDirectEndpoint(agent);
+    const endpoint = formatDirectEndpoint(agent);
 
     return h(
       'section',
@@ -2467,13 +2469,30 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
     const [toast, setToast] = React.useState<string | null>(null);
     const [form, setForm] = React.useState<AgentFormState | null>(null);
     const [saving, setSaving] = React.useState(false);
+    const [catalog, setCatalog] = React.useState<{
+      key: string;
+      providers?: Array<{ id: string; label: string }>;
+      error?: string;
+    } | null>(null);
+    const catalogKey =
+      form?.kind === 'paseo'
+        ? JSON.stringify([
+            form.id,
+            form.transport,
+            form.endpoint,
+            form.host,
+            form.port,
+            form.encryptedOverlay,
+            form.token,
+            form.clearToken,
+          ])
+        : '';
+    const visibleCatalog = catalog?.key === catalogKey ? catalog : undefined;
+    const catalogRequest = React.useRef(0);
     const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
     const formAddress = (form?.transport === 'direct' ? form.endpoint : form?.host)?.trim();
     const showEncryptedOverlay =
-      formAddress &&
-      !/^(?:https|wss):\/\//i.test(formAddress) &&
-      !isLoopbackEndpoint(formAddress) &&
-      !(form?.kind === 'acp' && form.acpTransport === 'stdio');
+      formAddress && !/^(?:https|wss):\/\//i.test(formAddress) && !isLoopbackEndpoint(formAddress);
     const toastTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const stateRequest = React.useRef(0);
     const hasRunningRef = React.useRef(false);
@@ -2582,12 +2601,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
     };
 
     const openAddForm = () => {
+      catalogRequest.current++;
+      setCatalog(null);
       setForm({
         editing: false,
         hasToken: false,
         clearToken: false,
         id: '',
-        kind: 'hermes',
+        kind: 'paseo',
         transport: 'direct',
         endpoint: '',
         host: '',
@@ -2595,13 +2616,14 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
         encryptedOverlay: false,
         token: '',
         model: '',
-        acpTransport: 'websocket',
-        acpCommand: '',
-        acpArgsText: '',
+        dshCwd: '',
+        paseoProvider: '',
       });
     };
 
     const openEditForm = (agent: AgentSummary) => {
+      catalogRequest.current++;
+      setCatalog(null);
       const transport = agent.transport === 'local' ? 'local' : 'direct';
       setForm({
         editing: true,
@@ -2616,10 +2638,36 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
         encryptedOverlay: agent.encryptedOverlay === true,
         token: '',
         model: agent.model ?? '',
-        acpTransport: transport === 'local' ? (agent.acpTransport ?? 'websocket') : 'websocket',
-        acpCommand: agent.acpCommand ?? '',
-        acpArgsText: '',
+        dshCwd: agent.dshCwd ?? '',
+        paseoProvider: agent.paseoProvider ?? '',
       });
+    };
+
+    const loadPaseoProviders = async () => {
+      if (form?.kind !== 'paseo') return;
+      const revision = ++catalogRequest.current;
+      setCatalog({ key: catalogKey });
+      try {
+        const { providers } = await apiPost<{ providers: Array<{ id: string; label: string }> }>(
+          ctx,
+          '/api/dsh-knot/paseo-providers',
+          {
+            id: form.id.trim(),
+            transport: form.transport,
+            endpoint: form.transport === 'direct' ? form.endpoint.trim() : undefined,
+            host: form.transport === 'local' ? form.host.trim() : undefined,
+            port: form.transport === 'local' ? form.port.trim() : undefined,
+            encryptedOverlay: form.encryptedOverlay,
+            token: form.token,
+            clearToken: form.clearToken,
+          },
+        );
+        if (catalogRequest.current === revision) setCatalog({ key: catalogKey, providers });
+      } catch (error) {
+        if (catalogRequest.current === revision) {
+          setCatalog({ key: catalogKey, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
     };
 
     const saveAgentForm = async () => {
@@ -2627,10 +2675,6 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
       setSaving(true);
       const savedId = form.id.trim();
       try {
-        const acpArgs =
-          form.kind === 'acp' && form.acpTransport === 'stdio' && form.acpArgsText.trim()
-            ? form.acpArgsText.trim().split(/\s+/).filter(Boolean)
-            : undefined;
         const { agents } = await apiPost<{ agents: AgentSummary[] }>(ctx, '/api/dsh-knot/agent-save', {
           id: savedId,
           kind: form.kind,
@@ -2642,9 +2686,8 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
           token: form.token,
           clearToken: form.clearToken,
           model: form.model,
-          acpTransport: form.kind === 'acp' ? form.acpTransport : undefined,
-          acpCommand: form.kind === 'acp' && form.acpTransport === 'stdio' ? form.acpCommand : undefined,
-          ...(acpArgs ? { acpArgs } : {}),
+          dshCwd: form.kind === 'paseo' ? form.dshCwd : undefined,
+          paseoProvider: form.kind === 'paseo' ? form.paseoProvider : undefined,
         });
         setState((prev) =>
           prev ? { ...prev, agents, jobs: prev.jobs.filter((job) => job.agentId !== savedId) } : prev,
@@ -2913,7 +2956,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                   const connStatus = agent.connection?.status ?? 'unverified';
                   const isOpen = Boolean(expandedDoctor[agent.id]);
                   const isDeleteArmed = confirmDeleteId === agent.id;
-                  const endpoint = agent.acpTransport === 'stdio' ? 'Local stdio' : formatDirectEndpoint(agent);
+                  const endpoint = formatDirectEndpoint(agent);
                   const dotClass =
                     connStatus === 'connected'
                       ? 'dk-dot dk-dot-ok'
@@ -3195,9 +3238,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           );
                         },
                       },
-                      h('option', { value: 'acp' }, 'ACP v1'),
-                      h('option', { value: 'hermes' }, 'Hermes'),
-                      h('option', { value: 'openclaw' }, 'OpenClaw'),
+                      h('option', { value: 'paseo' }, 'Paseo'),
                       h('option', { value: 'dsh' }, 'Remote DSH'),
                     ),
                   ),
@@ -3220,7 +3261,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                               ? {
                                   ...cur,
                                   transport: e.target.value as AgentFormState['transport'],
-                                  acpTransport: e.target.value === 'direct' ? 'websocket' : cur.acpTransport,
+                                  paseoProvider: '',
                                   encryptedOverlay: false,
                                 }
                               : null,
@@ -3230,7 +3271,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                       h('option', { value: 'local' }, t('transportLocalOpt')),
                     ),
                   ),
-                  form.transport === 'local' && !(form.kind === 'acp' && form.acpTransport === 'stdio')
+                  form.transport === 'local'
                     ? h(
                         'label',
                         { className: 'dk-field' },
@@ -3241,7 +3282,9 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           placeholder: defaultPortForKind(form.kind),
                           value: form.port,
                           onInput: (e: { target: { value: string } }) =>
-                            setForm((cur) => (cur ? { ...cur, port: e.target.value, encryptedOverlay: false } : null)),
+                            setForm((cur) =>
+                              cur ? { ...cur, port: e.target.value, paseoProvider: '', encryptedOverlay: false } : null,
+                            ),
                         }),
                       )
                     : h('div', null),
@@ -3250,17 +3293,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                   ? h(
                       'div',
                       { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
-                      h(
-                        'div',
-                        { className: 'dk-infobox' },
-                        t(
-                          form.kind === 'hermes'
-                            ? 'hermesSetupTip'
-                            : form.kind === 'openclaw'
-                              ? 'openclawSetupTip'
-                              : 'directSetupTip',
-                        ),
-                      ),
+                      h('div', { className: 'dk-infobox' }, t('directSetupTip')),
                       h(
                         'label',
                         { className: 'dk-field' },
@@ -3271,85 +3304,75 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                           value: form.endpoint,
                           onInput: (e: { target: { value: string } }) =>
                             setForm((cur) =>
-                              cur ? { ...cur, endpoint: e.target.value, encryptedOverlay: false } : null,
+                              cur
+                                ? { ...cur, endpoint: e.target.value, paseoProvider: '', encryptedOverlay: false }
+                                : null,
                             ),
                         }),
                       ),
                     )
-                  : form.kind === 'acp' && form.acpTransport === 'stdio'
-                    ? null
-                    : h(
-                        'label',
-                        { className: 'dk-field' },
-                        h('span', null, t('fieldHost')),
-                        h('input', {
-                          className: 'dk-input dk-mono',
-                          placeholder: '127.0.0.1',
-                          value: form.host,
-                          onInput: (e: { target: { value: string } }) =>
-                            setForm((cur) => (cur ? { ...cur, host: e.target.value, encryptedOverlay: false } : null)),
-                        }),
-                      ),
-                form.kind === 'acp' && form.transport === 'local'
+                  : h(
+                      'label',
+                      { className: 'dk-field' },
+                      h('span', null, t('fieldHost')),
+                      h('input', {
+                        className: 'dk-input dk-mono',
+                        placeholder: '127.0.0.1',
+                        value: form.host,
+                        onInput: (e: { target: { value: string } }) =>
+                          setForm((cur) =>
+                            cur ? { ...cur, host: e.target.value, paseoProvider: '', encryptedOverlay: false } : null,
+                          ),
+                      }),
+                    ),
+                form.kind === 'paseo'
                   ? h(
                       'div',
-                      { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+                      { className: 'dk-field' },
+                      h('label', { htmlFor: 'dk-paseo-provider' }, t('fieldPaseoProvider')),
                       h(
                         'div',
                         { className: 'dk-field-row' },
                         h(
-                          'label',
-                          { className: 'dk-field' },
-                          h('span', null, t('fieldAcpTransport')),
-                          h(
-                            'select',
-                            {
-                              className: 'dk-input',
-                              value: form.acpTransport,
-                              onChange: (e: { target: { value: string } }) =>
-                                setForm((cur) =>
-                                  cur
-                                    ? {
-                                        ...cur,
-                                        acpTransport: e.target.value as 'websocket' | 'stdio',
-                                        encryptedOverlay: false,
-                                      }
-                                    : null,
-                                ),
-                            },
-                            h('option', { value: 'websocket' }, 'WebSocket'),
-                            h('option', { value: 'stdio' }, 'stdio'),
+                          'select',
+                          {
+                            id: 'dk-paseo-provider',
+                            className: 'dk-input',
+                            value: form.paseoProvider,
+                            onChange: (e: { target: { value: string } }) =>
+                              setForm((cur) => (cur ? { ...cur, paseoProvider: e.target.value } : null)),
+                          },
+                          h('option', { value: '' }, t('choosePaseoProvider')),
+                          form.paseoProvider &&
+                            !visibleCatalog?.providers?.some((provider) => provider.id === form.paseoProvider)
+                            ? h('option', { value: form.paseoProvider }, form.paseoProvider)
+                            : null,
+                          ...(visibleCatalog?.providers ?? []).map((provider) =>
+                            h('option', { key: provider.id, value: provider.id }, provider.label),
                           ),
                         ),
-                        form.acpTransport === 'stdio'
-                          ? h(
-                              'label',
-                              { className: 'dk-field' },
-                              h('span', null, t('fieldAcpCommand')),
-                              h('input', {
-                                className: 'dk-input dk-mono',
-                                placeholder: 'hermes',
-                                value: form.acpCommand,
-                                onInput: (e: { target: { value: string } }) =>
-                                  setForm((cur) => (cur ? { ...cur, acpCommand: e.target.value } : null)),
-                              }),
-                            )
-                          : h('div', null),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dk-btn',
+                            disabled:
+                              (form.transport === 'direct' && !form.endpoint.trim()) ||
+                              Boolean(visibleCatalog && !visibleCatalog.providers && !visibleCatalog.error),
+                            onClick: () => void loadPaseoProviders(),
+                          },
+                          t(
+                            visibleCatalog && !visibleCatalog.providers && !visibleCatalog.error
+                              ? 'loadingPaseoProviders'
+                              : 'loadPaseoProviders',
+                          ),
+                        ),
                       ),
-                      form.acpTransport === 'stdio'
-                        ? h(
-                            'label',
-                            { className: 'dk-field' },
-                            h('span', null, t('fieldAcpArgs')),
-                            h('input', {
-                              className: 'dk-input dk-mono',
-                              placeholder: 'acp',
-                              value: form.acpArgsText,
-                              onInput: (e: { target: { value: string } }) =>
-                                setForm((cur) => (cur ? { ...cur, acpArgsText: e.target.value } : null)),
-                            }),
-                          )
-                        : null,
+                      visibleCatalog?.error
+                        ? h('span', { role: 'alert' }, visibleCatalog.error)
+                        : visibleCatalog?.providers?.length === 0
+                          ? h('span', { role: 'status' }, t('noPaseoProviders'))
+                          : null,
                     )
                   : null,
                 showEncryptedOverlay
@@ -3368,7 +3391,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 h(
                   'label',
                   { className: 'dk-field' },
-                  h('span', null, t('fieldToken')),
+                  h('span', null, t(form.kind === 'paseo' ? 'fieldPaseoPassword' : 'fieldToken')),
                   h('input', {
                     className: 'dk-input dk-mono',
                     type: 'password',
@@ -3403,13 +3426,17 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                 h(
                   'label',
                   { className: 'dk-field' },
-                  h('span', null, t('fieldModel')),
+                  h('span', null, t(form.kind === 'paseo' ? 'fieldPaseoCwd' : 'fieldModel')),
                   h('input', {
                     className: 'dk-input dk-mono',
-                    placeholder: 'optional',
-                    value: form.model,
+                    value: form.kind === 'paseo' ? form.dshCwd : form.model,
                     onInput: (e: { target: { value: string } }) =>
-                      setForm((cur) => (cur ? { ...cur, model: e.target.value } : null)),
+                      setForm((cur) => {
+                        if (!cur) return null;
+                        return cur.kind === 'paseo'
+                          ? { ...cur, dshCwd: e.target.value }
+                          : { ...cur, model: e.target.value };
+                      }),
                   }),
                 ),
                 h(
@@ -3417,7 +3444,12 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                   { className: 'dk-modal-foot' },
                   h(
                     'button',
-                    { type: 'button', className: 'dk-btn', disabled: saving, onClick: () => setForm(null) },
+                    {
+                      type: 'button',
+                      className: 'dk-btn',
+                      disabled: saving || (form.kind === 'paseo' && (!form.paseoProvider || !form.dshCwd.trim())),
+                      onClick: () => setForm(null),
+                    },
                     t('cancelBtn'),
                   ),
                   h(
@@ -3425,7 +3457,7 @@ function makeDashboard(React: ReactModule, ctx: ClientContext, primitives: ChatP
                     {
                       type: 'button',
                       className: 'dk-btn dk-btn-primary',
-                      disabled: saving,
+                      disabled: saving || (form.kind === 'paseo' && (!form.paseoProvider || !form.dshCwd.trim())),
                       onClick: () => void saveAgentForm(),
                     },
                     saving ? t('savingAgent') : t('saveAgent'),

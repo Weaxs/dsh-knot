@@ -5,8 +5,8 @@ for (const name of ['OPENAI_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_MODEL_NAME']) {
   if (!process.env[name])
     throw new Error(`${name} is required. Configure it as a GitHub Actions secret for real E2E tests.`);
 }
-for (const name of ['HERMES_API_KEY', 'OPENCLAW_GATEWAY_TOKEN']) {
-  if (!process.env[name]) throw new Error(`${name} must contain an ephemeral gateway token for the E2E environment`);
+if (!process.env.OPENCLAW_GATEWAY_TOKEN) {
+  throw new Error('OPENCLAW_GATEWAY_TOKEN must contain an ephemeral gateway token for the E2E environment');
 }
 
 const modelId = process.env.OPENAI_MODEL_NAME.replace(/^openai\//, '');

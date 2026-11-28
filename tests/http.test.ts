@@ -25,7 +25,7 @@ describe('HTTP transport', () => {
     const port = (server.address() as AddressInfo).port;
     const transport = new NodeHttpTransport('local', {
       id: 'x',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'local',
       host: '127.0.0.1',
       port,
@@ -47,7 +47,7 @@ describe('HTTP transport', () => {
     const port = (server.address() as AddressInfo).port;
     const transport = new NodeHttpTransport('direct', {
       id: 'ts',
-      kind: 'hermes',
+      kind: 'dsh',
       transport: 'direct',
       host: '127.0.0.1',
       port,
@@ -66,7 +66,7 @@ describe('HTTP transport', () => {
     });
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
     const port = (server.address() as AddressInfo).port;
-    const transport = new NodeHttpTransport('local', { id: 'x', kind: 'hermes', port, connectTimeoutMs: 120 });
+    const transport = new NodeHttpTransport('local', { id: 'x', kind: 'dsh', port, connectTimeoutMs: 120 });
     await expect(transport.request({ path: '/health' })).rejects.toThrow(/timed out/);
   });
 

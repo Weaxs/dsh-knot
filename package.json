@@ -1,13 +1,10 @@
 {
   "name": "@weaxs/dsh-knot",
   "version": "0.2.2",
-  "description": "Connect DeepSeek Harness with Hermes, OpenClaw, and remote dsh instances through ACP v1 or native gateways over private networks or loopback.",
+  "description": "Connect DeepSeek Harness to Paseo agents and remote dsh instances over private networks or loopback.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "dsh-knot-acp": "./dist/acp/cli.js"
-  },
   "exports": {
     ".": "./dist/index.js",
     "./client": "./dist/client.js",
@@ -75,8 +72,7 @@
     }
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^2.8.0",
-    "ws": "^8.23.0"
+    "@getpaseo/client": "0.18.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.1.0 <5",
@@ -98,7 +94,6 @@
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
     "@types/node": "^26.6.6",
-    "@types/ws": "^8.18.2",
     "@vitest/coverage-v8": "^5.1.1",
     "typescript": "^7.0.2",
     "vitest": "^5.1.1"

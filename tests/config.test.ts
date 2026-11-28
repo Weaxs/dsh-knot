@@ -1,18 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AcpAdapter } from '../src/adapters/acp.js';
 import { DshAdapter } from '../src/adapters/dsh.js';
-import { HermesAdapter } from '../src/adapters/hermes.js';
-import { OpenClawAdapter } from '../src/adapters/openclaw.js';
+import { PaseoAdapter } from '../src/adapters/paseo.js';
 import { normalizeConfig } from '../src/config.js';
 import { requireSecureGateway } from '../src/policy/auth.js';
 import { redact, redactText, redactTextSegments, retainRedactionTail, toolInputPreview } from '../src/policy/redact.js';
 
 describe('configuration and policy', () => {
   it.each([
-    ['hermes', HermesAdapter],
     ['dsh', DshAdapter],
-    ['openclaw', OpenClawAdapter],
-    ['acp', AcpAdapter],
+    ['paseo', PaseoAdapter],
   ] as const)('refuses a credential from the environment over plain LAN for %s', async (kind, Adapter) => {
     vi.stubEnv('KNOT_TEST_GATEWAY_TOKEN', 'synthetic-test-credential');
     const adapter = new Adapter('test', {
@@ -32,7 +28,7 @@ describe('configuration and policy', () => {
   });
 
   it('accepts loopback, TLS, or a verified overlay without granting trust based on the address range', () => {
-    const agent = { id: 'test', kind: 'acp' as const };
+    const agent = { id: 'test', kind: 'paseo' as const };
     for (const host of ['localhost', '127.9.8.7', '::1', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1']) {
       expect(() => requireSecureGateway({ ...agent, host })).not.toThrow();
     }
@@ -45,52 +41,50 @@ describe('configuration and policy', () => {
   it('defaults to direct and assigns protocol ports', () => {
     const value = normalizeConfig({
       agents: [
-        { id: 'hermes', kind: 'hermes', host: 'gpu' },
-        { id: 'claw', kind: 'openclaw', host: 'claw' },
         { id: 'remote-dsh', kind: 'dsh', host: 'dsh' },
-        { id: 'acp', kind: 'acp', host: 'acp' },
+        { id: 'paseo', kind: 'paseo', host: 'paseo', paseoProvider: 'hermes', dshCwd: '/repo' },
       ],
     });
     expect(value.agents.map((agent) => [agent.transport, agent.port])).toEqual([
-      ['direct', 8642],
-      ['direct', 18789],
       ['direct', 18790],
-      ['direct', 18792],
+      ['direct', 6767],
     ]);
   });
 
-  it('rejects duplicate ids, invalid ports, and direct stdio or missing endpoints', () => {
-    expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'hermes' }] })).toThrow(/gateway endpoint/);
-    expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'hermes', transport: 'local', port: 0 }] })).toThrow(
-      /port/,
+  it('rejects duplicate ids, invalid ports, and missing provider IDs or endpoints', () => {
+    expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'dsh' }] })).toThrow(/gateway endpoint/);
+    expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'dsh', transport: 'local', port: 0 }] })).toThrow(/port/);
+    expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'paseo', host: 'example.test' }] })).toThrow(
+      /provider ID/,
     );
-    expect(() =>
-      normalizeConfig({ agents: [{ id: 'x', kind: 'acp', acpTransport: 'stdio', acpCommand: 'agent' }] }),
-    ).toThrow(/stdio/);
     expect(() =>
       normalizeConfig({
         agents: [
-          { id: 'x', kind: 'hermes', transport: 'local' },
-          { id: 'x', kind: 'hermes', transport: 'local' },
+          { id: 'x', kind: 'dsh', transport: 'local' },
+          { id: 'x', kind: 'dsh', transport: 'local' },
         ],
       }),
     ).toThrow(/duplicate/);
   });
 
   it.each([
-    ['gateway.test', '/acp'],
-    ['wss://gateway.test', '/acp'],
+    ['gateway.test', '/ws'],
+    ['wss://gateway.test', '/ws'],
     ['wss://gateway.test/', '/'],
     ['wss://gateway.test/agent/endpoint/', '/agent/endpoint/'],
-  ])('uses the ACP WebSocket path for %s', (host, basePath) => {
-    const [agent] = normalizeConfig({ agents: [{ id: 'acp', kind: 'acp', host }] }).agents;
+  ])('uses the Paseo WebSocket path for %s', (host, basePath) => {
+    const [agent] = normalizeConfig({
+      agents: [{ id: 'paseo', kind: 'paseo', host, paseoProvider: 'hermes', dshCwd: '/repo' }],
+    }).agents;
     expect(agent?.basePath).toBe(basePath);
   });
 
   it.each(['https://user:password@example.test', 'https://example.test/?token=secret', 'wss://example.test/#fragment'])(
     'rejects non-endpoint components in %s',
     (host) => {
-      expect(() => normalizeConfig({ agents: [{ id: 'x', kind: 'openclaw', host }] })).toThrow(/endpoint URL/);
+      expect(() =>
+        normalizeConfig({ agents: [{ id: 'x', kind: 'paseo', host, paseoProvider: 'hermes', dshCwd: '/repo' }] }),
+      ).toThrow(/endpoint URL/);
     },
   );
 
@@ -195,17 +189,17 @@ describe('configuration and policy', () => {
   it('parses Tailscale Serve HTTPS endpoints and defaults TLS direct ports to 443', () => {
     const value = normalizeConfig({
       agents: [
-        { id: 'ts-https', kind: 'hermes', transport: 'direct', host: 'https://aws-hermes.tail1234.ts.net' },
+        { id: 'ts-https', kind: 'dsh', transport: 'direct', host: 'https://aws-hermes.tail1234.ts.net' },
         {
           id: 'ts-prefix',
-          kind: 'hermes',
+          kind: 'dsh',
           transport: 'direct',
           host: 'https://aws-hermes.tail1234.ts.net:8443/hermes/',
           port: 8642,
           tls: false,
           basePath: '/old',
         },
-        { id: 'tls-no-port', kind: 'hermes', transport: 'direct', host: 'aws-hermes.tail1234.ts.net', tls: true },
+        { id: 'tls-no-port', kind: 'dsh', transport: 'direct', host: 'aws-hermes.tail1234.ts.net', tls: true },
       ],
     });
     expect(value.agents[0]).toMatchObject({ host: 'aws-hermes.tail1234.ts.net', port: 443, tls: true });

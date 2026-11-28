@@ -85,29 +85,29 @@
 
       <rect x="18" y="48" width="406" height="38" rx="9" fill="#F8FAFC" stroke="#E5E7EB"/>
       <text x="32" y="71" fill="#111827" font-size="12.5" font-weight="600">hermes-gpu</text>
-      <text x="122" y="71" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">hermes · Tailscale</text>
-      <text x="364" y="71" fill="#2563EB" font-size="11.5" font-weight="500">History</text>
+      <text x="122" y="71" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">Paseo · hermes</text>
+      <text x="364" y="71" fill="#2563EB" font-size="11.5" font-weight="500">Chat</text>
 
       <rect x="440" y="48" width="406" height="38" rx="9" fill="#F8FAFC" stroke="#E5E7EB"/>
       <text x="454" y="71" fill="#111827" font-size="12.5" font-weight="600">claude-box</text>
-      <text x="542" y="71" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">acp · Local stdio</text>
-      <text x="786" y="71" fill="#2563EB" font-size="11.5" font-weight="500">History</text>
+      <text x="542" y="71" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">Paseo · provider</text>
+      <text x="786" y="71" fill="#2563EB" font-size="11.5" font-weight="500">Chat</text>
 
       <rect x="18" y="96" width="406" height="38" rx="9" fill="#F8FAFC" stroke="#E5E7EB"/>
       <text x="32" y="119" fill="#111827" font-size="12.5" font-weight="600">claw-prod</text>
-      <text x="116" y="119" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">openclaw · Tailscale</text>
-      <text x="364" y="119" fill="#2563EB" font-size="11.5" font-weight="500">History</text>
+      <text x="116" y="119" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">Paseo · provider</text>
+      <text x="364" y="119" fill="#2563EB" font-size="11.5" font-weight="500">Chat</text>
 
       <rect x="440" y="96" width="406" height="38" rx="9" fill="#F8FAFC" stroke="#E5E7EB"/>
       <text x="454" y="119" fill="#111827" font-size="12.5" font-weight="600">dsh-remote</text>
       <text x="546" y="119" fill="#6B7280" font-family="ui-monospace, monospace" font-size="11">dsh · Direct :18790</text>
-      <text x="786" y="119" fill="#2563EB" font-size="11.5" font-weight="500">History</text>
+      <text x="786" y="119" fill="#2563EB" font-size="11.5" font-weight="500">Chat</text>
     </g>
 
     <!-- Row 3: Remote History + Shared Local Chats -->
     <g transform="translate(0, 396)">
       <rect x="0" y="0" width="500" height="122" rx="12" fill="#FFFFFF" stroke="#E2E5EE"/>
-      <text x="18" y="26" fill="#111827" font-size="13" font-weight="600">Remote Conversation History</text>
+      <text x="18" y="26" fill="#111827" font-size="13" font-weight="600">Remote Sessions</text>
       <line x1="18" y1="38" x2="482" y2="38" stroke="#EDF0F5"/>
       <text x="18" y="64" fill="#111827" font-size="12" font-weight="500">CUDA kernel benchmark</text>
       <text x="380" y="64" fill="#2563EB" font-size="11.5" font-weight="500">Continue in dsh</text>

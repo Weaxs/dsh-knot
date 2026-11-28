@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { AcpAdapter } from './adapters/acp.js';
-import { createNativeAdapter, createNativeSessionId } from './adapters/native.js';
+import { DshAdapter } from './adapters/dsh.js';
+import { PaseoAdapter } from './adapters/paseo.js';
 import { LocalOnlyAbortError, normalizeToolCallId, raceAbort, secret, stripTrailingText } from './config.js';
 import { type RedactionContext, retainRedactionTail } from './policy/redact.js';
 import type {
@@ -55,7 +55,6 @@ export class AgentManager {
       cancelling?: Promise<void>;
       stopConfirmation?: 'pending' | 'received';
       terminalConfirmation?: Promise<void>;
-      recoverStop?: (signal: AbortSignal) => Promise<void>;
     }
   >();
   private readonly configRevisions = new WeakMap<AgentConfig, string>();
@@ -112,8 +111,8 @@ export class AgentManager {
       | 'tls'
       | 'encryptedOverlay'
       | 'basePath'
-      | 'acpTransport'
-      | 'acpCommand'
+      | 'dshCwd'
+      | 'paseoProvider'
       | 'model'
     > & {
       revision: string;
@@ -132,8 +131,8 @@ export class AgentManager {
       tls: config.tls,
       encryptedOverlay: config.encryptedOverlay,
       basePath: config.basePath,
-      acpTransport: config.acpTransport,
-      acpCommand: config.acpCommand,
+      dshCwd: config.dshCwd,
+      paseoProvider: config.paseoProvider,
       model: config.model,
       revision: this.configRevision(config),
       hasToken: Boolean(secret(config)),
@@ -237,13 +236,10 @@ export class AgentManager {
       if (owner?.adapter === adapter && owner.submission === submission) return existing;
       throw new Error('This message submission already belongs to a different conversation or gateway');
     }
-    const config = this.configs.find((item) => item.id === agentId)!;
-    const remoteSession =
-      sessionId ??
-      (adapter.kind === 'acp' || adapter.kind === 'dsh' ? undefined : createNativeSessionId(config, clientMessageId));
+    const remoteSession = sessionId;
     let historyOverlaps: AgentJob[] = [];
     if (remoteSession) {
-      const exclusive = exclusiveSession || adapter.kind === 'acp';
+      const exclusive = exclusiveSession || adapter.kind === 'paseo';
       const activeSessionJobs = [...this.jobs.values()].filter((job) => {
         const owner = this.jobOwners.get(job.id);
         return (
@@ -256,7 +252,7 @@ export class AgentManager {
             owner.cancelling !== undefined ||
             (job.remoteStop !== 'unconfirmed-released' &&
               (job.remoteStop !== undefined ||
-                (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))))
+                (adapter.kind === 'paseo' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id)))))
         );
       });
       const existingJob = activeSessionJobs.find((job) => exclusive || this.jobOwners.get(job.id)?.exclusive);
@@ -266,7 +262,7 @@ export class AgentManager {
           owner?.cancelling !== undefined ||
           (job.remoteStop !== 'unconfirmed-released' &&
             (job.remoteStop !== undefined ||
-              (adapter.kind === 'acp' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id))))
+              (adapter.kind === 'paseo' && job.status === 'cancelled' && !this.remoteCancelled.has(job.id))))
         );
       });
       if (
@@ -545,7 +541,6 @@ export class AgentManager {
     const terminal = owner.adapter.promptTerminalForCancel?.(sessionId);
     if (!terminal) return;
     owner.stopConfirmation = 'pending';
-    owner.recoverStop = owner.adapter.recoverPromptStopForCancel?.(sessionId);
     owner.terminalConfirmation = terminal.then(
       () => {
         owner.stopConfirmation = 'received';
@@ -575,10 +570,7 @@ export class AgentManager {
           (async () => {
             const recovering = !drain && owner.stopConfirmation === 'pending';
             const originalPromptBusy = recovering && owner.adapter.isSessionBusy?.(sessionId);
-            if (recovering && !originalPromptBusy && owner.recoverStop) {
-              await owner.recoverStop(stopSignal);
-              owner.stopConfirmation = 'received';
-            } else if (!recovering || originalPromptBusy) {
+            if (!recovering || originalPromptBusy) {
               await owner.adapter.cancel(sessionId, stopSignal);
             }
             if (drain) {
@@ -599,7 +591,7 @@ export class AgentManager {
         if (owner.exclusive || owner.stopConfirmation) job.remoteStop = 'unconfirmed';
         throw error;
       } finally {
-        // Retractions can precede the remote terminal event even after the cancellation request.
+        // Keep the original prompt stream alive until confirmation or the stop deadline.
         drain?.controller.abort(new LocalOnlyAbortError('job cancelled'));
         delete owner.cancelling;
         job.updatedAt = Date.now();
@@ -961,6 +953,7 @@ function recordToolActivity(job: AgentJob, event: AgentEvent): void {
   const title = event.title?.trim().slice(0, 120) || previous?.title;
   let status = previous?.status ?? 'pending';
   if (event.phase === 'end') status = event.failed ? 'failed' : 'completed';
+  else if (event.phase === 'interrupted') status = 'interrupted';
   else if (event.phase === 'start' && status === 'pending') status = 'running';
   const activity: AgentToolActivity = {
     id: previous?.id ?? callId ?? randomUUID(),
@@ -1113,7 +1106,7 @@ function sessionKey(agentId: string, sessionId: string): string {
 }
 
 function defaultFactory(config: AgentConfig): AgentAdapter {
-  return config.kind === 'acp' ? new AcpAdapter(config.id, config) : createNativeAdapter(config);
+  return config.kind === 'paseo' ? new PaseoAdapter(config.id, config) : new DshAdapter(config.id, config);
 }
 
 export function fromConfig(config: PluginConfig): AgentManager {
